@@ -11,6 +11,8 @@ opened.
 
 from __future__ import annotations
 
+import gc
+import os
 import sys
 from pathlib import Path
 
@@ -39,6 +41,14 @@ def _symlink_or_skip(link: Path, target: Path, *, target_is_directory: bool = Fa
         link.symlink_to(target, target_is_directory=target_is_directory)
     except (OSError, NotImplementedError) as exc:  # Windows without symlink privilege
         pytest.skip(f"symlinks unavailable on this platform: {exc}")
+
+
+def _open_fd_count() -> int | None:
+    """How many descriptors the process holds, or None where that cannot be seen."""
+    for listing in (Path("/proc/self/fd"), Path("/dev/fd")):
+        if listing.is_dir():
+            return len(list(listing.iterdir()))
+    return None
 
 
 def _check_then_swap(monkeypatch, swap) -> None:
@@ -241,6 +251,50 @@ def test_symlink_swapped_in_after_the_check_is_not_served(results_dir, tmp_path,
 
     assert response.status_code == 400
     assert "secret" not in response.text
+
+
+def test_symlink_swapped_in_after_the_check_is_refused_even_inside_results_dir(
+    results_dir, monkeypatch
+):
+    # `O_NOFOLLOW` refuses the open itself wherever the platform provides it, so
+    # a name that changed under the check is refused even when it now points at
+    # a file that is still inside the results directory. Where the platform has
+    # no `O_NOFOLLOW`, the containment re-check is what answers, and it lets an
+    # inside target through -- so this pins the stricter answer only there.
+    if not getattr(os, "O_NOFOLLOW", 0):
+        pytest.skip("O_NOFOLLOW is not available on this platform")
+    inside = results_dir / "other.csv"
+    inside.write_text("inside\n", encoding="utf-8")
+
+    def swap() -> None:
+        (results_dir / "matrix_matrix.csv").unlink()
+        _symlink_or_skip(results_dir / "matrix_matrix.csv", inside)
+
+    _check_then_swap(monkeypatch, swap)
+
+    response = TestClient(viewer_app_module.app, raise_server_exceptions=False).get(
+        "/api/backtests/matrix/matrix.csv"
+    )
+
+    assert response.status_code == 400
+
+
+def test_refusal_does_not_leak_the_descriptor_it_opened(results_dir):
+    # A refused request must not leave the descriptor behind: the viewer serves
+    # these endpoints for as long as it runs, and 400/404 are answerable at will.
+    descriptors_before = _open_fd_count()
+    if descriptors_before is None:
+        pytest.skip("open descriptors cannot be listed on this platform")
+    (results_dir / "matrix_matrix.csv").unlink()
+    (results_dir / "matrix_matrix.csv").mkdir()
+
+    response = TestClient(viewer_app_module.app, raise_server_exceptions=False).get(
+        "/api/backtests/matrix/matrix.csv"
+    )
+    gc.collect()
+
+    assert response.status_code == 404
+    assert _open_fd_count() == descriptors_before
 
 
 def test_directory_component_swapped_in_after_the_check_is_not_served(
