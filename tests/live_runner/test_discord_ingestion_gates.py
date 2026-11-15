@@ -381,7 +381,7 @@ def test_seen_set_is_not_pruned_against_the_poll_cursor() -> None:
 
     async def _fetch(_channel_id, **kwargs):
         # A repeat page still hands back the boundary message that is already
-        # seen; the seen-set, not the cursor, must absorb it.
+        # seen; the stale-id filter drops it, the seen-set is the backstop.
         return [_message("100000000000000060"), _message("100000000000000050")]
 
     source._fetch_messages = _fetch
@@ -1413,6 +1413,28 @@ class TestIssueB2Backfill:
 
         assert source._last_seen_message_ids["channel-1"] == "1000"
         assert any("no numeric message id" in r.message for r in caplog.records)
+
+    def test_poison_id_sorts_after_numeric_ids_in_emission_order(self) -> None:
+        """Within one page, numeric ids go out oldest-first and a poison id last."""
+        import asyncio
+
+        source = _source(trusted_author_ids={"bot-1"})
+        source._last_seen_message_ids["channel-1"] = "1000"
+        page = [
+            _burst_message(2),
+            {**_burst_message(9), "id": "not-an-id"},
+            _burst_message(3),
+            _burst_message(1),
+        ]
+
+        async def _fetch(_channel_id, *, after=None, **kwargs):
+            return list(page) if after == "1000" else []
+
+        source._fetch_messages = _fetch
+        asyncio.run(source._poll_once("channel-1"))
+        queued = [source._queue.get_nowait() for _ in range(source._queue.qsize())]
+        ids = [item.metadata["discord_message_id"] for item in queued]
+        assert ids == ["1001", "1002", "1003", "not-an-id"]
 
     def test_stale_ids_are_not_emitted_even_after_seen_set_pruning(self) -> None:
         """A below-cursor id the seen-set forgot must still not be re-emitted."""
@@ -4365,9 +4387,8 @@ def test_poll_emits_messages_in_chronological_order() -> None:
 def test_the_poll_cursor_never_moves_backwards() -> None:
     """A page of older messages must not rewind the cursor.
 
-    The cursor feeds gap detection. Moving it backwards would make the next poll
-    treat already-drained history as new and log a phantom gap (or, with a
-    cursor-based emit filter, re-emit it).
+    The cursor anchors the forward drain and the stale-id filter. Moving it
+    backwards would make the next poll re-request already-drained history.
     """
     import asyncio
 

@@ -130,10 +130,13 @@ Ohne Allowlist startet der Listener nicht (fail-closed). Zusätzlich gilt:
   nach Snowflake-ID chronologisch emittiert, und der Cursor rückt nur bis zur
   neuesten tatsächlich emittierten Nachricht vor. Pro Poll werden höchstens
   `MAX_BACKFILL_PAGES` (5) Seiten geholt; eine größere Lücke wird in den nächsten
-  Poll übernommen (im laufenden Betrieb geht nichts verloren) und als Warnung mit Kanal und den
+  Poll übernommen (im laufenden Betrieb geht dadurch nichts verloren) und als Warnung mit Kanal und den
   Grenz-IDs (`last_seen_message_id`, `newest_fetched_message_id`, `pages_fetched`)
   geloggt. IDs unterhalb des Cursors werden nie erneut emittiert; ein nicht
-  numerischer Cursor wird verworfen und neu aufgesetzt (Warnung). Snowflake-IDs
+  numerischer Cursor wird verworfen und neu aufgesetzt (Warnung). Eine Seite ganz ohne
+  numerische ID kann keinen Folge-Request verankern: der Poll stoppt mit Warnung,
+  der Cursor bleibt stehen, und kommt dauerhaft nur so eine Seite, nimmt der Kanal
+  bis zu einem Neustart nichts auf (danach greift das Start-Verhalten unten). Snowflake-IDs
   sind nicht fortlaufend, daher wird keine Nachrichtenanzahl berechnet.
   Grundlage ist die Semantik von `after`: Discord liefert mit `after=<id>&limit=N`
   die N Nachrichten direkt nach der ID, im Array neueste zuerst
