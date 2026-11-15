@@ -43,28 +43,42 @@ def _symlink_or_skip(link: Path, target: Path, *, target_is_directory: bool = Fa
         pytest.skip(f"symlinks unavailable on this platform: {exc}")
 
 
-def _open_fd_count() -> int | None:
-    """How many descriptors the process holds, or None where that cannot be seen."""
+def _descriptors_pointing_at(path: Path) -> int | None:
+    """Open descriptors that point at ``path``, or None where that cannot be seen.
+
+    The file is named rather than counted, so unrelated descriptors the process
+    holds -- a portal, a log handle -- do not decide the answer.
+    """
     for listing in (Path("/proc/self/fd"), Path("/dev/fd")):
-        if listing.is_dir():
-            return len(list(listing.iterdir()))
+        if not listing.is_dir():
+            continue
+        pointing = 0
+        for entry in listing.iterdir():
+            try:
+                target = os.readlink(entry)
+            except OSError:  # closed between listing and reading it
+                continue
+            if Path(target) == path:
+                pointing += 1
+        return pointing
     return None
 
 
-def _check_then_swap(monkeypatch, swap) -> None:
-    """Run ``swap`` immediately after the containment check, before the open.
+def _check_then_swap(monkeypatch, swap, *, after: str = "_matrix_result_path") -> None:
+    """Rename the file inside the window between two steps of the request.
 
-    The check and the serve are two filesystem walks, so anything renamed in
-    between the two would have been followed. This reproduces that window.
+    Checking a path, opening it and streaming it are separate steps, so anything
+    renamed between two of them would have been followed. This reproduces that
+    window at ``after``.
     """
-    original = viewer_app_module._matrix_result_path
+    original = getattr(viewer_app_module, after)
 
-    def check_then_swap_helper(filename: str) -> Path:
-        path = original(filename)
+    def wrapper(*args, **kwargs):
+        result = original(*args, **kwargs)
         swap()
-        return path
+        return result
 
-    monkeypatch.setattr(viewer_app_module, "_matrix_result_path", check_then_swap_helper)
+    monkeypatch.setattr(viewer_app_module, after, wrapper)
 
 
 def _assert_rejected(filename: str) -> None:
@@ -298,22 +312,46 @@ def test_symlink_swapped_in_after_the_check_is_refused_even_inside_results_dir(
     assert response.status_code == 400
 
 
+def test_served_bytes_come_from_the_file_that_was_checked(results_dir, monkeypatch):
+    # The promise of the checked descriptor: the response streams what the check
+    # opened. A replacement published under the same name between the check and
+    # the response's own open must not reach the client -- the PR's central claim,
+    # and the one a re-open by path breaks.
+    expected_name = results_dir / "matrix_matrix.csv"
+    expected_name.write_text("ok\n", encoding="utf-8")
+
+    def swap() -> None:
+        staged = results_dir / "matrix_matrix.csv.staged"
+        staged.write_text("secret\n", encoding="utf-8")
+        os.replace(staged, expected_name)  # a new inode under the checked name
+
+    _check_then_swap(monkeypatch, swap, after="_checked_matrix_result")
+
+    response = TestClient(viewer_app_module.app, raise_server_exceptions=False).get(
+        "/api/backtests/matrix/matrix.csv"
+    )
+
+    assert response.status_code == 200
+    assert response.text == "ok\n"
+
+
 def test_refusal_does_not_leak_the_descriptor_it_opened(results_dir):
     # A refused request must not leave the descriptor behind: the viewer serves
     # these endpoints for as long as it runs, and 400/404 are answerable at will.
-    descriptors_before = _open_fd_count()
-    if descriptors_before is None:
-        pytest.skip("open descriptors cannot be listed on this platform")
-    (results_dir / "matrix_matrix.csv").unlink()
-    (results_dir / "matrix_matrix.csv").mkdir()
+    expected_name = results_dir / "matrix_matrix.csv"
+    expected_name.unlink()
+    expected_name.mkdir()
 
     response = TestClient(viewer_app_module.app, raise_server_exceptions=False).get(
         "/api/backtests/matrix/matrix.csv"
     )
     gc.collect()
 
+    leaked = _descriptors_pointing_at(expected_name)
+    if leaked is None:
+        pytest.skip("open descriptors cannot be listed on this platform")
     assert response.status_code == 404
-    assert _open_fd_count() == descriptors_before
+    assert leaked == 0
 
 
 def test_directory_component_swapped_in_after_the_check_is_not_served(
