@@ -81,6 +81,11 @@ def _match_cost(
     price/quantity costs are relative differences. All terms are unitless
     so time, price and quantity trade off against each other instead of
     array order deciding ties.
+
+    The relative terms deliberately keep ``max(|ref|, |act|, 1e-12)`` as
+    their base, unlike the tolerance-gate deviations that measure against the
+    reference (#128): this is a symmetric ranking cost, so a one-sided base
+    would systematically favour pairings on one side of the drift.
     """
     time_cost = (
         _time_diff_seconds(ref["entry"], act["entry"])

@@ -27,8 +27,14 @@ def _abs_pct_diff(expected: float, actual: float) -> float:
 
     The old ``max(|expected|, |actual|)`` denominator halved real drift
     (100 -> 200 read as 50%, not 100%). Zero expected fails closed unless
-    actual is also zero. The rule itself lives in the shared comparison
-    helper so every relative deviation uses one definition (#128).
+    actual is also zero. The rule itself lives in the shared comparison helper
+    (``validation.comparison.tolerances.abs_pct_diff``) so every
+    tolerance-gate relative deviation uses one definition (#128).
+
+    ``validation/comparison/matcher.py`` deliberately keeps a symmetric
+    ``max(|ref|, |act|, 1e-12)`` denominator: it scores candidate trade
+    pairings rather than gating a tolerance, and a one-sided base would bias
+    the pairing toward whichever side happens to be larger.
     """
     return abs_pct_diff(expected, actual)
 
