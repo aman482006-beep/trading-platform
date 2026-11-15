@@ -8800,7 +8800,10 @@ def _checked_matrix_result(filename: str, *, not_found_detail: str) -> _CheckedM
 
     ``O_NOFOLLOW`` is read through ``getattr`` because it is not in every
     platform's ``os`` module; where it is missing, the containment re-check is
-    what closes that window.
+    what closes that window. A rename that is undone before that re-check cannot
+    be seen from here at all; excluding it needs the components opened one at a
+    time relative to a directory descriptor (``dir_fd``), which is not available
+    on every platform this runs on.
     """
     path = _matrix_result_path(filename)
     nofollow = getattr(os, "O_NOFOLLOW", 0)
@@ -8955,6 +8958,9 @@ def _matrix_summary_payload() -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=_internal_error_detail(exc, "matrix summary")) from exc
     runs = [row for row in payload.get("runs", []) if isinstance(row, dict)]
     _refuse_stale_grid_rows(runs, source="matrix summary")
+    # A path, not an open file: these are informational strings describing where
+    # the results would be, so a run that produced no CSV yet still answers. The
+    # routes that serve them go through _checked_matrix_result.
     payload["matrix_csv"] = str(_matrix_result_path("matrix_matrix.csv"))
     payload["daily_equity_csv"] = str(_matrix_result_path("matrix_daily_equity.csv"))
     return payload
