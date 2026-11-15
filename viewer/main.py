@@ -156,6 +156,7 @@ from shared.models import (
     Service,
     ServiceStatus,
     ServiceType,
+    TradeContractError,
     VerificationEvidenceRecord,
     VerificationEvidenceSummary,
     resolve_defined_stat,
@@ -1817,8 +1818,36 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
     )
 
 
+class _StoredResultViolatesContract(Exception):
+    """A stored backtest row exists but breaks the Trade contract."""
+
+
+def _load_stored_result_or_raise(backtest_id: str) -> BacktestResult | None:
+    """``load_backtest_result``; a Trade-contract violation (e.g. a legacy
+    lower-case direction) is logged and re-raised as a private marker. Every
+    other error propagates unchanged."""
+    try:
+        return load_backtest_result(backtest_id)
+    except TradeContractError as exc:
+        logger.warning("Stored backtest %s violates the trade contract: %s", backtest_id, exc)
+        raise _StoredResultViolatesContract(backtest_id) from exc
+
+
+def _load_stored_result(backtest_id: str) -> BacktestResult | None:
+    """Stored result, or ``None`` when it is missing or breaks the Trade contract."""
+    try:
+        return _load_stored_result_or_raise(backtest_id)
+    except _StoredResultViolatesContract:
+        return None
+
+
 def _load_result(backtest_id: str) -> BacktestResult | None:
-    result = load_backtest_result(backtest_id)
+    try:
+        result = _load_stored_result_or_raise(backtest_id)
+    except _StoredResultViolatesContract:
+        # The row exists: never fall back to the JSON artifact here, since that
+        # path rewrites the stored rows on a read.
+        return None
     if result is not None:
         return result
 
@@ -8792,7 +8821,7 @@ def _matrix_grid_row_with_trades(row: dict[str, Any], *, trades_limit: int) -> d
         enriched["trade_sample_count"] = 0
         return enriched
 
-    result = load_backtest_result(backtest_id)
+    result = _load_stored_result(backtest_id)
     if result is None:
         enriched.setdefault("trades", [])
         enriched["trade_sample_count"] = 0

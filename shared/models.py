@@ -375,6 +375,38 @@ VALID_TIMEFRAMES = ("tick", "s1", "1m", "5m", "15m", "30m", "1h", "4h", "1d", "1
 VALID_DIRECTIONS = ("LONG", "SHORT")
 
 
+class TradeContractError(ValueError):
+    """A ``Trade`` violates its contract (direction outside ``VALID_DIRECTIONS``).
+
+    A ``ValueError`` subclass so existing callers keep working; readers of
+    stored results can catch exactly this instead of every ``ValueError``.
+    """
+
+# Spellings a strategy may use for a per-entry direction. Wider than
+# VALID_DIRECTIONS because signal frames commonly carry lower-case or +1/-1.
+_LONG_DIRECTION_SPELLINGS = ("LONG", "long", 1)
+_SHORT_DIRECTION_SPELLINGS = ("SHORT", "short", -1)
+
+
+def normalize_direction_value(value: Any) -> str:
+    """Map a strategy's per-entry direction value to LONG/SHORT, or raise (#123).
+
+    Anything outside the explicit spellings (NaN/None/``pd.NA`` at an entry
+    bar, ``0``, booleans incl. ``np.bool_``, ``"BUY"``, a typo) raises
+    ``ValueError`` instead of silently becoming LONG.
+    """
+    if isinstance(value, bool) or type(value).__name__ in ("bool", "bool_"):
+        raise ValueError(f"unknown trade direction value {value!r} at an entry bar")
+    try:
+        if value in _SHORT_DIRECTION_SPELLINGS:
+            return "SHORT"
+        if value in _LONG_DIRECTION_SPELLINGS:
+            return "LONG"
+    except (TypeError, ValueError):  # e.g. pd.NA has no truth value
+        pass
+    raise ValueError(f"unknown trade direction value {value!r} at an entry bar")
+
+
 # ─── Exit ────────────────────────────────────────────────────────────────────
 
 
@@ -448,6 +480,15 @@ class Trade:
     stop_loss: float | None = None
     take_profit: float | None = None
 
+    def __post_init__(self) -> None:
+        # #123: no case normalisation and no guessing. Anything outside
+        # VALID_DIRECTIONS used to read as SHORT through ``direction_sign``
+        # (and as LONG through several engine comparisons), flipping PnL sign.
+        if self.direction not in VALID_DIRECTIONS:
+            raise TradeContractError(
+                f"direction must be one of {VALID_DIRECTIONS}, got {self.direction!r}"
+            )
+
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
             "id": self.id,
@@ -518,12 +559,27 @@ class Trade:
 
     @property
     def last_exit_time(self) -> str:
-        """Time of the final exit."""
-        return self.exits[-1].time if self.exits else self.entry_time
+        """Time of the final exit.
+
+        Raises ValueError for a trade without exits (#123): an open or
+        malformed trade has no exit time, and the old fallback to
+        ``entry_time`` made it look like a zero-duration closed trade.
+        """
+        if not self.exits:
+            raise ValueError(f"trade {self.id} has no exits; last_exit_time is undefined")
+        return self.exits[-1].time
 
     @property
     def direction_sign(self) -> int:
-        return 1 if self.direction == "LONG" else -1
+        # #123: exhaustive and strict - never default to SHORT for a value
+        # that is not in VALID_DIRECTIONS (including after a field mutation).
+        if self.direction == "LONG":
+            return 1
+        if self.direction == "SHORT":
+            return -1
+        raise TradeContractError(
+            f"direction must be one of {VALID_DIRECTIONS}, got {self.direction!r}"
+        )
 
 
 # ─── Equity point ────────────────────────────────────────────────────────────
