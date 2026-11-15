@@ -721,8 +721,9 @@ export interface LiveTradesResponse {
 export interface LiveDashboardAccount extends LiveAccount {
   current_equity: number;
   current_balance: number;
-  total_trades: number;
-  total_pnl: number;
+  /** `null` when a fill price was unusable: the figure is unknown, not zero. */
+  total_trades: number | null;
+  total_pnl: number | null;
 }
 
 export interface LiveDashboardStrategy extends LiveDeploymentConfig {
