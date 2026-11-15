@@ -4376,7 +4376,7 @@ def _backtest_is_ruined(backtest: BacktestRecord, stats: dict[str, Any]) -> bool
             equity = float(point.get("equity")) if isinstance(point, dict) else math.nan
         except (TypeError, ValueError):
             equity = math.nan
-        if not (equity > 0):
+        if not (math.isfinite(equity) and equity > 0):
             logger.warning(
                 "Backtest %s predates the ruin flag and its equity curve reaches %s; "
                 "treating it as ruined (non-positive or unreadable)",

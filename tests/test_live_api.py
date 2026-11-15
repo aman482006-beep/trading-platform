@@ -2949,7 +2949,13 @@ def test_legacy_curve_with_unreadable_point_fails_closed(isolated_db):
     """An unreadable or non-finite equity point cannot prove the account survived."""
     database, _engine, _data_dir = isolated_db
     legacy_stats = {"sharpe_ratio": 2.5}
-    for backtest_id, bad_equity in (("none", None), ("text", "n/a"), ("nan", float("nan"))):
+    bad_points = (
+        ("none", None),
+        ("text", "n/a"),
+        ("nan", float("nan")),
+        ("inf", float("inf")),
+    )
+    for backtest_id, bad_equity in bad_points:
         _store_backtest(
             database,
             f"legacy-{backtest_id}",
