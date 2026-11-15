@@ -75,6 +75,47 @@ def test_lowest_total_cost_wins_when_cardinality_is_equal() -> None:
             assert _pairs(result) == {(1, 101), (2, 102)}
 
 
+def test_solver_sentinel_fill_is_never_reported_as_a_match() -> None:
+    """A component whose maximum matching is smaller than its dimensions.
+
+    ``ref_b``/``ref_c`` can only pair with ``act_x``, so at most two of the
+    three pairs can be matched even though three refs and three actuals exist.
+    The rectangular solver is forced to fill the leftover row and column with
+    its big-M sentinel; reporting that sentinel would invent a match between
+    an infeasible pair.
+    """
+    ref_a = _trade(1, "2024-01-02T10:00:00Z", "2024-01-02T10:01:00Z")
+    ref_b = _trade(2, "2024-01-02T10:00:00Z", "2024-01-02T10:00:00Z")
+    ref_c = _trade(3, "2024-01-02T10:00:00Z", "2024-01-02T10:00:00Z")
+    act_x = _trade(101, "2024-01-02T10:00:00Z", "2024-01-02T10:00:00Z")
+    act_y = _trade(102, "2024-01-02T10:00:00Z", "2024-01-02T10:01:30Z")
+    act_z = _trade(103, "2024-01-02T10:00:00Z", "2024-01-02T10:02:00Z")
+
+    result = TradeMatcher.match([ref_a, ref_b, ref_c], [act_x, act_y, act_z], **TOLERANCE)
+
+    pairs = _pairs(result)
+    assert len(result.matched) == 2
+    # ref_a's cheapest feasible partner is act_y; one of ref_b/ref_c takes act_x.
+    assert (1, 102) in pairs
+    assert len(pairs & {(2, 101), (3, 101)}) == 1
+    assert len(pairs) == 2
+    assert len(result.missing) == 1
+    assert [t.id for t in result.extra] == [103]
+
+
+def test_content_identical_duplicates_pair_by_id_in_every_input_order() -> None:
+    """Exact duplicates still pair by id, so the pairing cannot depend on order."""
+    ref_1 = _trade(1, "2024-01-02T10:00:00Z", "2024-01-02T11:00:00Z")
+    ref_2 = _trade(2, "2024-01-02T10:00:00Z", "2024-01-02T11:00:00Z")
+    act_101 = _trade(101, "2024-01-02T10:00:05Z", "2024-01-02T11:00:05Z")
+    act_102 = _trade(102, "2024-01-02T10:00:05Z", "2024-01-02T11:00:05Z")
+
+    for refs in ([ref_1, ref_2], [ref_2, ref_1]):
+        for acts in ([act_101, act_102], [act_102, act_101]):
+            result = TradeMatcher.match(refs, acts, **TOLERANCE)
+            assert _pairs(result) == {(1, 101), (2, 102)}
+
+
 def test_infeasible_pairs_are_never_matched() -> None:
     ref = _trade(1, "2024-01-02T10:00:00Z", "2024-01-02T11:00:00Z")
     wrong_direction = _trade(101, "2024-01-02T10:00:00Z", "2024-01-02T11:00:00Z", direction="SHORT")
