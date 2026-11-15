@@ -427,8 +427,6 @@ def select_best_risk_parity_universe(
     )
     best = selections[0]
     return {
-        # "structure_only": no datetime index, Sharpe undefined and excluded
-        # from the score (not comparable with Sharpe-based scores).
         # "structure_only": no datetime index, or observations spaced wider
         # than a day (weekly bars) - in both cases the Sharpe is undefined and
         # excluded from the score (not comparable with Sharpe-based scores).
