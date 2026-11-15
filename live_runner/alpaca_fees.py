@@ -340,6 +340,8 @@ def _group_problem(inputs: _Inputs, pair: str, day: date) -> tuple[str | None, l
         if any(row["commission"] is not None for row in rows):
             return f"order {order_id} already has a known commission on part of its rows", []
         local_qty = sum(float(row["filled_qty"]) for row in rows)
+        if not local_qty > 0:
+            return f"order {order_id} has no positive recorded quantity ({local_qty})", []
         broker_qty = float(sum(fill.qty for fill in order_fills))
         if not _close(local_qty, broker_qty):
             return (
@@ -386,6 +388,11 @@ def _allocate(
     for order_id, order_usd in usd_by_order.items():
         rows = inputs.rows_by_order[order_id]
         order_qty = sum(float(row["filled_qty"]) for row in rows)
+        if not order_qty > 0:
+            # Defence in depth: `_group_problem` refuses this earlier; never divide by it.
+            return GroupPlan(
+                pair, day, {}, f"order {order_id} has no positive recorded quantity ({order_qty})"
+            )
         for row in rows:
             share = float(row["filled_qty"]) / order_qty
             commissions[row["execution_id"]] = float(order_usd) * share
@@ -463,5 +470,9 @@ def plan_commission_backfill(
         if problem is not None:
             plans.append(GroupPlan(pair, day, {}, problem))
             continue
-        plans.append(_allocate(inputs, pair, day, group_fills))
+        try:
+            plans.append(_allocate(inputs, pair, day, group_fills))
+        except ArithmeticError as exc:
+            # One unallocatable group must not abort the pass for every other group.
+            plans.append(GroupPlan(pair, day, {}, f"allocation failed: {exc!r}"))
     return plans, unplaced
