@@ -1817,8 +1817,18 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
     )
 
 
+def _load_stored_result(backtest_id: str) -> BacktestResult | None:
+    """``load_backtest_result`` that treats a stored row violating the Trade
+    contract (e.g. a legacy lower-case direction) as unavailable, not a 500."""
+    try:
+        return load_backtest_result(backtest_id)
+    except ValueError as exc:
+        logger.warning("Stored backtest %s violates the trade contract: %s", backtest_id, exc)
+        return None
+
+
 def _load_result(backtest_id: str) -> BacktestResult | None:
-    result = load_backtest_result(backtest_id)
+    result = _load_stored_result(backtest_id)
     if result is not None:
         return result
 
@@ -8786,7 +8796,7 @@ def _matrix_grid_row_with_trades(row: dict[str, Any], *, trades_limit: int) -> d
         enriched["trade_sample_count"] = 0
         return enriched
 
-    result = load_backtest_result(backtest_id)
+    result = _load_stored_result(backtest_id)
     if result is None:
         enriched.setdefault("trades", [])
         enriched["trade_sample_count"] = 0

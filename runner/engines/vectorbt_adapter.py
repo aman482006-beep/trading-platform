@@ -59,6 +59,7 @@ from shared.models import (
     IndicatorSeries,
     Trade,
     TradeExit,
+    normalize_direction_value,
 )
 
 logger = logging.getLogger(__name__)
@@ -1271,24 +1272,9 @@ def _find_entry_stop_series(signals: pd.DataFrame, indicators: IndicatorMap) -> 
     return _find_indicator_series(signals, indicators, kind="entry_stop")
 
 
-_LONG_DIRECTION_VALUES = ("LONG", "long", 1)
-_SHORT_DIRECTION_VALUES = ("SHORT", "short", -1)
-
-
 def _normalize_direction_value(value: Any) -> str:
-    """Map a strategy's per-entry direction value to LONG/SHORT, or raise (#123).
-
-    Anything outside the explicit spellings (NaN at an entry bar, ``0``,
-    ``"BUY"``, a typo) used to fall through to LONG and silently flip the
-    side of a trade the strategy meant as something else.
-    """
-    if isinstance(value, bool):
-        raise ValueError(f"unknown trade direction value {value!r} at an entry bar")
-    if value in _SHORT_DIRECTION_VALUES:
-        return "SHORT"
-    if value in _LONG_DIRECTION_VALUES:
-        return "LONG"
-    raise ValueError(f"unknown trade direction value {value!r} at an entry bar")
+    """Strict per-entry direction mapping; see ``shared.models.normalize_direction_value``."""
+    return normalize_direction_value(value)
 
 
 def _resolve_direction(
