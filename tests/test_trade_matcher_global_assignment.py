@@ -189,6 +189,26 @@ def test_huge_weights_take_the_rescale_path_and_keep_the_global_optimum() -> Non
             assert result.extra == []
 
 
+def test_huge_weights_never_hand_inf_to_the_solver(monkeypatch) -> None:
+    """The rescale branch, not scipy's tolerance for ``inf``, keeps the matrix finite."""
+    import numpy as np
+
+    import validation.comparison.matcher as matcher_module
+
+    matrices: list = []
+    real_solver = matcher_module.linear_sum_assignment
+
+    def spy(matrix):
+        matrices.append(np.array(matrix, copy=True))
+        return real_solver(matrix)
+
+    monkeypatch.setattr(matcher_module, "linear_sum_assignment", spy)
+    TradeMatcher.match([REF_A, REF_B], [ACT_SHARED, ACT_ONLY_A], time_weight=1.0e308, **TOLERANCE)
+
+    assert matrices, "the dense solver was not called"
+    assert all(np.isfinite(m).all() for m in matrices)
+
+
 def test_nonfinite_price_keeps_order_independence() -> None:
     """NaN-price trades never match (their cost is non-finite) in any input order.
 
