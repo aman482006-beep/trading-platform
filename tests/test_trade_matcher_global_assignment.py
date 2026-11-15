@@ -110,6 +110,28 @@ def test_matched_list_keeps_reference_order_and_missing_and_extra_keep_input_ord
     assert [t.id for t in result.extra] == [103]
 
 
+def test_more_references_than_actuals_matches_only_the_actuals() -> None:
+    """Two refs compete for one actual: one match, one missing, no extra.
+
+    This is the ``ref_count > act_count`` direction of the objective, where
+    the rectangular solver must leave one reference unassigned.  Which of the
+    two content-identical refs wins an exact cost tie is solver-dependent, so
+    only the cardinality and the identity of the matched actual are pinned.
+    """
+    ref_a = _trade(1, "2024-01-02T10:00:00Z", "2024-01-02T11:00:00Z")
+    ref_b = _trade(2, "2024-01-02T10:00:00Z", "2024-01-02T11:00:00Z")
+    shared = _trade(101, "2024-01-02T10:00:10Z", "2024-01-02T11:00:10Z")
+
+    for refs in ([ref_a, ref_b], [ref_b, ref_a]):
+        result = TradeMatcher.match(refs, [shared], **TOLERANCE)
+
+        assert len(result.matched) == 1
+        assert len(result.missing) == 1
+        assert result.extra == []
+        assert result.matched[0][1].id == 101
+        assert sorted([result.matched[0][0].id, result.missing[0].id]) == [1, 2]
+
+
 def test_empty_inputs() -> None:
     assert TradeMatcher.match([], []).matched == []
     only_ref = TradeMatcher.match([REF_A], [], **TOLERANCE)
