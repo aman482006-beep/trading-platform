@@ -5513,6 +5513,68 @@ def test_deduplicate_backtests_dry_run_and_confirm(viewer_client, monkeypatch, t
     assert "backtest-dup2" in deleted_files
 
 
+def test_deduplicate_backtests_kept_id_skipped(viewer_client, monkeypatch, tmp_path):
+    import viewer.main as viewer_app_module
+
+    monkeypatch.setattr(viewer_app_module, "list_portfolio_records", lambda: [])
+    monkeypatch.setattr(viewer_app_module, "delete_portfolio_record", lambda _portfolio_id: False)
+    monkeypatch.setattr(
+        viewer_app_module,
+        "_duplicate_backtest_members",
+        lambda: [
+            {
+                "id": "backtest-dup1",
+                "display_name": "Duplicate Backtest",
+                "strategy_name": "Test",
+                "symbols": ["AAPL"],
+                "timeframe": "1d",
+                "trade_count": 1,
+                "created_at": "2026-01-02T00:00:00Z",
+                "fingerprint": "fp1",
+                "kept_id": "backtest-dup1",
+                "is_kept": True,
+            },
+            {
+                "id": "backtest-dup2",
+                "display_name": "Duplicate Backtest",
+                "strategy_name": "Test",
+                "symbols": ["AAPL"],
+                "timeframe": "1d",
+                "trade_count": 1,
+                "created_at": "2026-01-01T00:00:00Z",
+                "fingerprint": "fp1",
+                "kept_id": "backtest-dup1",
+                "is_kept": False,
+            },
+        ],
+    )
+    deleted_calls: list[str] = []
+
+    def fake_delete(backtest_id):
+        deleted_calls.append(backtest_id)
+        return {
+            "id": backtest_id,
+            "status": "deleted",
+            "database": "deleted",
+            "artifact": "deleted",
+        }
+
+    monkeypatch.setattr(viewer_app_module, "_delete_backtest_with_artifacts", fake_delete)
+
+    # Confirm the kept newest entry itself: it must never be deleted
+    response = viewer_client.post(
+        "/api/backtests/deduplicate",
+        json={"dry_run": False, "ids": ["backtest-dup1"]},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["deleted_ids"] == []
+    assert payload["skipped_ids"] == ["backtest-dup1"]
+    assert payload["items"][0]["status"] == "skipped"
+    assert payload["items"][0]["reason"] == "now_kept_entry"
+    assert deleted_calls == []
+
+
 def test_remove_empty_portfolios_partial_failure_middle_leaves_earlier_deleted(
     viewer_client, monkeypatch, tmp_path
 ):
