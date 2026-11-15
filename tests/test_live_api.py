@@ -2990,3 +2990,37 @@ def test_ruined_backtest_metadata_publishes_null_cagr(isolated_db):
     )
 
     assert database.load_backtest_metadata_row("ruined-cagr")["cagr"] is None
+
+
+def test_live_dashboard_passes_unknown_totals_through_as_null(monkeypatch):
+    """A fill with an unusable price makes the account totals None; never a silent 0."""
+    import viewer.main as viewer_main_module
+
+    account = LiveAccountConfig(id="acct-1", broker="alpaca", name="Account One")
+    monkeypatch.setattr(viewer_main_module, "_seed_default_live_accounts", lambda: None)
+    monkeypatch.setattr(viewer_main_module, "list_live_accounts", lambda: [account])
+    monkeypatch.setattr(viewer_main_module, "list_live_deployments", lambda: [])
+    monkeypatch.setattr(
+        viewer_main_module,
+        "_live_account_stats_payload",
+        lambda _account_id: {
+            "account_id": _account_id,
+            "current_equity": 10000.0,
+            "current_balance": 9900.0,
+            "total_trades": None,
+            "total_pnl": None,
+            "pnl_complete": False,
+        },
+    )
+
+    async def _fake_trades(_account_id):
+        return {"account_id": _account_id, "deployment_ids": [], "trades": []}
+
+    monkeypatch.setattr(viewer_main_module, "_live_trades_payload", _fake_trades)
+
+    response = TestClient(viewer_main_module.app).get("/api/live/dashboard")
+
+    assert response.status_code == 200
+    (row,) = response.json()["accounts"]
+    assert row["total_trades"] is None
+    assert row["total_pnl"] is None

@@ -2203,3 +2203,129 @@ def test_daemon_backfill_pass_times_out_a_hung_adapter(monkeypatch):
     asyncio.run(asyncio.wait_for(daemon._backfill_commissions_once(adapters), timeout=5))
 
     assert sorted(calls) == ["hung", "ok"]
+
+
+# ── #143 follow-ups ────────────────────────────────────────────────────────────────────────────
+
+
+def test_migration_fails_closed_on_orphan_executions(isolated_db_no_schema):
+    """A zero whose signal/deployment/account row is gone is not provably an equity zero."""
+    database, engine = _build_legacy_database(isolated_db_no_schema)
+    with engine.connect() as connection:
+        connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+        connection.execute(
+            text("INSERT INTO live_deployments (id, strategy_name, account_id, symbols, "
+                 "timeframe, status, created_at, updated_at) VALUES "
+                 "('dep-lost-acct', 'x', 'acc-gone', '[]', '1m', 'ACTIVE', "
+                 "'2026-11-01 00:00:00', '2026-11-01 00:00:00')")
+        )
+        for signal_id, deployment_id, symbol in (
+            ("sig-no-deployment", "dep-gone", "BTC/USD"),
+            ("sig-no-account", "dep-lost-acct", "BTCUSD"),
+            ("sig-orphan-equity", "dep-gone", "AAPL"),
+        ):
+            connection.execute(
+                text(
+                    "INSERT INTO live_signals (id, deployment_id, symbol, action, "
+                    "theoretical_price, timestamp, metadata, source) VALUES "
+                    "(:id, :dep, :symbol, 'buy', 1.0, '2026-11-03 15:00:00', '{}', 'internal')"
+                ),
+                {"id": signal_id, "dep": deployment_id, "symbol": symbol},
+            )
+        for execution_id, signal_id in (
+            ("ex-no-signal", "sig-gone"),
+            ("ex-no-deployment", "sig-no-deployment"),
+            ("ex-no-account", "sig-no-account"),
+            ("ex-orphan-equity", "sig-orphan-equity"),
+        ):
+            connection.execute(
+                text(
+                    "INSERT INTO live_executions (id, signal_id, actual_price, filled_qty, "
+                    "commission, timestamp, broker_order_id, dedupe_key) VALUES "
+                    "(:id, :sig, 10.0, 1.0, 0.0, '2026-11-03 15:00:00', 'bo', :key)"
+                ),
+                {"id": execution_id, "sig": signal_id, "key": f"k:{execution_id}"},
+            )
+        connection.commit()
+
+    # `init_db` refuses a database with foreign-key orphans; the migration itself must still fail
+    # closed on them, so run it directly on a connection with enforcement off.
+    with engine.connect() as connection:
+        connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+        assert database._make_live_executions_commission_nullable(connection) is True
+        connection.commit()
+        commissions = dict(
+            connection.execute(text("SELECT id, commission FROM live_executions")).fetchall()
+        )
+    assert commissions["ex-no-signal"] is None, "no symbol, no broker: unknown, not a known zero"
+    assert commissions["ex-no-deployment"] is None, "broker undeterminable: fail closed"
+    assert commissions["ex-no-account"] is None, "broker undeterminable: fail closed"
+    assert commissions["ex-orphan-equity"] == 0.0, "provably an equity: the zero is known"
+    # Rows whose broker is known keep the established behaviour.
+    assert commissions["ex-equity"] == 0.0
+    assert commissions["ex-ctrader-zero"] == 0.0
+    assert commissions["ex-ctrader"] == 1.5
+    assert commissions["ex-crypto"] is None
+
+
+def test_backfill_refuses_a_zero_quantity_order_and_keeps_the_rest(db, live_runner_logs):
+    zero_signal, zero_order = _crypto_fill(db, qty=0.0, label="zero", symbol="BTC/USD")
+    ok_signal, ok_order = _crypto_fill(
+        db, qty=0.5, label="ok", symbol="ETH/USD", at=FILL_AT + timedelta(hours=1)
+    )
+    client = FakeActivitiesClient(
+        fills=[
+            _fill_activity(order_id=zero_order, side="buy", qty="0.5", price="60000", at=FILL_AT),
+            _fill_activity(
+                order_id=ok_order,
+                side="buy",
+                qty="0.5",
+                price="3000",
+                at=FILL_AT + timedelta(hours=1),
+                symbol="ETH/USD",
+            ),
+        ],
+        cfees=[_cfee(qty="-0.00125"), _cfee(qty="-0.0025", symbol="ETHUSD")],
+    )
+
+    _backfill(client)
+
+    assert _commission(db, zero_signal) == [None]
+    assert _commission(db, ok_signal) == [pytest.approx(0.0025 * 3000.0)]
+
+
+def test_plan_refuses_a_zero_quantity_local_order_without_aborting_the_pass():
+    from live_runner.alpaca_fees import plan_commission_backfill
+
+    def row(order_id: str, qty: float, execution_id: str) -> dict[str, Any]:
+        return {
+            "execution_id": execution_id,
+            "broker_order_id": order_id,
+            "symbol": "BTC/USD",
+            "action": "buy",
+            "filled_qty": qty,
+            "commission": None,
+        }
+
+    bad, good = _order_id("zero-qty"), _order_id("good-qty")
+    fills = [
+        _fill_activity(order_id=bad, side="buy", qty="0.5", price="60000", at=FILL_AT),
+        _fill_activity(
+            order_id=good, side="buy", qty="0.5", price="60000", at=FILL_AT + timedelta(hours=1)
+        ),
+    ]
+    rows = [row(bad, 0.0, "ex-bad"), row(good, 0.5, "ex-good")]
+
+    plans, _unplaced = plan_commission_backfill(
+        candidates=rows,
+        fill_activities=fills,
+        cfee_activities=[_cfee(qty="-0.00125")],
+        fee_activities=[],
+        local_rows=rows,
+        now=NOW,
+    )
+
+    assert plans, "planning must not raise"
+    (plan,) = plans
+    assert plan.problem is not None and "no positive recorded quantity" in plan.problem
+    assert plan.commissions == {}
