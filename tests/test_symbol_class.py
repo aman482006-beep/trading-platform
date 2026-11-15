@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pandas as pd
@@ -119,10 +120,44 @@ def test_refresh_routes_each_symbol_to_its_feed_and_skips_unclassifiable(monkeyp
 
 
 def test_bars_for_unslashed_and_slashed_crypto_share_one_key() -> None:
+    """Every form of the pair lands on one key, whichever side reads or writes it."""
     service = mds.LiveMarketDataStreamService()
     asyncio.run(service.ingest_manual_bars([{"symbol": "BTC/USD", "close": 1.0}]))
-    payload = asyncio.run(service.get_quote_payload("BTCUSD"))
-    assert payload["latest"]["close"] == 1.0
+    # A manual/backfill bar can arrive in the unslashed spelling too.
+    asyncio.run(service.ingest_manual_bars([{"symbol": "BTCUSD", "close": 2.0}]))
+    for requested in ("BTC/USD", "BTCUSD", "btc-usd"):
+        payload = asyncio.run(service.get_quote_payload(requested))
+        assert payload["latest"] is not None
+        assert [bar["close"] for bar in payload["bars"]] == [1.0, 2.0]
+    # Nothing may be stored under a second, raw key: a quote read for the
+    # canonical form would then silently miss bars.
+    assert service._bars_for_symbol("BTCUSD") == []
+
+
+def test_on_bar_keys_stream_bars_by_canonical_crypto_symbol() -> None:
+    """The live callback can deliver ``BTCUSD``; it belongs in the ``BTC/USD`` queue."""
+    service = mds.LiveMarketDataStreamService()
+    asyncio.run(
+        service._on_bar(
+            SimpleNamespace(
+                symbol="BTCUSD",
+                timestamp=datetime(2026, 11, 15, 12, 0, tzinfo=timezone.utc),
+                open=1.0,
+                high=1.0,
+                low=1.0,
+                close=7.0,
+                volume=1.0,
+            )
+        )
+    )
+    bars = service._bars_for_symbol("BTC/USD")
+    assert len(bars) == 1
+    assert bars[0]["close"] == 7.0
+    assert bars[0]["symbol"] == "BTCUSD"
+    assert service._bars_for_symbol("BTCUSD") == []
+    payload = asyncio.run(service.get_quote_payload("BTC/USD"))
+    assert payload["latest"] is not None
+    assert payload["latest"]["close"] == 7.0
 
 
 def test_get_market_data_uses_crypto_client_for_crypto_symbols() -> None:
@@ -152,9 +187,36 @@ def test_get_market_data_uses_crypto_client_for_crypto_symbols() -> None:
     assert len(frame.index) == 1
 
 
-def test_get_market_data_rejects_unclassifiable_symbol() -> None:
+def test_get_market_data_uses_stock_client_for_share_class_equity() -> None:
+    """``BF-B`` is a us_equity, so it must reach the stock client unmodified."""
+    calls: dict[str, object] = {}
+
+    class _Stock:
+        def get_stock_bars(self, request):
+            calls["symbols"] = request.symbol_or_symbols
+            idx = pd.DatetimeIndex([pd.Timestamp.now(tz="UTC")], name="timestamp")
+            frame = pd.DataFrame(
+                {"open": [1.0], "high": [1.0], "low": [1.0], "close": [1.0]}, index=idx
+            )
+            return SimpleNamespace(df=frame)
+
     adapter = AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
     adapter._connected = True
-    adapter._historical_data_client = object()
+    adapter._historical_data_client = _Stock()
+
+    frame = asyncio.run(adapter.get_market_data("BF-B", timeframe="1h", limit=1))
+
+    assert calls["symbols"] == ["BF-B"]
+    assert len(frame.index) == 1
+
+
+def test_get_market_data_rejects_unclassifiable_symbol() -> None:
+    class _Stock:
+        def get_stock_bars(self, request):  # pragma: no cover - must not be used
+            raise AssertionError("unclassifiable symbol routed to the stock client")
+
+    adapter = AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
+    adapter._connected = True
+    adapter._historical_data_client = _Stock()
     with pytest.raises(UnclassifiableSymbolError):
         asyncio.run(adapter.get_market_data("FOOBARUSD", timeframe="1h", limit=1))
