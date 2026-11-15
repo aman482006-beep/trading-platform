@@ -8787,7 +8787,7 @@ def _checked_matrix_result(filename: str, *, not_found_detail: str) -> _CheckedM
     is a check-time promise: anything renamed inside the results directory in
     between the two would have been followed. The descriptor opened here is the
     one the response streams, so the file that is served is the file that was
-    checked, and three things are refused instead of followed (#155):
+    checked, and four things are refused instead of followed (#155):
 
     * ``O_NOFOLLOW``, where the platform provides it, makes the kernel refuse a
       final component that has become a symlink since the check;
