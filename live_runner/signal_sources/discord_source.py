@@ -1314,9 +1314,10 @@ class DiscordSignalSource(BaseSignalSource):
         # B2: close the gap by paginating FORWARD from the cursor with `after`.
         # Discord returns an `after` page holding the messages immediately
         # after the anchor (the same contract discord.py's
-        # `history(after=...)` pagination relies on; see docs/signal_bots.md); each page is emitted in snowflake-id order (the
-        # response order is not relied on) and each full page anchors the next
-        # request; a short page proves the newest message was reached. The per-poll page
+        # `history(after=...)` pagination relies on; see docs/signal_bots.md).
+        # Each page is emitted in snowflake-id order (the response order is
+        # not relied on) and each full page anchors the next request; a short
+        # page proves the newest message was reached. The per-poll page
         # bound caps REST traffic and a larger gap is carried into the next
         # poll, because the cursor advances only to the newest message actually
         # emitted -- never past unfetched history. A 429 or error raised while
