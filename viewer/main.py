@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures.thread
+import errno
 import json
 import logging
 import math
 import os
 import re
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -15,7 +17,7 @@ import time
 import traceback
 import uuid
 import weakref
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
@@ -23,7 +25,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Literal
+from typing import Any, Awaitable, BinaryIO, Callable, Literal, NamedTuple
 
 import numpy as np
 import pandas as pd
@@ -39,7 +41,7 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, ValidationError
 from pydantic import Field as PydanticField
 from sentry_sdk.integrations.fastapi import FastApiIntegration
@@ -8973,11 +8975,140 @@ async def rename_strategy(name: str, payload: NameUpdateRequest) -> dict[str, An
         raise HTTPException(status_code=500, detail=_internal_error_detail(exc, "strategy rename")) from exc
 
 
+def _contained_in_results_dir(path: Path) -> bool:
+    """Whether ``path`` is a file directly inside the resolved results directory.
+
+    The directory itself is refused: it is contained, and handing it out would
+    send a caller (or a response) at a directory instead of a file.
+    """
+    base = MATRIX_RESULTS_DIR.resolve()
+    return path != base and path.is_relative_to(base)
+
+
 def _matrix_result_path(filename: str) -> Path:
+    """Return the resolved path of a matrix result file inside MATRIX_RESULTS_DIR.
+
+    Separator and drive forms are refused up front so the same input is rejected
+    on Linux, Windows and macOS alike. The candidate is then resolved (following
+    symlinks) and must stay inside the resolved results directory (#155).
+    """
     normalized = str(filename or "").strip()
-    if not normalized or ".." in normalized or normalized.startswith("/"):
+    if (
+        not normalized
+        or ".." in normalized
+        or normalized.startswith("/")
+        or "\\" in normalized
+        or ":" in normalized
+    ):
         raise HTTPException(status_code=400, detail="Invalid matrix filename")
-    return MATRIX_RESULTS_DIR / normalized
+    resolved = (MATRIX_RESULTS_DIR / normalized).resolve()
+    if not _contained_in_results_dir(resolved):
+        raise HTTPException(status_code=400, detail="Invalid matrix filename")
+    return resolved
+
+
+class _CheckedMatrixResult(NamedTuple):
+    """A matrix result file opened from the path that containment approved."""
+
+    path: Path
+    handle: BinaryIO
+    size: int
+
+
+def _checked_matrix_result(filename: str, *, not_found_detail: str) -> _CheckedMatrixResult:
+    """Open the matrix result file :func:`_matrix_result_path` just approved.
+
+    Checking a path and opening it are two separate walks, so containment alone
+    is a check-time promise: anything renamed inside the results directory in
+    between the two would have been followed. The descriptor opened here is the
+    one the response streams, so the file that is served is the file that was
+    checked, and four things are refused instead of followed (#155):
+
+    * ``O_NOFOLLOW``, where the platform provides it, makes the kernel refuse a
+      final component that has become a symlink since the check;
+    * the path is resolved *again* after the open and required to be contained,
+      which covers a swapped directory component -- the same escape one level
+      up, and one the kernel cannot see at the final component;
+    * a regular file is required, so a name that resolves to a directory, or to
+      a file that is gone, answers the caller instead of failing inside the
+      response;
+    * ``O_NONBLOCK`` keeps the open itself from blocking, so a FIFO or device
+      planted under the name answers instead of stalling the request -- and with
+      it the event loop every other request shares.
+
+    ``O_NOFOLLOW`` is read through ``getattr`` because it is not in every
+    platform's ``os`` module; where it is missing, the containment re-check is
+    what closes that window. A rename that is undone before that re-check cannot
+    be seen from here at all; excluding it needs the components opened one at a
+    time relative to a directory descriptor (``dir_fd``), which is not available
+    on every platform this runs on.
+    """
+    path = _matrix_result_path(filename)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    nonblock = getattr(os, "O_NONBLOCK", 0)
+    # Windows opens in text mode unless O_BINARY is passed: reads would turn
+    # CRLF into LF and stop at 0x1A, so the body would not match Content-Length.
+    binary = getattr(os, "O_BINARY", 0)
+    try:
+        descriptor = os.open(path, os.O_RDONLY | binary | nofollow | nonblock)
+    except OSError as exc:
+        if exc.errno == getattr(errno, "ELOOP", None):
+            # A symlink stands where the check found a regular file.
+            raise HTTPException(status_code=400, detail="Invalid matrix filename") from exc
+        raise HTTPException(status_code=404, detail=not_found_detail) from exc
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise HTTPException(status_code=404, detail=not_found_detail)
+        if not _contained_in_results_dir(Path(os.path.realpath(path))):
+            raise HTTPException(status_code=400, detail="Invalid matrix filename")
+    except HTTPException:
+        os.close(descriptor)
+        raise
+    except OSError as exc:
+        os.close(descriptor)
+        raise HTTPException(status_code=404, detail=not_found_detail) from exc
+    return _CheckedMatrixResult(path, os.fdopen(descriptor, "rb"), info.st_size)
+
+
+class _MatrixCsvResponse(StreamingResponse):
+    """Stream a matrix CSV from the descriptor that containment checked.
+
+    ``FileResponse`` opens its path when the response is sent, so the bytes it
+    serves come from a second, unchecked walk -- the window
+    ``_checked_matrix_result`` exists to close. Streaming the open descriptor
+    instead keeps the route declared as a CSV download.
+    """
+
+    media_type = "text/csv"
+
+
+def _stream_matrix_result(handle: BinaryIO, chunk_size: int = 64 * 1024) -> Iterator[bytes]:
+    """Yield the open descriptor's bytes in the order it reads them.
+
+    A generator, so the reads run where ``StreamingResponse`` runs its content
+    -- in a thread pool -- rather than on the event loop.
+    """
+    try:
+        while True:
+            chunk = handle.read(chunk_size)
+            if not chunk:
+                return
+            yield chunk
+    finally:
+        handle.close()
+
+
+def _matrix_result_response(filename: str, *, not_found_detail: str) -> _MatrixCsvResponse:
+    """Serve a matrix result file, or say why there is nothing to serve."""
+    checked = _checked_matrix_result(filename, not_found_detail=not_found_detail)
+    return _MatrixCsvResponse(
+        _stream_matrix_result(checked.handle),
+        headers={
+            "content-disposition": f'attachment; filename="{checked.path.name}"',
+            "content-length": str(checked.size),
+        },
+    )
 
 
 def _stale_grid_findings(
@@ -9069,6 +9200,9 @@ def _matrix_summary_payload() -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=_internal_error_detail(exc, "matrix summary")) from exc
     runs = [row for row in payload.get("runs", []) if isinstance(row, dict)]
     _refuse_stale_grid_rows(runs, source="matrix summary")
+    # A path, not an open file: these are informational strings describing where
+    # the results would be, so a run that produced no CSV yet still answers. The
+    # routes that serve them go through _checked_matrix_result.
     payload["matrix_csv"] = str(_matrix_result_path("matrix_matrix.csv"))
     payload["daily_equity_csv"] = str(_matrix_result_path("matrix_daily_equity.csv"))
     return payload
@@ -9146,20 +9280,16 @@ async def get_backtest_matrix_summary() -> dict[str, Any]:
     return _matrix_summary_payload()
 
 
-@app.get("/api/backtests/matrix/matrix.csv", response_class=FileResponse)
-async def get_backtest_matrix_csv() -> FileResponse:
-    path = _matrix_result_path("matrix_matrix.csv")
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="Matrix CSV not found")
-    return FileResponse(path, media_type="text/csv", filename=path.name)
+@app.get("/api/backtests/matrix/matrix.csv", response_class=_MatrixCsvResponse)
+async def get_backtest_matrix_csv() -> _MatrixCsvResponse:
+    return _matrix_result_response("matrix_matrix.csv", not_found_detail="Matrix CSV not found")
 
 
-@app.get("/api/backtests/matrix/daily-equity.csv", response_class=FileResponse)
-async def get_backtest_matrix_daily_equity_csv() -> FileResponse:
-    path = _matrix_result_path("matrix_daily_equity.csv")
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="Matrix daily equity CSV not found")
-    return FileResponse(path, media_type="text/csv", filename=path.name)
+@app.get("/api/backtests/matrix/daily-equity.csv", response_class=_MatrixCsvResponse)
+async def get_backtest_matrix_daily_equity_csv() -> _MatrixCsvResponse:
+    return _matrix_result_response(
+        "matrix_daily_equity.csv", not_found_detail="Matrix daily equity CSV not found"
+    )
 
 
 @app.get("/api/grid/{strategy_id:path}")
