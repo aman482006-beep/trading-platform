@@ -19,7 +19,6 @@ from runner.stats import compute_stats
 from shared.models import EquityPoint
 
 RETURN_METRICS = ("sharpe_ratio", "sortino_ratio", "psr", "p_value")
-RUIN_UNDEFINED_METRICS = RETURN_METRICS + ("cagr", "calmar_ratio")
 START = datetime(2021, 1, 4, tzinfo=timezone.utc)
 
 
@@ -135,3 +134,25 @@ def test_no_curve_is_not_ruined() -> None:
 
     assert stats["ruined"] is False
     assert stats["ruin_time"] is None
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")], ids=str)
+def test_non_finite_equity_is_ruin_and_fails_closed(quantstats_flag, bad) -> None:
+    """NaN/inf equity is never a tradeable account: treat it as ruin, never skip it."""
+    curve = _curve(PRE_RUIN + [bad, 120_000.0])
+    stats = compute_stats([], initial_capital=100_000.0, equity_curve=curve)
+
+    assert stats["ruined"] is True
+    assert stats["ruin_time"] == curve[len(PRE_RUIN)].time
+    for metric in RETURN_METRICS + ("cagr", "calmar_ratio"):
+        assert stats[metric] is None, metric
+        assert metric in stats["undefined_metrics"], metric
+
+
+def test_degenerate_curves_name_return_and_drawdown_as_undefined() -> None:
+    """Consumers resolve these through `undefined_metrics`, not the published 0.0."""
+    for equities in ([], [100_000.0], [0.0]):
+        stats = compute_stats([], initial_capital=100_000.0, equity_curve=_curve(equities))
+
+        for metric in ("total_return", "max_drawdown_pct"):
+            assert metric in stats["undefined_metrics"], (metric, equities)

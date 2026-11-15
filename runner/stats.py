@@ -339,10 +339,16 @@ def _truncate_at_ruin(
     equity means the account is gone: nothing after that point is a path the
     strategy could have traded, so no equity metric may see it, and no return
     metric can be measured over a series that ends in ruin.
+
+    A non-finite equity (NaN/inf) also counts as ruin and fails closed: it is
+    not a tradeable account, and silently skipping it would let a corrupt
+    curve publish measured-looking ratios and pass the live-deployment gate.
+    The test is ``not (equity > 0)``, which is true for NaN as well.
     """
     ordered = _equity_curve_in_time_order(equity_curve)
     for index, point in enumerate(ordered):
-        if float(point.equity) <= 0:
+        equity = float(point.equity)
+        if not (math.isfinite(equity) and equity > 0):
             return ordered[: index + 1], True, point.time
     # Not ruined: hand back the curve exactly as given so a healthy run's
     # metrics do not depend on this sort (only the ruin search needs time order).
