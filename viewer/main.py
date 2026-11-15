@@ -156,8 +156,10 @@ from shared.models import (
     Service,
     ServiceStatus,
     ServiceType,
+    TradeContractError,
     VerificationEvidenceRecord,
     VerificationEvidenceSummary,
+    execution_price_is_usable,
     resolve_defined_stat,
 )
 from shared.models import (
@@ -1817,8 +1819,36 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
     )
 
 
+class _StoredResultViolatesContract(Exception):
+    """A stored backtest row exists but breaks the Trade contract."""
+
+
+def _load_stored_result_or_raise(backtest_id: str) -> BacktestResult | None:
+    """``load_backtest_result``; a Trade-contract violation (e.g. a legacy
+    lower-case direction) is logged and re-raised as a private marker. Every
+    other error propagates unchanged."""
+    try:
+        return load_backtest_result(backtest_id)
+    except TradeContractError as exc:
+        logger.warning("Stored backtest %s violates the trade contract: %s", backtest_id, exc)
+        raise _StoredResultViolatesContract(backtest_id) from exc
+
+
+def _load_stored_result(backtest_id: str) -> BacktestResult | None:
+    """Stored result, or ``None`` when it is missing or breaks the Trade contract."""
+    try:
+        return _load_stored_result_or_raise(backtest_id)
+    except _StoredResultViolatesContract:
+        return None
+
+
 def _load_result(backtest_id: str) -> BacktestResult | None:
-    result = load_backtest_result(backtest_id)
+    try:
+        result = _load_stored_result_or_raise(backtest_id)
+    except _StoredResultViolatesContract:
+        # The row exists: never fall back to the JSON artifact here, since that
+        # path rewrites the stored rows on a read.
+        return None
     if result is not None:
         return result
 
@@ -3416,7 +3446,13 @@ def _backtest_summary_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
         if initial_capital > 0
         else total_return_decimal * 100.0
     )
-    cagr_decimal = _safe_float(meta.get("cagr"), total_return_decimal)
+    # An undefined CAGR (ruined run, #132) stays undefined: falling back to the
+    # total return would publish a measured-looking annualised figure.
+    cagr_decimal = (
+        _optional_float(meta.get("cagr"))
+        if "cagr" in meta
+        else total_return_decimal
+    )
     sharpe_ratio = _optional_float(meta.get("sharpe_ratio"))
     psr = _optional_float(meta.get("psr"))
     p_value = _optional_float(meta.get("p_value"))
@@ -3443,7 +3479,7 @@ def _backtest_summary_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
         "created_at": str(meta.get("created_at") or ""),
         "sharpe": sharpe_ratio,
         "sharpe_ratio": sharpe_ratio,
-        "cagr": round(cagr_decimal * 100.0, 2),
+        "cagr": round(cagr_decimal * 100.0, 2) if cagr_decimal is not None else None,
         "max_drawdown_pct": round(max_drawdown_decimal * 100.0, 2),
         "net_profit": round(total_pnl, 6),
         "net_profit_pct": round(net_profit_pct, 2),
@@ -5490,14 +5526,78 @@ def _calculate_realized_live_pnl(
     return total_pnl, wins, losses
 
 
+def _live_commission_totals(rows: list[dict[str, Any]]) -> tuple[float | None, int]:
+    """The summed commission of ``rows`` and how many are unknown; the sum is None if any is.
+
+    An unknown (NULL) commission is "the broker has not told us yet" - Alpaca posts crypto fees end
+    of day (#124). Netting it as zero would overstate net PnL, so one unknown row makes the total
+    unknown rather than a smaller number that looks complete.
+    """
+    total = 0.0
+    unknown = 0
+    for row in rows:
+        commission = row.get("commission")
+        if commission is None:
+            unknown += 1
+            continue
+        total += _safe_float(commission, 0.0)
+    return (None if unknown else total), unknown
+
+
+def _live_unpriced_fill_count(rows: list[dict[str, Any]]) -> int:
+    """How many buy/sell fills carry real quantity at an unusable price (#124, review of #143).
+
+    Such a fill (stored at 0.0 with `sent_bad`, `absent` or `derived_unavailable`, served as
+    `actual_price: None`) still moved the position. `_calculate_realized_live_pnl` cannot price
+    it, so every realized number after it is unknown rather than a smaller real number.
+    """
+    count = 0
+    for row in rows:
+        action = str(row.get("action") or "").strip().lower()
+        if action not in ("buy", "sell") or abs(_safe_float(row.get("filled_qty"), 0.0)) <= 0.0:
+            continue
+        if not execution_price_is_usable(row.get("actual_price"), row.get("actual_price_observed")):
+            count += 1
+    return count
+
+
 def _live_account_stats_payload(account_id: str) -> dict[str, Any]:
     balances, execution_rows = load_live_account_stats_inputs(account_id)
 
     total_pnl_realized, wins, losses = _calculate_realized_live_pnl(execution_rows)
+    # A fill at an unknown price makes realized PnL unknown, like an unknown fee makes net PnL
+    # unknown: never a 0.0 price.
+    price_unknown_count = _live_unpriced_fill_count(execution_rows)
+    pnl_complete = price_unknown_count == 0
+    # `total_pnl` is gross (price PnL of closed round trips). Net PnL subtracts every execution's
+    # commission and is reported only when every commission is known.
+    total_commission, commission_unknown_count = _live_commission_totals(execution_rows)
+    net_pnl = (
+        round(total_pnl_realized - total_commission, 2)
+        if total_commission is not None and pnl_complete
+        else None
+    )
     # Win rate denominators are closed round trips (a win or a loss), never raw
     # execution rows: partial fills would otherwise deflate the ratio.
     total_trades = wins + losses
     win_rate = (wins / total_trades * 100.0) if total_trades else 0.0
+    # The counts come from the same walk as `total_pnl`, so they are just as incomplete when a
+    # fill's price is unknown: report them as unknown, never as a measured win or loss.
+    win_loss_fields: dict[str, Any] = (
+        {
+            "total_trades": total_trades,
+            "winning_trades": wins,
+            "losing_trades": losses,
+            "win_rate": round(win_rate, 2),
+        }
+        if pnl_complete
+        else {
+            "total_trades": None,
+            "winning_trades": None,
+            "losing_trades": None,
+            "win_rate": None,
+        }
+    )
 
     max_drawdown = 0.0
     max_drawdown_pct = 0.0
@@ -5517,11 +5617,16 @@ def _live_account_stats_payload(account_id: str) -> dict[str, Any]:
 
     return {
         "account_id": account_id,
-        "total_trades": total_trades,
-        "winning_trades": wins,
-        "losing_trades": losses,
-        "win_rate": round(win_rate, 2),
-        "total_pnl": round(total_pnl_realized, 2),
+        **win_loss_fields,
+        "total_pnl": round(total_pnl_realized, 2) if pnl_complete else None,
+        "pnl_complete": pnl_complete,
+        "price_unknown_count": price_unknown_count,
+        "total_commission": (
+            round(total_commission, 2) if total_commission is not None else None
+        ),
+        "commission_unknown_count": commission_unknown_count,
+        "net_pnl": net_pnl,
+        "net_pnl_complete": pnl_complete and commission_unknown_count == 0,
         "max_drawdown": round(max_drawdown, 2),
         "max_drawdown_pct": round(max_drawdown_pct, 2),
         "current_balance": round(current_balance, 2),
@@ -8802,7 +8907,7 @@ def _matrix_grid_row_with_trades(row: dict[str, Any], *, trades_limit: int) -> d
         enriched["trade_sample_count"] = 0
         return enriched
 
-    result = load_backtest_result(backtest_id)
+    result = _load_stored_result(backtest_id)
     if result is None:
         enriched.setdefault("trades", [])
         enriched["trade_sample_count"] = 0
@@ -11992,9 +12097,11 @@ async def _live_trades_payload(account_id: str) -> dict[str, Any]:
                 "symbol": row.get("symbol", ""),
                 "action": row.get("action", ""),
                 "theoretical_price": float(row.get("theoretical_price", 0.0)),
-                "actual_price": float(row.get("actual_price", 0.0)),
-                "slippage": float(row.get("slippage", 0.0)),
-                "slippage_bps": float(row.get("slippage_bps", 0.0)),
+                # None is "no usable price" (#124, review of #143), never a fill at 0.0.
+                "actual_price": _optional_float(row.get("actual_price")),
+                "actual_price_observed": row.get("actual_price_observed"),
+                "slippage": _optional_float(row.get("slippage")),
+                "slippage_bps": _optional_float(row.get("slippage_bps")),
                 "filled_qty": float(row.get("filled_qty", 0.0)),
                 "position_size": _execution_risk_value(row, metadata, "position_size"),
                 "risk_amount": _execution_risk_value(row, metadata, "risk_amount"),
@@ -12004,7 +12111,12 @@ async def _live_trades_payload(account_id: str) -> dict[str, Any]:
                     if row.get("exit_reason") not in (None, "")
                     else None
                 ),
-                "commission": float(row.get("commission", 0.0)),
+                # None is "fee not known yet" (#124), never a zero fee.
+                "commission": (
+                    _safe_float(row.get("commission"))
+                    if row.get("commission") is not None
+                    else None
+                ),
                 "signal_timestamp": signal_iso,
                 "signal_time": signal_unix,
                 "execution_timestamp": execution_iso,
@@ -12515,8 +12627,9 @@ async def get_live_dashboard() -> dict[str, Any]:
                 **_serialize_live_account_payload(account),
                 "current_equity": equity,
                 "current_balance": _safe_float(stats.get("current_balance"), 0.0),
-                "total_trades": stats.get("total_trades", 0),
-                "total_pnl": stats.get("total_pnl", 0.0),
+                # None means "unknown" (an unusable fill price), not zero: pass it through.
+                "total_trades": stats["total_trades"] if "total_trades" in stats else 0,
+                "total_pnl": stats["total_pnl"] if "total_pnl" in stats else 0.0,
             }
         )
         recent_fills.extend(trades_payload.get("trades", [])[:10])
