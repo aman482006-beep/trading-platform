@@ -135,6 +135,13 @@ Ohne Allowlist startet der Listener nicht (fail-closed). Zusätzlich gilt:
   geloggt. IDs unterhalb des Cursors werden nie erneut emittiert; ein nicht
   numerischer Cursor wird verworfen und neu aufgesetzt (Warnung). Snowflake-IDs
   sind nicht fortlaufend, daher wird keine Nachrichtenanzahl berechnet.
+  Grundlage ist die Semantik von `after`: Discord liefert mit `after=<id>&limit=N`
+  die N Nachrichten direkt nach der ID, im Array neueste zuerst
+  ([Get Channel Messages](https://docs.discord.com/developers/resources/message#get-channel-messages):
+  "Returns an array of message objects from newest to oldest"). Dass es die
+  ältesten N nach der ID sind, steht dort nicht wörtlich; discord.py verlässt sich
+  aber genauso darauf (`Messageable.history(after=...)`, `_after_strategy` setzt
+  `after` auf `data[0]` und dreht die Seite um).
   Der Cursor liegt nur im Speicher: beim Start (`_prime_cursors`) wird er auf die
   neueste Seite gesetzt, ohne sie zu emittieren. Nachrichten aus einer Downtime,
   die älter als diese Seite sind, werden daher nicht nachgeholt und erreichen auch
