@@ -7,6 +7,7 @@ import logging
 import pandas as pd
 import pytest
 
+import runner.risk_parity_optimizer as rpo
 from runner.risk_parity_optimizer import select_best_risk_parity_universe
 
 
@@ -33,6 +34,29 @@ def test_infeasible_universes_are_skipped_with_log(caplog: pytest.LogCaptureFixt
     assert len(result["evaluated_universes"]) == 1
     assert all(w <= 0.4 + 1e-9 for w in result["best_weights"].values())
     assert any("Skipping risk parity universe" in r.message for r in caplog.records)
+
+
+def test_infeasible_universe_is_never_scored_and_is_reported(monkeypatch) -> None:
+    """The skip itself: an infeasible universe must not reach the scorer."""
+    calls: list[list[str]] = []
+    real_score = rpo.score_risk_parity_universe
+
+    def spy(symbols, returns, **kwargs):
+        calls.append(list(symbols))
+        return real_score(symbols, returns, **kwargs)
+
+    monkeypatch.setattr(rpo, "score_risk_parity_universe", spy)
+    result = select_best_risk_parity_universe(
+        _frame(),
+        [["SPY", "TLT"], ["SPY", "TLT", "GLD"]],
+        max_weight=0.4,
+    )
+
+    assert calls == [["SPY", "TLT", "GLD"]]
+    assert result["best_symbols"] == ["SPY", "TLT", "GLD"]
+    # Skipped universes are reported, not silently absent from the payload.
+    assert result["infeasible_skipped"] == 1
+    assert len(result["evaluated_universes"]) == 1
 
 
 def test_all_universes_infeasible_raises_clear_error() -> None:
@@ -66,3 +90,55 @@ def test_backtest_script_rejects_infeasible_max_weight() -> None:
 
     with pytest.raises(ValueError, match="max_weight"):
         script.calculate_risk_parity_weights(np.eye(4), 0.0, 0.2, ["A", "B", "C", "D"])
+
+
+def test_backtest_script_rejects_infeasible_min_weight() -> None:
+    """The sibling guard: min_weight * n > 1 cannot satisfy sum(w) == 1.
+
+    Without it SLSQP fails, the unbounded inverse-vol fallback runs and the
+    projection silently returns a non-summing "weights" dict - a wrong-weight
+    portfolio reported as computed rather than refused.
+    """
+    import numpy as np
+    import pytest
+
+    import scripts.run_risk_parity_backtest as script
+
+    with pytest.raises(ValueError, match="min_weight"):
+        script.calculate_risk_parity_weights(np.eye(4), 0.4, 0.6, ["A", "B", "C", "D"])
+
+
+def test_backtest_script_clamps_bounds_before_the_solver(monkeypatch) -> None:
+    """A negative min_weight / max_weight > 1 must not reach SLSQP or the projection.
+
+    The module's solver clamps to the long-only simplex; the script's copy of
+    the check did not, so out-of-range bounds entered the solver and the
+    projection raw (the in-repo callers pass 0.02/0.30, so it stayed latent).
+    """
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    import scripts.run_risk_parity_backtest as script
+
+    solver_bounds: list[tuple[float, float]] = []
+    projections: list[tuple[float, float]] = []
+    real_projection = script._project_to_capped_simplex
+
+    def fake_minimize(*_args, **kwargs):
+        solver_bounds.extend(kwargs["bounds"])
+        return SimpleNamespace(success=False, x=None)
+
+    def spy_projection(values, *, lower, upper):
+        projections.append((lower, upper))
+        return real_projection(values, lower=lower, upper=upper)
+
+    monkeypatch.setattr(script, "minimize", fake_minimize)
+    monkeypatch.setattr(script, "_project_to_capped_simplex", spy_projection)
+
+    weights = script.calculate_risk_parity_weights(np.eye(3), -0.25, 1.25, ["A", "B", "C"])
+
+    assert solver_bounds == [(0.0, 1.0)] * 3
+    assert projections == [(0.0, 1.0)]
+    assert sum(weights.values()) == pytest.approx(1.0)
+    assert all(0.0 <= weight <= 1.0 for weight in weights.values())

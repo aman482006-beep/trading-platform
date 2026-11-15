@@ -14,7 +14,10 @@ import numpy as np
 import pytest
 
 import runner.risk_parity_optimizer as rpo
-from runner.risk_parity_optimizer import solve_risk_parity_weights
+from runner.risk_parity_optimizer import (
+    _project_to_capped_simplex,
+    solve_risk_parity_weights,
+)
 
 TOL = 1e-9
 
@@ -111,3 +114,38 @@ def test_infeasible_min_weight_still_raises() -> None:
     cov = np.eye(3) * 0.01
     with pytest.raises(ValueError, match="min_weight"):
         solve_risk_parity_weights(cov, min_weight=0.4, max_weight=0.6)
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_projection_returns_a_point_of_the_capped_simplex(seed: int) -> None:
+    """The projection itself: sum == 1 inside [lower, upper] on its own.
+
+    The fallback example only showed the projection broke (a sum of 0), which
+    does not point at the bisection. Assert the invariant directly.
+    """
+    rng = np.random.default_rng(50_000 + seed)
+    n = int(rng.integers(2, 9))
+    lower = float(rng.uniform(0.0, 1.0 / n))
+    upper = float(rng.uniform(max(lower, 1.0 / n), 1.0))
+    values = rng.normal(0.0, 5.0, size=n)
+
+    projected = _project_to_capped_simplex(values, lower=lower, upper=upper)
+
+    _assert_feasible(projected, n, lower, upper)
+
+
+def test_bounds_that_cross_within_tolerance_raise() -> None:
+    """min_weight above max_weight leaves the capped simplex empty.
+
+    Both bound checks pass inside _FEASIBILITY_TOL (n=2, min=0.5+e,
+    max=0.5-e), and np.clip with a_min > a_max returns a_max everywhere, so the
+    projection would return weights summing to 1 - 2e: the documented
+    "weights always sum to 1" invariant would be silently broken. Refuse the
+    bounds instead of returning a portfolio that does not sum to 1.
+    """
+    cov = np.eye(2) * 0.01
+
+    with pytest.raises(ValueError, match="min_weight"):
+        solve_risk_parity_weights(
+            cov, min_weight=0.5 + 1e-13, max_weight=0.5 - 1e-13
+        )
