@@ -15,8 +15,9 @@ committed comparison cases, plus the remaining limitations.
   a non-zero platform now yields `relative_delta: null` plus a note; zero on
   both sides stays `0.0`.
 - Why: the symmetric denominator halved real drift — a reference of 100 against
-  a platform of 200 read as 50%, not 100% (#128). Tolerance gates elsewhere
-  (readiness, risk comparison) already measured against the reference.
+  a platform of 200 read as 50%, not 100% (#128). Readiness already measured
+  against the reference; the same PR moves the risk-comparison gate
+  (`validation/risk/comparison.py`) from the symmetric base to the reference.
 - Focused tests: `tests/test_relative_deviation_reference.py`.
 
 ### Before/after matrix

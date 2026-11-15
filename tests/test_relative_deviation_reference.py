@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from validation.comparison.tolerances import relative_difference
 from validation.risk.comparison import _pct_diff
 from validation.statistics.cross_platform import _metric_delta
 
@@ -144,3 +145,9 @@ def test_no_max_abs_relative_denominator_left_in_validation() -> None:
         "tolerance-gate relative deviations must use the reference magnitude; "
         "max(abs(a), abs(b)) denominators remain at:\n" + "\n".join(offenders)
     )
+
+
+def test_relative_difference_uses_reference_base() -> None:
+    """`relative_difference(expected, actual)` divides by the expected value."""
+    assert relative_difference(100.0, 200.0) == pytest.approx(1.0)
+    assert relative_difference(10.0, 50.0) == pytest.approx(4.0)
