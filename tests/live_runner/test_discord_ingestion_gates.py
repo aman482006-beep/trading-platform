@@ -1369,6 +1369,92 @@ class TestIssueB2Backfill:
 
         assert calls == [cursor]
         assert source._last_seen_message_ids["channel-1"] == cursor
+        assert source._queue.qsize() == 0, "stale ids must never be re-emitted"
+
+    def test_stale_ids_are_not_emitted_even_after_seen_set_pruning(self) -> None:
+        """A below-cursor id the seen-set forgot must still not be re-emitted."""
+        import asyncio
+
+        source = _source(trusted_author_ids={"bot-1"})
+        source._last_seen_message_ids["channel-1"] = "1010"
+        # seen-set is empty (as if pruned): only the cursor protects ids <= 1010.
+        page = [_burst_message(i) for i in (12, 11, 10, 5)]
+
+        async def _fetch(_channel_id, *, after=None, **kwargs):
+            return list(page) if after == "1010" else []
+
+        source._fetch_messages = _fetch
+        asyncio.run(source._poll_once("channel-1"))
+        queued = [source._queue.get_nowait() for _ in range(source._queue.qsize())]
+        ids = [item.metadata["discord_message_id"] for item in queued]
+        assert ids == ["1011", "1012"]
+        assert source._last_seen_message_ids["channel-1"] == "1012"
+
+    def test_first_poll_seeds_cursor_from_max_numeric_id_not_page_head(self) -> None:
+        import asyncio
+
+        source = _source(trusted_author_ids={"bot-1"})
+        # Poison row first, and an oldest-first page: head is not the newest.
+        page = [{**_burst_message(9), "id": "poison"}] + [
+            _burst_message(i) for i in (1, 2, 3)
+        ]
+
+        async def _fetch(_channel_id, **kwargs):
+            return list(page)
+
+        source._fetch_messages = _fetch
+        asyncio.run(source._poll_once("channel-1"))
+        assert source._last_seen_message_ids["channel-1"] == "1003"
+
+    def test_first_poll_with_only_poison_ids_sets_no_cursor(self) -> None:
+        import asyncio
+
+        source = _source(trusted_author_ids={"bot-1"})
+
+        async def _fetch(_channel_id, **kwargs):
+            return [{**_burst_message(1), "id": "poison"}]
+
+        source._fetch_messages = _fetch
+        asyncio.run(source._poll_once("channel-1"))
+        assert "channel-1" not in source._last_seen_message_ids
+
+    def test_prime_cursors_uses_max_numeric_id_and_skips_poison_head(self) -> None:
+        import asyncio
+
+        source = _source(trusted_author_ids={"bot-1"})
+        page = [{**_burst_message(9), "id": "None"}, _burst_message(2), _burst_message(4)]
+
+        async def _fetch(_channel_id, **kwargs):
+            return list(page)
+
+        source._fetch_messages = _fetch
+        asyncio.run(source._prime_cursors(["channel-1"]))
+        assert source._last_seen_message_ids["channel-1"] == "1004"
+
+        source2 = _source(trusted_author_ids={"bot-1"})
+
+        async def _fetch_poison(_channel_id, **kwargs):
+            return [{**_burst_message(1), "id": "None"}]
+
+        source2._fetch_messages = _fetch_poison
+        asyncio.run(source2._prime_cursors(["channel-1"]))
+        assert "channel-1" not in source2._last_seen_message_ids
+
+    def test_non_numeric_stored_cursor_is_reprimed_not_used_as_after(self) -> None:
+        import asyncio
+
+        source = _source(trusted_author_ids={"bot-1"})
+        source._last_seen_message_ids["channel-1"] = "None"
+        calls: list[dict[str, object]] = []
+
+        async def _fetch(_channel_id, **kwargs):
+            calls.append(kwargs)
+            return [_burst_message(3), _burst_message(2)]
+
+        source._fetch_messages = _fetch
+        asyncio.run(source._poll_once("channel-1"))
+        assert calls == [{}], "poisoned cursor must not be sent as `after`"
+        assert source._last_seen_message_ids["channel-1"] == "1003"
 
     def test_first_poll_without_cursor_emits_in_order_and_seeds_the_cursor(self) -> None:
         """Without a cursor the newest page is read once, oldest first."""

@@ -268,6 +268,22 @@ def _safe_message_id_int(message_id: str) -> int | None:
         return None
 
 
+def _message_sort_key(message: dict[str, Any]) -> tuple[bool, int]:
+    """Chronological snowflake order; a non-numeric (poison) id sorts last."""
+    parsed = _safe_message_id_int(str(message.get("id")))
+    return (parsed is None, parsed or 0)
+
+
+def _newest_numeric_id(page: Iterable[dict[str, Any]]) -> str | None:
+    """Highest numeric message id in ``page``, or ``None`` if none is numeric."""
+    values = [
+        value
+        for value in (_safe_message_id_int(str(m.get("id"))) for m in page)
+        if value is not None
+    ]
+    return str(max(values)) if values else None
+
+
 def _is_discord_auth_error(exc: BaseException | None) -> bool:
     if exc is None:
         return False
@@ -1262,6 +1278,23 @@ class DiscordSignalSource(BaseSignalSource):
     async def _poll_once(self, channel_id: str, *, emit: bool = True) -> None:
         seen = self._seen_ids.setdefault(channel_id, set())
         last_seen = self._last_seen_message_ids.get(channel_id, "")
+        if last_seen and _safe_message_id_int(last_seen) is None:
+            # A non-numeric cursor can never anchor `after=`: Discord would
+            # reject every request and the channel would ingest nothing
+            # forever. Drop it and re-seed from the newest page instead.
+            logger.warning(
+                "Discord cursor is not a numeric snowflake; re-priming",
+                extra={
+                    "data": {
+                        "bot_name": self.bot_name,
+                        "service_id": self.service_id,
+                        "channel_id": channel_id,
+                        "last_seen_message_id": last_seen,
+                    }
+                },
+            )
+            self._last_seen_message_ids.pop(channel_id, None)
+            last_seen = ""
         if not last_seen:
             # First poll without a cursor (the daemon primes the cursor in
             # `_prime_cursors` first; this path is a direct/priming-less call).
@@ -1270,9 +1303,11 @@ class DiscordSignalSource(BaseSignalSource):
             first_page = await self._fetch_messages(channel_id)
             if not first_page:
                 return
-            for message in reversed(first_page):
+            for message in sorted(first_page, key=_message_sort_key):
                 await self._emit_polled_message(channel_id, message, seen, emit=emit)
-            self._last_seen_message_ids[channel_id] = str(first_page[0].get("id"))
+            newest = _newest_numeric_id(first_page)
+            if newest is not None:
+                self._advance_cursor(channel_id, newest)
             self._prune_seen_ids(channel_id, seen)
             return
 
@@ -1299,25 +1334,37 @@ class DiscordSignalSource(BaseSignalSource):
             # round. A non-numeric (poison) id sorts last and never becomes
             # the cursor: anchoring on it would re-request the same page on
             # every poll and stall the channel behind one malformed message.
-            numeric_ids = [
-                value
-                for value in (_safe_message_id_int(str(m.get("id"))) for m in page)
-                if value is not None
+            # `after` guarantees every id is above the anchor. A numeric id at
+            # or below it is stale (a server ignoring `after`): never emit it,
+            # since the seen-set may already have pruned it and a re-emit
+            # would be a duplicate trade signal.
+            anchor_int = _safe_message_id_int(anchor)
+            fresh = [
+                m
+                for m in page
+                if (parsed := _safe_message_id_int(str(m.get("id")))) is None
+                or anchor_int is None
+                or parsed > anchor_int
             ]
-            ordered = sorted(
-                page,
-                key=lambda m: (
-                    (parsed := _safe_message_id_int(str(m.get("id")))) is None,
-                    parsed or 0,
-                ),
-            )
+            if len(fresh) < len(page):
+                logger.warning(
+                    "Discord page contained ids at or below the cursor; dropped",
+                    extra={
+                        "data": {
+                            "channel_id": channel_id,
+                            "anchor": anchor,
+                            "dropped": len(page) - len(fresh),
+                        }
+                    },
+                )
+            ordered = sorted(fresh, key=_message_sort_key)
             for message in ordered:
                 await self._emit_polled_message(channel_id, message, seen, emit=emit)
-            if not numeric_ids:
+            newest_in_page = _newest_numeric_id(fresh)
+            if newest_in_page is None:
                 # Nothing in the page can anchor another request; stop and let
                 # the next poll retry from the last good cursor.
                 break
-            newest_in_page = str(max(numeric_ids))
             if not self._advance_cursor(channel_id, newest_in_page):
                 # The page did not move past the cursor (a server ignoring
                 # `after`): stop instead of looping on the same page.
@@ -1423,8 +1470,8 @@ class DiscordSignalSource(BaseSignalSource):
         visible in ops instead of looking like a stalled channel.
         """
         logger.warning(
-            "Discord backfill exceeded the per-poll page bound; the remaining "
-            "gap will be fetched on the next poll",
+            "Discord backfill reached the per-poll page bound with a full page; "
+            "more messages may remain and are fetched on the next poll",
             extra={
                 "data": {
                     "bot_name": self.bot_name,
@@ -1479,7 +1526,9 @@ class DiscordSignalSource(BaseSignalSource):
             for message in messages:
                 message_id = str(message.get("id"))
                 seen.add(message_id)
-            self._last_seen_message_ids[channel_id] = str(messages[0].get("id"))
+            newest = _newest_numeric_id(messages)
+            if newest is not None:
+                self._last_seen_message_ids[channel_id] = newest
 
     async def _poll_loop(self) -> None:
         while not self._paused:

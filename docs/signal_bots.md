@@ -126,8 +126,14 @@ Ohne Allowlist startet der Listener nicht (fail-closed). Zusätzlich gilt:
   ohne strukturiertes Tickersymbol (`**$TICKER**`, `Ticker:`, `buy signal AAPL`,
   `$TICKER`, `TICKER $price`) wird verworfen.
 - Nachraten über `POLL_LIMIT` (20) hinaus werden nicht mehr still verworfen: der
-  Seen-Set ist kumulativ, Lücken werden als Warnung mit Kanal und den Grenz-IDs
-  (`last_seen_message_id`, `oldest_fetched_message_id`) geloggt. Snowflake-IDs
+  Poll paginiert **vorwärts** ab dem Cursor (`after=<letzte ID>`), jede Seite wird
+  nach Snowflake-ID chronologisch emittiert, und der Cursor rückt nur bis zur
+  neuesten tatsächlich emittierten Nachricht vor. Pro Poll werden höchstens
+  `MAX_BACKFILL_PAGES` (5) Seiten geholt; eine größere Lücke wird in den nächsten
+  Poll übernommen (nichts geht verloren) und als Warnung mit Kanal und den
+  Grenz-IDs (`last_seen_message_id`, `newest_fetched_message_id`, `pages_fetched`)
+  geloggt. IDs unterhalb des Cursors werden nie erneut emittiert; ein nicht
+  numerischer Cursor wird verworfen und neu aufgesetzt (Warnung). Snowflake-IDs
   sind nicht fortlaufend, daher wird keine Nachrichtenanzahl berechnet.
 - Ein Discord-Signal wird auf jedes passende Deployment verteilt (Fan-out), nicht
   nur auf das erste.
