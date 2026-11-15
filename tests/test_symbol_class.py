@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -18,6 +19,18 @@ from live_runner.symbol_class import (
     classify_symbol,
 )
 from shared.models import LiveAccountConfig, LiveDeploymentConfig
+
+
+@pytest.fixture
+def live_runner_logs(caplog):
+    """The ``live-runner`` logger does not propagate, so attach caplog's handler."""
+    target = logging.getLogger("trading.live-runner")
+    target.addHandler(caplog.handler)
+    caplog.set_level(logging.DEBUG, logger="trading.live-runner")
+    try:
+        yield caplog
+    finally:
+        target.removeHandler(caplog.handler)
 
 
 @pytest.mark.parametrize(
@@ -99,6 +112,20 @@ def test_same_base_and_quote_is_not_a_crypto_pair() -> None:
         canonical_crypto_symbol("BTCBTC")
     with pytest.raises(UnclassifiableSymbolError):
         canonical_crypto_symbol("BTC/BTC")
+
+
+def test_bars_stored_under_an_unclassified_symbol_are_logged(live_runner_logs) -> None:
+    """Storing under the raw key must be visible, not silent (#122)."""
+    service = mds.LiveMarketDataStreamService()
+    asyncio.run(service.ingest_manual_bars([{"symbol": "FOOBARUSD", "close": 1.0}]))
+    assert service._bars_for_symbol("FOOBARUSD")  # kept, not dropped
+
+    records = [record for record in live_runner_logs.records if record.levelno >= logging.WARNING]
+    assert len(records) == 1
+    assert (
+        records[0].getMessage() == "Storing market-data bars under an unclassified symbol key"
+    )
+    assert records[0].data["symbol"] == "FOOBARUSD"
 
 
 def test_canonical_crypto_symbol() -> None:

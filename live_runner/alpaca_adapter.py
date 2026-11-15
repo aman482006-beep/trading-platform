@@ -31,8 +31,8 @@ from live_runner.base_adapter import (
     is_unbounded_tp,
     order_not_submitted,
 )
-from live_runner.symbol_class import canonical_crypto_symbol, classify_symbol
 from live_runner.credential_env import parse_bool_env, resolve_env_value
+from live_runner.symbol_class import canonical_crypto_symbol, classify_symbol
 from shared.alpaca_symbols import classify_alpaca_symbol, crypto_pair_key
 from shared.database import (
     apply_live_execution_commissions,

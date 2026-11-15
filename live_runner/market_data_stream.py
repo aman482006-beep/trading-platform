@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
+from live_runner.alpaca_adapter import resolve_alpaca_credentials
 from live_runner.symbol_class import (
     UnclassifiableSymbolError,
     canonical_crypto_symbol,
@@ -30,13 +30,23 @@ def _is_crypto_symbol(symbol: str) -> bool:
 
 
 def _bar_key(symbol: str) -> str:
-    """Storage key for bars: crypto pairs share one canonical form (``BTC/USD``)."""
+    """Storage key for bars: crypto pairs share one canonical form (``BTC/USD``).
+
+    An unclassifiable symbol keeps its normalized spelling, which
+    :meth:`refresh_from_deployments` would have refused to subscribe. That
+    acceptance is logged rather than silent: bars keyed under a symbol the
+    refresh loop rejected are invisible to a canonical lookup, and an operator
+    needs to see the key they were stored under (issue #122).
+    """
     normalized = _normalize_symbol(symbol)
     try:
         if classify_symbol(normalized) == "crypto":
             return canonical_crypto_symbol(normalized)
-    except UnclassifiableSymbolError:
-        pass
+    except UnclassifiableSymbolError as exc:
+        logger.warning(
+            "Storing market-data bars under an unclassified symbol key",
+            extra={"data": {"symbol": normalized, "error": str(exc)}},
+        )
     return normalized
 
 
@@ -228,7 +238,9 @@ class LiveMarketDataStreamService:
                 self._refresh_sync, deployments, account_lookup, env_values
             )
         except ModuleNotFoundError:
-            logger.info("alpaca-py market data stream unavailable; install alpaca-py to enable live quotes")
+            logger.info(
+                "alpaca-py market data stream unavailable; install alpaca-py to enable live quotes"
+            )
 
     def _refresh_sync(
         self,
