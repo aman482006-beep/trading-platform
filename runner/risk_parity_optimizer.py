@@ -20,6 +20,10 @@ logger = logging.getLogger(__name__)
 
 # #129: float slack for the bound-feasibility checks (n * bound vs 1.0).
 _FEASIBILITY_TOL = 1e-12
+# #129 H8: a resampled series whose median observation spacing is wider than this
+# is not a daily series (weekly bars resample to one row per week), so the
+# sqrt(252) annualisation does not apply to it.
+_MAX_DAILY_SPACING_SECONDS = 1.5 * 24 * 60 * 60
 
 
 @dataclass(frozen=True)
@@ -27,7 +31,8 @@ class RiskParitySelection:
     symbols: list[str]
     weights: dict[str, float]
     score: float
-    # None when the observation frequency is unknown (no datetime index): the
+    # None when no daily annualisation applies: the observation frequency is
+    # unknown (no datetime index) or coarser than daily (weekly bars). The
     # Sharpe is then undefined and the score excludes the Sharpe term.
     sharpe: float | None
     volatility: float
@@ -46,25 +51,54 @@ def returns_from_equity_matrix(equity_matrix: np.ndarray) -> np.ndarray:
     return np.nan_to_num(returns, nan=0.0, posinf=0.0, neginf=0.0)
 
 
+def _is_daily_spaced(index: pd.DatetimeIndex) -> bool:
+    """Whether the median observation spacing is about one day.
+
+    Median spacing (the same inference ``portfolio_optimizer`` uses for its
+    annualisation factor) rather than a label, because only the spacing says
+    what the annualisation factor should be. A trading-day series has mostly
+    one-day gaps with occasional weekend/holiday gaps, so its median is one
+    day; weekly bars give ~7 days and a monthly series ~30.
+    """
+    if len(index) < 2:
+        # A single observation has no spacing to infer from.
+        return False
+    spacings = index.to_series().diff().dt.total_seconds().dropna()
+    if spacings.empty:
+        return False
+    spacing = float(spacings.median())
+    if not math.isfinite(spacing) or spacing <= 0:
+        return False
+    return spacing <= _MAX_DAILY_SPACING_SECONDS
+
+
 def daily_returns_frame(returns_frame: pd.DataFrame) -> pd.DataFrame | None:
     """Resample per-bar returns to daily close-to-close returns.
 
     Sharpe is annualised with sqrt(252) across the platform
     (``runner/stats.py``, ``runner/portfolio_optimizer.py``), which is only
     valid for daily observations (#87, #129 H8). Per-bar returns inside a UTC
-    day are compounded (``prod(1 + r) - 1``), which is exactly the day's
-    close-to-close return because each bar return already spans the gap to the
-    previous bar. Days without any bar (weekends, holidays) are dropped, not
+    day are compounded (``prod(1 + r) - 1``), which for an interior day is
+    exactly the day's close-to-close return, because each bar return already
+    spans the gap to the previous bar; the window's first day compounds from
+    the first close inside the window (the preceding close is not in the
+    frame). Days without any bar (weekends, holidays) are dropped, not
     zero-filled.
 
-    Returns ``None`` when the frame has no ``DatetimeIndex``: the observation
-    frequency is then unknown and the caller must not invent an annualisation.
+    Returns ``None`` when the caller must not apply the daily annualisation:
+    the frame has no ``DatetimeIndex`` (frequency unknown), or the observations
+    are spaced wider than a day - weekly bars resample to one row per week, and
+    sqrt(252) would overstate their Sharpe by sqrt(252/52) ~ 2.2x. The caller
+    then keeps its own frame and reports the Sharpe as undefined.
     """
     if not isinstance(returns_frame.index, pd.DatetimeIndex):
         return None
     growth = (1.0 + returns_frame.sort_index()).resample("1D")
     daily = growth.prod() - 1.0
-    return daily[growth.size() > 0]
+    daily = daily[growth.size() > 0]
+    if not _is_daily_spaced(daily.index):
+        return None
+    return daily
 
 
 def shrink_covariance(returns: np.ndarray, *, shrinkage: float = 0.2) -> np.ndarray:
@@ -189,9 +223,10 @@ def score_risk_parity_universe(
 
     ``returns`` must already be DAILY close-to-close returns when ``daily`` is
     true (see :func:`daily_returns_frame`); only then is Sharpe annualised with
-    sqrt(252). With ``daily=False`` the observation frequency is unknown, so
-    Sharpe is left undefined (``None``) and the score uses only the
-    scale-invariant structure terms. Weights, diversification ratio,
+    sqrt(252). With ``daily=False`` no daily annualisation applies - the
+    observation frequency is unknown (no datetime index) or coarser than daily
+    (weekly bars) - so Sharpe is left undefined (``None``) and the score uses
+    only the scale-invariant structure terms. Weights, diversification ratio,
     correlation and risk contributions do not depend on the return scale.
     """
     if len(symbols) < 2:
@@ -294,7 +329,8 @@ def select_best_risk_parity_universe(
         # C3: intersection, not zero-fill — missing bars are not 0% returns.
         subset = returns_frame[columns].dropna()
         # #129 H8: covariance, Sharpe and score all use daily close-to-close
-        # returns when timestamps are available (None => frequency unknown).
+        # returns when the timestamps say the bars are daily (None => no
+        # datetime index, or observations spaced wider than a day).
         daily_subset = daily_returns_frame(subset)
         if daily_subset is not None:
             subset = daily_subset
@@ -346,6 +382,9 @@ def select_best_risk_parity_universe(
     return {
         # "structure_only": no datetime index, Sharpe undefined and excluded
         # from the score (not comparable with Sharpe-based scores).
+        # "structure_only": no datetime index, or observations spaced wider
+        # than a day (weekly bars) - in both cases the Sharpe is undefined and
+        # excluded from the score (not comparable with Sharpe-based scores).
         "score_basis": (
             "sharpe_and_structure" if best.sharpe is not None else "structure_only"
         ),
