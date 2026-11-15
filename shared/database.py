@@ -4388,16 +4388,6 @@ def _as_string_list(value: Any) -> list[str]:
     return [str(item) for item in value if str(item).strip()]
 
 
-def _safe_stat_number(value: Any, default: float = 0.0) -> float:
-    try:
-        numeric = float(value)
-    except (TypeError, ValueError):
-        return default
-    if math.isnan(numeric):
-        return default
-    return numeric
-
-
 def _stat_number_or_undefined(
     stats: dict[str, Any], key: str, default: float
 ) -> float | None:
@@ -4426,6 +4416,45 @@ def _stat_number_or_undefined(
     return numeric if math.isfinite(numeric) else None
 
 
+def _backtest_is_ruined(backtest: BacktestRecord, stats: dict[str, Any]) -> bool:
+    """Whether a stored backtest's account reached zero (#132).
+
+    Artifacts saved after the flag existed carry ``ruined`` in their stats and
+    that is authoritative. Older artifacts carry no such key, and reading that
+    as "not ruined" would let a liquidated legacy run (whose pre-ruin Sharpe can
+    look excellent) reach live deployment selection. For those the persisted
+    equity curve is checked directly: any non-positive equity point means ruin.
+    A legacy artifact with no curve at all keeps the previous reading (not
+    ruined) because there is nothing to derive it from.
+
+    A curve that exists but has a point that cannot be read as a finite number
+    (``None``, text, NaN/inf, a malformed entry) fails closed: that point could
+    have been the liquidation, and this gate guards live deployment, so an
+    unprovable "survived" counts as ruined. A readable non-positive point is
+    ruin regardless of where unreadable points sit.
+    """
+    flag = stats.get("ruined")
+    if isinstance(flag, bool):
+        return flag
+    curve = backtest.equity_curve
+    if not isinstance(curve, list):
+        return False
+    for point in curve:
+        try:
+            equity = float(point.get("equity")) if isinstance(point, dict) else math.nan
+        except (TypeError, ValueError):
+            equity = math.nan
+        if not (math.isfinite(equity) and equity > 0):
+            logger.warning(
+                "Backtest %s predates the ruin flag and its equity curve reaches %s; "
+                "treating it as ruined (non-positive or unreadable)",
+                backtest.id,
+                equity,
+            )
+            return True
+    return False
+
+
 def _backtest_metadata_payload(backtest: BacktestRecord, trade_count: int) -> dict[str, Any]:
     data = backtest.data or {}
     stats = backtest.stats or {}
@@ -4448,14 +4477,17 @@ def _backtest_metadata_payload(backtest: BacktestRecord, trade_count: int) -> di
         "timeframe": timeframe,
         "start_date": str(backtest.backtest_start or ""),
         "end_date": str(backtest.backtest_end or ""),
-        "total_return": _safe_stat_number(stats.get("total_return"), 0.0),
-        "cagr": _safe_stat_number(stats.get("cagr"), 0.0),
+        "total_return": _stat_number_or_undefined(stats, "total_return", 0.0),
+        "cagr": _stat_number_or_undefined(stats, "cagr", 0.0),
         "sharpe_ratio": _stat_number_or_undefined(stats, "sharpe_ratio", 0.0),
         "psr": _stat_number_or_undefined(stats, "psr", 0.0),
         "p_value": _stat_number_or_undefined(stats, "p_value", 1.0),
-        "max_drawdown": _safe_stat_number(stats.get("max_drawdown_pct"), 0.0),
+        "max_drawdown": _stat_number_or_undefined(stats, "max_drawdown_pct", 0.0),
         "win_rate": stats.get("win_rate"),
         "trade_count": max(int(trade_count), 0),
+        # #132: a ruined run has undefined return metrics; consumers that rank
+        # backtests (live deployment selection) must be able to exclude it.
+        "ruined": _backtest_is_ruined(backtest, stats),
         "created_at": str(backtest.created_at or ""),
         "tags": tags,
     }

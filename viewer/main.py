@@ -3416,7 +3416,13 @@ def _backtest_summary_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
         if initial_capital > 0
         else total_return_decimal * 100.0
     )
-    cagr_decimal = _safe_float(meta.get("cagr"), total_return_decimal)
+    # An undefined CAGR (ruined run, #132) stays undefined: falling back to the
+    # total return would publish a measured-looking annualised figure.
+    cagr_decimal = (
+        _optional_float(meta.get("cagr"))
+        if "cagr" in meta
+        else total_return_decimal
+    )
     sharpe_ratio = _optional_float(meta.get("sharpe_ratio"))
     psr = _optional_float(meta.get("psr"))
     p_value = _optional_float(meta.get("p_value"))
@@ -3443,7 +3449,7 @@ def _backtest_summary_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
         "created_at": str(meta.get("created_at") or ""),
         "sharpe": sharpe_ratio,
         "sharpe_ratio": sharpe_ratio,
-        "cagr": round(cagr_decimal * 100.0, 2),
+        "cagr": round(cagr_decimal * 100.0, 2) if cagr_decimal is not None else None,
         "max_drawdown_pct": round(max_drawdown_decimal * 100.0, 2),
         "net_profit": round(total_pnl, 6),
         "net_profit_pct": round(net_profit_pct, 2),
