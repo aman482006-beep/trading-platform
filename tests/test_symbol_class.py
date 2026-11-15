@@ -43,7 +43,11 @@ def test_crypto_forms(symbol: str) -> None:
 
 
 def test_crypto_quotes_come_from_the_shared_alpaca_symbol_module() -> None:
-    """One quote list: fee backfill (#124) and market-data routing (#122) must not drift."""
+    """One quote list: fee backfill (#124) and market-data routing (#122) must not drift.
+
+    The import already makes this true; the assertion is the drift guard for
+    whoever reintroduces a local copy of the tuple.
+    """
     from shared import alpaca_symbols
 
     assert CRYPTO_QUOTES == alpaca_symbols.CRYPTO_QUOTES
