@@ -59,6 +59,34 @@ def test_infeasible_universe_is_never_scored_and_is_reported(monkeypatch) -> Non
     assert len(result["evaluated_universes"]) == 1
 
 
+def test_bounds_that_cross_are_skipped_not_solved(monkeypatch) -> None:
+    """min_weight above max_weight (inside _FEASIBILITY_TOL) is infeasible on its own.
+
+    Both bound counts pass for n=2 at min=0.5+e / max=0.5-e, so only the
+    crossing makes the capped simplex empty. The universe is skipped like any
+    other infeasible one rather than reaching the solver and failing the whole
+    search from inside scipy.
+    """
+    calls: list[list[str]] = []
+    real_score = rpo.score_risk_parity_universe
+
+    def spy(symbols, returns, **kwargs):
+        calls.append(list(symbols))
+        return real_score(symbols, returns, **kwargs)
+
+    monkeypatch.setattr(rpo, "score_risk_parity_universe", spy)
+
+    with pytest.raises(ValueError, match="satisfies min_weight/max_weight"):
+        select_best_risk_parity_universe(
+            _frame(),
+            [["SPY", "TLT"]],
+            min_weight=0.5 + 1e-13,
+            max_weight=0.5 - 1e-13,
+        )
+
+    assert calls == []
+
+
 def test_all_universes_infeasible_raises_clear_error() -> None:
     with pytest.raises(ValueError, match="satisfies min_weight/max_weight"):
         select_best_risk_parity_universe(_frame(), [["SPY", "TLT"]], max_weight=0.4)
