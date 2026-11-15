@@ -425,6 +425,9 @@ export interface BacktestStats {
   expectancy: number;
   psr?: number | null;
   p_value?: number | null;
+  // #132: equity reached zero; return ratios above are null by definition.
+  ruined?: boolean;
+  ruin_time?: string | null;
   [key: string]: unknown;
 }
 
@@ -656,11 +659,19 @@ export interface LiveEquitySeriesPoint {
 
 export interface LiveAccountStats {
   account_id: string;
-  total_trades: number;
-  winning_trades: number;
-  losing_trades: number;
-  win_rate: number;
-  total_pnl: number;
+  /** The four win/loss fields are null, like `total_pnl`, when `pnl_complete` is false. */
+  total_trades: number | null;
+  winning_trades: number | null;
+  losing_trades: number | null;
+  win_rate: number | null;
+  /** null when a fill's price is unknown: realized PnL is then incomplete, not smaller. */
+  total_pnl: number | null;
+  pnl_complete?: boolean;
+  price_unknown_count?: number;
+  total_commission?: number | null;
+  commission_unknown_count?: number;
+  net_pnl?: number | null;
+  net_pnl_complete?: boolean;
   current_balance: number;
   current_equity: number;
   max_drawdown: number;
@@ -675,11 +686,15 @@ export interface LiveTradeSlippage {
   symbol: string;
   action: string;
   theoretical_price: number;
-  actual_price: number;
-  slippage: number;
-  slippage_bps: number;
+  /** null: the fill's price is unknown (not stated, or not derivable); never a fill at 0. */
+  actual_price: number | null;
+  /** observed | derived | sent_bad | absent | derived_unavailable; null for legacy rows. */
+  actual_price_observed?: string | null;
+  slippage: number | null;
+  slippage_bps: number | null;
   filled_qty: number;
-  commission: number;
+  /** null: the fee is not known yet (Alpaca posts crypto fees end of day); not a zero fee. */
+  commission: number | null;
   position_size?: number | null;
   risk_amount?: number | null;
   risk_percent?: number | null;
@@ -706,8 +721,9 @@ export interface LiveTradesResponse {
 export interface LiveDashboardAccount extends LiveAccount {
   current_equity: number;
   current_balance: number;
-  total_trades: number;
-  total_pnl: number;
+  /** `null` when a fill price was unusable: the figure is unknown, not zero. */
+  total_trades: number | null;
+  total_pnl: number | null;
 }
 
 export interface LiveDashboardStrategy extends LiveDeploymentConfig {

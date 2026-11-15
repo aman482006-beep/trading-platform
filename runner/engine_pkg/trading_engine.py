@@ -32,7 +32,14 @@ from runner.engines._shared import resolve_ask_high_low, resolve_bar_spread
 from runner.engines.base import BacktestConfig
 from runner.engines.contract import flag_missing_intrabar, resolve_same_bar_exit
 from runner.fees import resolve_fee_model
-from shared.models import BacktestResult, EquityPoint, IndicatorSeries, Trade, TradeExit
+from shared.models import (
+    BacktestResult,
+    EquityPoint,
+    IndicatorSeries,
+    Trade,
+    TradeExit,
+    normalize_direction_value,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -197,8 +204,11 @@ class TradeEngine:
         return stop_loss, tp_levels
 
     def _resolve_direction(self, row: pd.Series) -> str:
-        direction = str(row.get("direction", "LONG")).upper()
-        return "SHORT" if direction == "SHORT" else "LONG"
+        # No direction column => long-only strategy. A present-but-unknown
+        # value (NaN, 0, "BUY", ...) raises rather than silently trading LONG.
+        if "direction" not in row.index:
+            return "LONG"
+        return normalize_direction_value(row["direction"])
 
     def _current_risk_exposure(
         self, reference_price: float, exclude_order: Order | None = None
