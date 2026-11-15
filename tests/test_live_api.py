@@ -2917,6 +2917,63 @@ def test_explicit_not_ruined_flag_is_authoritative_over_curve(isolated_db):
     assert database.load_backtest_metadata_row("flagged-healthy")["ruined"] is False
 
 
+def test_degenerate_curve_metadata_publishes_null_return_and_drawdown(isolated_db):
+    """A 0.0 placeholder that `undefined_metrics` names must not read as a measurement."""
+    database, _engine, _data_dir = isolated_db
+    _store_backtest(
+        database,
+        "degenerate",
+        stats={
+            "total_return": 0.0,
+            "max_drawdown_pct": 0.0,
+            "undefined_metrics": ["total_return", "max_drawdown_pct"],
+        },
+        equity_curve=[],
+    )
+    _store_backtest(
+        database,
+        "legacy-measured",
+        stats={"total_return": 0.0, "max_drawdown_pct": 0.0},
+        equity_curve=[],
+    )
+
+    row = database.load_backtest_metadata_row("degenerate")
+    assert row["total_return"] is None
+    assert row["max_drawdown"] is None
+    legacy = database.load_backtest_metadata_row("legacy-measured")
+    assert legacy["total_return"] == 0.0
+    assert legacy["max_drawdown"] == 0.0
+
+
+def test_legacy_curve_with_unreadable_point_fails_closed(isolated_db):
+    """An unreadable or non-finite equity point cannot prove the account survived."""
+    database, _engine, _data_dir = isolated_db
+    legacy_stats = {"sharpe_ratio": 2.5}
+    for backtest_id, bad_equity in (("none", None), ("text", "n/a"), ("nan", float("nan"))):
+        _store_backtest(
+            database,
+            f"legacy-{backtest_id}",
+            stats=legacy_stats,
+            equity_curve=[
+                {"time": "2021-01-04", "equity": 100.0},
+                {"time": "2021-01-05", "equity": bad_equity},
+            ],
+        )
+        assert database.load_backtest_metadata_row(f"legacy-{backtest_id}")["ruined"] is True
+
+    _store_backtest(
+        database,
+        "legacy-readable-ruin",
+        stats=legacy_stats,
+        equity_curve=[
+            {"time": "2021-01-04", "equity": 100.0},
+            {"time": "2021-01-05", "equity": None},
+            {"time": "2021-01-06", "equity": -5.0},
+        ],
+    )
+    assert database.load_backtest_metadata_row("legacy-readable-ruin")["ruined"] is True
+
+
 def test_ruined_backtest_metadata_publishes_null_cagr(isolated_db):
     database, _engine, _data_dir = isolated_db
     _store_backtest(
