@@ -738,6 +738,11 @@ def test_no_trade_trials_lose_against_honest_negative_trials(monkeypatch, tmp_pa
         for trial in payload["top_trials"]
     }
     assert penalties == {1: True, 2: False}
+    penalised = next(t for t in payload["top_trials"] if t["params"]["window"] == 1)
+    assert penalised["metric_value"] == optimizer_module._no_trade_penalty_value(
+        [-0.5], direction="maximize"
+    )
+    assert penalised["metric_value"] != 0.0
     no_trade_trial = next(t for t in payload["top_trials"] if t["params"]["window"] == 1)
     assert no_trade_trial["value"] is None or no_trade_trial["value"] < -0.5
 
@@ -825,6 +830,71 @@ def test_ruined_cagr_target_trial_never_wins_the_study(monkeypatch, tmp_path: Pa
         optimizer_module.OptimizationConfig(
             base_backtest_id="base-demo",
             target_metric="cagr",
+            n_trials=2,
+            train_split_pct=0.7,
+            parameter_ranges={"window": {"type": "int", "min": 1, "max": 2, "step": 1}},
+        ),
+    )
+
+    assert payload["best_params"] == {"window": 2}
+    assert {t["params"]["window"]: t["penalty_applied"] for t in payload["top_trials"]} == {
+        1: True,
+        2: False,
+    }
+
+
+def test_degenerate_curve_total_return_target_never_wins_the_study(monkeypatch, tmp_path: Path):
+    """A published 0.0 that `undefined_metrics` names is unrankable, not a score."""
+    _patch_optimizer_env(monkeypatch, tmp_path, grid_choices=[1, 2], pass_through_stats=True)
+
+    def fake_run_backtest(config, strategy_path):
+        window = int(config.parameters["window"])
+        result = _trial_result(config, metric=-0.5, trade_count=1)
+        if window == 1:
+            result.stats["total_return"] = 0.0
+            result.stats["undefined_metrics"] = ["total_return"]
+        return result
+
+    monkeypatch.setattr(optimizer_module, "_run_vectorbt_backtest", fake_run_backtest)
+
+    payload = optimizer_module.run_optimization(
+        optimizer_module.OptimizationConfig(
+            base_backtest_id="base-demo",
+            target_metric="total_return",
+            n_trials=2,
+            train_split_pct=0.7,
+            parameter_ranges={"window": {"type": "int", "min": 1, "max": 2, "step": 1}},
+        ),
+    )
+
+    assert payload["best_params"] == {"window": 2}
+    assert {t["params"]["window"]: t["penalty_applied"] for t in payload["top_trials"]} == {
+        1: True,
+        2: False,
+    }
+
+
+def test_ruined_negative_equity_trial_with_raw_target_is_penalised_not_failed(
+    monkeypatch, tmp_path: Path
+):
+    """A ruined run can report max_drawdown_pct beyond 1.0; it must not crash the trial."""
+    _patch_optimizer_env(monkeypatch, tmp_path, grid_choices=[1, 2], pass_through_stats=True)
+
+    def fake_run_backtest(config, strategy_path):
+        window = int(config.parameters["window"])
+        result = _trial_result(config, metric=-0.5, trade_count=1)
+        if window == 1:
+            result.stats["ruined"] = True
+            result.stats["win_rate"] = 0.9
+            result.stats["max_drawdown_pct"] = -1.5
+        return result
+
+    monkeypatch.setattr(optimizer_module, "_run_vectorbt_backtest", fake_run_backtest)
+
+    payload = optimizer_module.run_optimization(
+        optimizer_module.OptimizationConfig(
+            base_backtest_id="base-demo",
+            target_metric="win_rate",
             n_trials=2,
             train_split_pct=0.7,
             parameter_ranges={"window": {"type": "int", "min": 1, "max": 2, "step": 1}},

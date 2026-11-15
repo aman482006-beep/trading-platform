@@ -29,7 +29,7 @@ from runner.universe_provenance import (
 )
 from shared.atomic_io import write_text_atomically
 from shared.constants import DATA_DIR, OPTIMIZATIONS_DIR, normalize_timeframe
-from shared.models import BacktestResult
+from shared.models import BacktestResult, resolve_defined_stat
 from shared.strategy_registry import find_strategy_entry
 
 logger = logging.getLogger(__name__)
@@ -582,10 +582,16 @@ def run_optimization(
             )
 
         metric_key = _metric_key(config.target_metric, train_stats)
-        if train_stats.get(metric_key) is None:
+        if train_stats.get("ruined") is True or (
+            resolve_defined_stat(train_stats, metric_key, None) is None
+        ):
             # #132: a ruined run publishes its return metrics as None, and an
             # undefined objective is unrankable - it is not a score of 0.0,
-            # which would beat every honest losing trial. It gets the same
+            # which would beat every honest losing trial. A metric the producer
+            # names in `undefined_metrics` is unrankable even when a placeholder
+            # 0.0 is published (degenerate curves). A ruined run never ranks
+            # whatever the target: its drawdown can exceed 1.0 (negative equity),
+            # which would otherwise trip the percent-scale guard. It gets the same
             # worst-trial penalty as a no-trade trial so it can never be
             # selected as the best parameter set, and the study keeps going
             # instead of aborting on the whole run.
