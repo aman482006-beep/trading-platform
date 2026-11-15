@@ -59,17 +59,23 @@ def _resolve_reference_dir(raw: str | None) -> pathlib.Path:
     """Return the MT5 reference directory from ``--reference-dir`` or the env var.
 
     The CLI value wins over ``TRADING_PLATFORM_REFERENCES``. Raises
-    ``ValueError`` when neither is set or the directory does not exist, so the
-    audit never reads a machine-specific default by accident.
+    ``ValueError`` when neither is set, when either is blank (an empty value
+    would resolve to the current working directory and silently audit the
+    wrong logs), or when the directory does not exist, so the audit never
+    reads a machine-specific default by accident.
     """
-    value = raw or os.environ.get(REFERENCE_ENV_VAR)
+    # Not ``raw or os.environ.get(...)``: an explicitly passed empty flag must
+    # not be read as "flag absent" and resurrect the env var.
+    value = raw if raw is not None else os.environ.get(REFERENCE_ENV_VAR)
     if not value:
         raise ValueError(
             f"no MT5 reference directory: pass --reference-dir or set {REFERENCE_ENV_VAR}"
         )
     ref = pathlib.Path(value).expanduser().resolve()
-    if not ref.is_dir():
+    if not ref.exists():
         raise ValueError(f"MT5 reference directory does not exist: {ref}")
+    if not ref.is_dir():
+        raise ValueError(f"MT5 reference directory is not a directory: {ref}")
     return ref
 
 

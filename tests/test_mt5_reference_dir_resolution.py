@@ -63,6 +63,15 @@ def test_nonexistent_reference_dir_is_rejected(tmp_path):
         _PARSER._resolve_reference_dir(str(missing))
 
 
+def test_reference_dir_must_be_a_directory_not_a_file(tmp_path):
+    """A path that exists but is a file gets its own message, not "missing"."""
+    file_path = tmp_path / "file.txt"
+    file_path.write_text("x", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="is not a directory"):
+        _PARSER._resolve_reference_dir(str(file_path))
+
+
 def test_empty_env_var_is_rejected(monkeypatch):
     """A blanked env var (CI templates leave them empty) must not resolve to cwd."""
     monkeypatch.setenv(_ENV_VAR, "")
@@ -81,6 +90,7 @@ def test_empty_reference_dir_flag_does_not_fall_back_to_env_var(tmp_path, monkey
 
     with pytest.raises(ValueError, match="no MT5 reference directory"):
         _PARSER._resolve_reference_dir("")
+
 
 def test_cli_argument_resolves_to_existing_directory(tmp_path):
     ref = tmp_path / "refs"
