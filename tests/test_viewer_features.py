@@ -6356,7 +6356,9 @@ def test_live_websocket_payload_redacts_nested_secrets_and_unknown_objects():
     assert safe["data"]["safe"] == "visible"
 
 
-def test_strategy_detail_accepts_relative_file_path_identifier(viewer_client, monkeypatch, tmp_path):
+def test_strategy_detail_accepts_relative_file_path_identifier(
+    viewer_client, monkeypatch, tmp_path
+):
     # The {name:path} converter keeps slash-containing identifiers routable;
     # matches_strategy_identifier accepts the relative file path as an alias.
     import viewer.main as viewer_app_module
@@ -6403,5 +6405,7 @@ def test_viewer_routes_without_response_model_keep_object_schema(path, method):
     spec = viewer_app_module.app.openapi()
 
     schema = _openapi_json_schema_for(spec, path, method)
-    assert schema.get("type") == "object", f"{method.upper()} {path} lost its object schema: {schema}"
+    assert schema.get("type") == "object", (
+        f"{method.upper()} {path} lost its object schema: {schema}"
+    )
     assert schema.get("additionalProperties") is True
