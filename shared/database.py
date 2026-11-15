@@ -1822,7 +1822,8 @@ def _make_live_executions_commission_nullable(connection: Connection) -> bool:
 
     The data step runs only together with the rebuild, so it happens once. It turns ``0.0`` into
     NULL on every Alpaca row whose zero is not a provable known zero: crypto in either spelling
-    (``BTC/USD``, ``BTCUSD``) and any symbol `shared.alpaca_symbols` cannot classify as an equity
+    (``BTC/USD``, ``BTCUSD``), an orphan whose signal, deployment or account row is missing (its
+    broker is unknowable), and any symbol `shared.alpaca_symbols` cannot classify as an equity
     (an option, a malformed symbol) - fail closed. Before #124 both Alpaca paths hard-coded
     ``0.0`` - alpaca-py has no commission field - while crypto fills do carry a fee. Alpaca equity zeros are a known zero and
     stay; other brokers' rows are not touched. The NULLs inside the backfill lookback get their
@@ -1901,10 +1902,12 @@ def _make_live_executions_commission_nullable(connection: Connection) -> bool:
     alpaca_zero_rows = connection.execute(
         text(
             "SELECT e.id, s.symbol FROM live_executions e"
-            " JOIN live_signals s ON s.id = e.signal_id"
-            " JOIN live_deployments d ON d.id = s.deployment_id"
-            " JOIN live_accounts a ON a.id = d.account_id"
-            " WHERE lower(a.broker) = 'alpaca' AND e.commission = 0.0"
+            " LEFT JOIN live_signals s ON s.id = e.signal_id"
+            " LEFT JOIN live_deployments d ON d.id = s.deployment_id"
+            " LEFT JOIN live_accounts a ON a.id = d.account_id"
+            # An orphan (signal/deployment/account row missing) has an undeterminable broker; the
+            # zero is only kept when it is provably an equity, so it joins the Alpaca rows.
+            " WHERE (a.broker IS NULL OR lower(a.broker) = 'alpaca') AND e.commission = 0.0"
         )
     ).fetchall()
     # Classified from the symbol's data, not from a slash (`BTCUSD` is crypto too). Only a provable
