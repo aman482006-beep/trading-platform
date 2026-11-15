@@ -670,7 +670,8 @@ class LiveExecutionModel(SQLModel, table=True):
     # uniqueness constraint - `dedupe_key` is what enforces uniqueness, and indexing this would
     # invite reading it as one. Adapters with no such id leave it NULL.
     broker_fill_id: int | None = Field(default=None, nullable=True)
-    # Whether `actual_price` is a price the broker stated: `observed`, `sent_bad` or `absent`.
+    # Whether `actual_price` is a price the broker stated: `observed`, `sent_bad`,
+    # `absent`, or - for a reconcile remainder - `derived` / `derived_unavailable`.
     # Nullable and with no database default: a row written before this column existed has no
     # verdict, and "no verdict" must not be fabricated into "observed".
     actual_price_observed: str | None = Field(default=None, nullable=True)

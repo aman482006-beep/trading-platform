@@ -5546,6 +5546,23 @@ def _live_account_stats_payload(account_id: str) -> dict[str, Any]:
     # execution rows: partial fills would otherwise deflate the ratio.
     total_trades = wins + losses
     win_rate = (wins / total_trades * 100.0) if total_trades else 0.0
+    # The counts come from the same walk as `total_pnl`, so they are just as incomplete when a
+    # fill's price is unknown: report them as unknown, never as a measured win or loss.
+    win_loss_fields: dict[str, Any] = (
+        {
+            "total_trades": total_trades,
+            "winning_trades": wins,
+            "losing_trades": losses,
+            "win_rate": round(win_rate, 2),
+        }
+        if pnl_complete
+        else {
+            "total_trades": None,
+            "winning_trades": None,
+            "losing_trades": None,
+            "win_rate": None,
+        }
+    )
 
     max_drawdown = 0.0
     max_drawdown_pct = 0.0
@@ -5565,10 +5582,7 @@ def _live_account_stats_payload(account_id: str) -> dict[str, Any]:
 
     return {
         "account_id": account_id,
-        "total_trades": total_trades,
-        "winning_trades": wins,
-        "losing_trades": losses,
-        "win_rate": round(win_rate, 2),
+        **win_loss_fields,
         "total_pnl": round(total_pnl_realized, 2) if pnl_complete else None,
         "pnl_complete": pnl_complete,
         "price_unknown_count": price_unknown_count,

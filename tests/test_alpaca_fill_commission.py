@@ -2102,3 +2102,104 @@ def test_known_good_price_verdicts_stay_usable(verdict) -> None:
 
     assert execution_price_is_usable(101.5, verdict) is True
     assert execution_price_is_usable(0.0, verdict) is False
+
+
+@pytest.mark.parametrize("verdict", [None, "observed", "derived"])
+@pytest.mark.parametrize("price", [float("inf"), float("-inf"), float("nan")])
+def test_execution_price_is_usable_rejects_non_finite_price(verdict, price) -> None:
+    from shared.models import execution_price_is_usable
+
+    assert execution_price_is_usable(price, verdict) is False
+
+
+def test_viewer_stats_pnl_is_incomplete_for_a_non_finite_price(monkeypatch):
+    import viewer.main as viewer_main
+
+    rows = [_stats_row("buy", 100.0, 1.0, 0, 0.0), _stats_row("sell", float("inf"), 1.0, 5, 0.0)]
+    rows[1]["actual_price_observed"] = "observed"
+    monkeypatch.setattr(viewer_main, "load_live_account_stats_inputs", lambda _a: ([], rows))
+
+    payload = viewer_main._live_account_stats_payload(ACCOUNT)
+
+    assert payload["pnl_complete"] is False
+    assert payload["total_pnl"] is None
+
+
+def test_viewer_stats_win_loss_counts_are_unknown_when_a_fill_price_is_unusable(monkeypatch):
+    """Counts computed over the priced subset describe a fictitious round trip (review of #143)."""
+    import viewer.main as viewer_main
+
+    rows = [
+        _stats_row("buy", 100.0, 1.0, 0, 0.0),
+        {**_stats_row("sell", 0.0, 1.0, 5, 0.0), "actual_price": None},
+        _stats_row("buy", 100.0, 1.0, 10, 0.0),
+        _stats_row("sell", 110.0, 1.0, 15, 0.0),
+    ]
+    rows[1]["actual_price_observed"] = PRICE_DERIVED_UNAVAILABLE
+    monkeypatch.setattr(viewer_main, "load_live_account_stats_inputs", lambda _a: ([], rows))
+
+    payload = viewer_main._live_account_stats_payload(ACCOUNT)
+
+    assert payload["pnl_complete"] is False
+    for key in ("winning_trades", "losing_trades", "total_trades", "win_rate"):
+        assert payload[key] is None, key
+
+
+def test_viewer_stats_win_loss_counts_are_numbers_when_complete(monkeypatch):
+    import viewer.main as viewer_main
+
+    rows = [_stats_row("buy", 100.0, 1.0, 0, 0.0), _stats_row("sell", 110.0, 1.0, 5, 0.0)]
+    monkeypatch.setattr(viewer_main, "load_live_account_stats_inputs", lambda _a: ([], rows))
+
+    payload = viewer_main._live_account_stats_payload(ACCOUNT)
+
+    assert payload["winning_trades"] == 1
+    assert payload["losing_trades"] == 0
+    assert payload["total_trades"] == 1
+    assert payload["win_rate"] == pytest.approx(100.0)
+
+
+def test_cumulative_save_refuses_to_amend_an_existing_key_with_an_average(db):
+    """A redelivered key plus a cumulative average cannot re-derive the stored row's price."""
+    signal = _signal(db)
+    order_id = _order_id("amend-refused")
+    _local_fill(db, signal, price=100.0, qty=1.0, order_id=order_id, key="alpaca:exec:K")
+    before = [(r.actual_price, r.filled_qty, r.commission) for r in _rows(db, signal)]
+    event = LiveExecution(
+        signal_id=signal.id,
+        actual_price=102.0,
+        filled_qty=1.0,
+        commission=None,
+        timestamp=datetime(2026, 11, 3, 15, 5, tzinfo=timezone.utc),
+        broker_order_id=order_id,
+        dedupe_key="alpaca:exec:K",
+    )
+
+    assert db.save_live_execution_up_to_cumulative(event, 2.0, cumulative_avg_price=102.0) == 0.0
+    assert [(r.actual_price, r.filled_qty, r.commission) for r in _rows(db, signal)] == before
+
+
+def test_daemon_backfill_pass_times_out_a_hung_adapter(monkeypatch):
+    from live_runner import daemon
+
+    calls: list[str] = []
+
+    class _Adapter:
+        _connected = True
+
+        def __init__(self, name: str, *, hang: bool = False):
+            self.name = name
+            self.hang = hang
+
+        async def backfill_commissions(self) -> int:
+            calls.append(self.name)
+            if self.hang:
+                await asyncio.sleep(3600)
+            return 1
+
+    monkeypatch.setattr(daemon, "COMMISSION_BACKFILL_TIMEOUT_SECONDS", 0.05)
+    adapters = {"hung": _Adapter("hung", hang=True), "ok": _Adapter("ok")}
+
+    asyncio.run(asyncio.wait_for(daemon._backfill_commissions_once(adapters), timeout=5))
+
+    assert sorted(calls) == ["hung", "ok"]
