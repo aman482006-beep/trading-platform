@@ -18,7 +18,10 @@ import pandas as pd
 import pytest
 
 from runner import optimizer as optimizer_module
-from runner.risk_parity_optimizer import select_best_risk_parity_universe
+from runner.risk_parity_optimizer import (
+    daily_returns_frame,
+    select_best_risk_parity_universe,
+)
 
 BARS_PER_DAY = 6
 SYMBOLS = ["SPY", "TLT", "GLD"]
@@ -114,6 +117,90 @@ def test_days_without_bars_are_not_zero_return_days() -> None:
     from_hourly = select_best_risk_parity_universe(hourly, [SYMBOLS])
 
     assert from_hourly["best_sharpe"] == pytest.approx(from_daily["best_sharpe"], rel=1e-9)
+
+
+def _weekly_returns(weeks: int = 40) -> pd.DataFrame:
+    """Weekly bars: one observation per week, so 52 periods a year, not 252."""
+    rng = np.random.default_rng(521)
+    data = {
+        "SPY": rng.normal(0.005, 0.024, weeks),
+        "TLT": rng.normal(0.001, 0.014, weeks) - 0.2 * rng.normal(0, 0.024, weeks),
+        "GLD": rng.normal(0.002, 0.017, weeks),
+    }
+    index = pd.date_range("2024-01-01", periods=weeks, freq="7D", tz="UTC")
+    return pd.DataFrame(data, index=index)
+
+
+def _structure_score(selection: dict) -> float:
+    """The scale-free terms of the universe score (no Sharpe contribution)."""
+    return (
+        0.35 * selection["best_diversification_ratio"]
+        - 0.5 * selection["best_avg_abs_correlation"]
+        - 2.0
+        * sum(
+            (value - 1.0 / len(SYMBOLS)) ** 2
+            for value in selection["best_risk_contributions"].values()
+        )
+    )
+
+
+def test_weekly_bars_do_not_claim_a_daily_annualisation() -> None:
+    """#129 H8: weekly bars resample to one row per week.
+
+    Applying sqrt(252) to them overstates Sharpe by sqrt(252/52) ~ 2.2x - the
+    very mis-scaling this daily-resample change exists to remove - so the
+    observation frequency is reported as not-daily and the Sharpe stays
+    undefined, exactly like the no-datetime-index case.
+    """
+    weekly = _weekly_returns()
+
+    assert daily_returns_frame(weekly) is None
+
+    from_weekly = select_best_risk_parity_universe(weekly, [SYMBOLS])
+
+    assert from_weekly["best_sharpe"] is None
+    assert from_weekly["score_basis"] == "structure_only"
+    assert from_weekly["best_score"] == pytest.approx(_structure_score(from_weekly), rel=1e-9)
+
+    # Nothing is invented: the same weekly returns without their timestamps
+    # (frequency unknown) score identically, and the raw weekly returns - not
+    # pseudo-daily rows - are what the covariance sees.
+    from_indexless = select_best_risk_parity_universe(weekly.reset_index(drop=True), [SYMBOLS])
+    assert from_weekly["best_score"] == pytest.approx(from_indexless["best_score"], rel=1e-9)
+    assert from_weekly["best_weights"] == pytest.approx(from_indexless["best_weights"], rel=1e-9)
+    assert from_weekly["best_volatility"] == pytest.approx(
+        from_indexless["best_volatility"], rel=1e-9
+    )
+
+
+def test_daily_returns_frame_drops_empty_days() -> None:
+    """Days without bars are dropped, never zero-filled: a fabricated 0% day
+    dilutes volatility and biases Sharpe (and with it the universe ranking)."""
+    daily = _daily_returns()
+    daily = daily[daily.index.dayofweek < 5]  # weekdays only
+    hourly = _as_intraday(daily)
+
+    frame = daily_returns_frame(hourly)
+
+    assert frame is not None
+    assert not any(day.dayofweek >= 5 for day in frame.index)
+    assert len(frame) == len(daily)
+    assert list(frame.columns) == list(daily.columns)
+
+    weights = np.full(len(SYMBOLS), 1.0 / len(SYMBOLS))
+    resampled_returns = frame.to_numpy(dtype=float) @ weights
+    daily_returns_array = daily.to_numpy(dtype=float) @ weights
+    assert float(np.std(resampled_returns)) == pytest.approx(
+        float(np.std(daily_returns_array)), rel=1e-9
+    )
+    assert float(np.mean(resampled_returns)) == pytest.approx(
+        float(np.mean(daily_returns_array)), rel=1e-9
+    )
+
+
+def test_daily_returns_frame_returns_none_without_datetime_index() -> None:
+    """The guard itself: no datetime index means no known observation grid."""
+    assert daily_returns_frame(_daily_returns().reset_index(drop=True)) is None
 
 
 def test_frame_without_datetime_index_leaves_sharpe_undefined() -> None:
