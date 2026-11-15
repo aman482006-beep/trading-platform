@@ -16,18 +16,19 @@ verifizieren, bis Trade-Listen und Stats (nahezu) identisch sind.
 Kontrakte (auf den Cent verifiziert): EURUSD 1 Lot = 100.000, Indices 1 Lot = 1.
 XLSX = EUR-Account (500 € Risk, Swaps, USD→EUR-Konvertierung), Logs = USD-Runs.
 
-Reproduktion der Referenz-Seite (Aufruf aus diesem `audit/`-Verzeichnis):
+Reproduktion der Referenz-Seite (vom Repo-Root aufrufen):
 
 ```bash
-python parse_mt5_reference.py --reference-dir <Referenz-Verzeichnis> --out audit_out
+python strategy-comparisons/intraday_volatility_breakout/audit/parse_mt5_reference.py --reference-dir <Referenz-Verzeichnis> --out data/intraday_volatility_breakout_audit
 ```
 
-`--out` ist optional (Default: dieses `audit/`-Verzeichnis) und muss innerhalb
-des Arbeitsverzeichnisses oder des Strategy-Vergleichs-Ordners liegen
-(Pfad-Einschränkung des Skripts) — Pfade wie `/tmp/audit_ref` werden abgelehnt.
-Das Referenz-Verzeichnis kommt aus `--reference-dir` oder
+`--out` ist optional (Default: der Audit-Ordner selbst) und muss innerhalb des
+Arbeitsverzeichnisses oder des Audit-Ordners liegen (Guard in
+`_resolve_output_dir`, absichtlich nicht aufgeweicht); `data/` ist
+git-ignoriert. Das Referenz-Verzeichnis kommt aus `--reference-dir` oder
 `$TRADING_PLATFORM_REFERENCES` (Flag gewinnt); ohne beides bricht das Skript
-mit Exit-Code 2 und Meldung auf stderr ab.
+mit Exit-Code 2 und Meldung auf stderr ab. Das Skript lässt sich auch aus
+`audit/` heraus mit relativem Pfad aufrufen.
 
 (Skript failt laut bei jeder Inkonsistenz: Deal-Sequenz, Volumen-Paarung,
 Final-Balance-Delta, XLSX↔Log-Keys.)
