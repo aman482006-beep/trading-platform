@@ -1,8 +1,11 @@
 """Acceptance tests for #128: relative deviation is measured against the reference.
 
 ``max(|a|, |b|)`` as the denominator halved real drift (100 -> 200 read as
-50%). Both sites must use the reference (ground-truth / expected) magnitude,
-the same rule ``validation/readiness/validator.py`` already uses.
+50%). The tolerance-gate sites (risk comparison, readiness validation and the
+cross-platform metric deltas) must use the reference (ground-truth / expected)
+magnitude, the same rule ``validation/readiness/validator.py`` already uses.
+``validation/comparison/matcher.py`` keeps a symmetric denominator on purpose:
+it ranks candidate pairings instead of gating a tolerance.
 """
 
 from __future__ import annotations
@@ -89,14 +92,41 @@ def test_metric_delta_missing_value_is_unchanged() -> None:
     assert delta.absolute_delta is None and delta.relative_delta is None
 
 
-# ── no remaining max(|a|,|b|) relative-deviation denominators ───────────────
+# ── no remaining max(|a|,|b|) tolerance-gate denominators ────────────────────
+
+# This is a spelling guard, not a semantic proof: it catches the literal
+# ``max(abs(a), abs(b))`` denominator in any layout, including a call continued
+# across lines. A rewritten denominator such as ``max(ref, act, 1e-12)`` -- the
+# intentional symmetric match cost in ``validation/comparison/matcher.py``, which
+# ranks pairings instead of gating a tolerance -- does not match, and cleaning it
+# up is not what this test claims.
+_MAX_ABS_DENOMINATOR = re.compile(r"max\(\s*abs\([^)]*\)\s*,\s*abs\(")
+
+
+def _max_abs_denominator_lines(text: str) -> list[int]:
+    """1-based line numbers of literal ``max(abs(a), abs(b))`` denominators."""
+    return [
+        text.count("\n", 0, match.start()) + 1
+        for match in _MAX_ABS_DENOMINATOR.finditer(text)
+    ]
+
+
+def test_denominator_scan_flags_single_line_spelling() -> None:
+    assert _max_abs_denominator_lines("denom = max(abs(a), abs(b))\n") == [1]
+
+
+def test_denominator_scan_flags_multi_line_spelling() -> None:
+    text = "result = (\n    max(\n        abs(reference),\n        abs(platform),\n    )\n)\n"
+    assert _max_abs_denominator_lines(text) == [2]
 
 
 def test_no_max_abs_relative_denominator_left_in_validation() -> None:
-    pattern = re.compile(r"max\(\s*abs\([^)]*\)\s*,\s*abs\(")
     offenders = []
     for path in (REPO_ROOT / "validation").rglob("*.py"):
-        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-            if pattern.search(line):
-                offenders.append(f"{path.relative_to(REPO_ROOT)}:{lineno}: {line.strip()}")
-    assert not offenders, "max(abs(a), abs(b)) denominators remain:\n" + "\n".join(offenders)
+        text = path.read_text(encoding="utf-8")
+        for lineno in _max_abs_denominator_lines(text):
+            offenders.append(f"{path.relative_to(REPO_ROOT)}:{lineno}")
+    assert not offenders, (
+        "tolerance-gate relative deviations must use the reference magnitude; "
+        "max(abs(a), abs(b)) denominators remain at:\n" + "\n".join(offenders)
+    )
