@@ -75,10 +75,12 @@ def test_universe_ranking_is_independent_of_bar_frequency() -> None:
     universes = [SYMBOLS, ["SPY", "TLT"], ["SPY", "GLD"], ["TLT", "GLD"]]
 
     ranked_daily = [
-        u["symbols"] for u in select_best_risk_parity_universe(daily, universes)["evaluated_universes"]
+        u["symbols"]
+        for u in select_best_risk_parity_universe(daily, universes)["evaluated_universes"]
     ]
     ranked_hourly = [
-        u["symbols"] for u in select_best_risk_parity_universe(hourly, universes)["evaluated_universes"]
+        u["symbols"]
+        for u in select_best_risk_parity_universe(hourly, universes)["evaluated_universes"]
     ]
 
     assert ranked_hourly == ranked_daily

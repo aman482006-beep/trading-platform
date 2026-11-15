@@ -69,7 +69,9 @@ def test_fallback_respects_min_weight(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.parametrize("seed", range(40))
-def test_property_bounds_hold_on_forced_fallback(monkeypatch: pytest.MonkeyPatch, seed: int) -> None:
+def test_property_bounds_hold_on_forced_fallback(
+    monkeypatch: pytest.MonkeyPatch, seed: int
+) -> None:
     rng = np.random.default_rng(seed)
     n = int(rng.integers(2, 9))
     lower = float(rng.uniform(0.0, 1.0 / n))

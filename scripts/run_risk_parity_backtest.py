@@ -50,12 +50,12 @@ _guard.ensure_own_checkout("run_risk_parity_backtest")
 # scripts that must carry the guard. Kept deliberately, and silenced rather than removed:
 # dropping it would take this script off the roster and out of the gate that keeps it alive.
 import shared  # noqa: F401
-from shared.constants import ensure_path_within_workspace
-from shared.logging import get_logger
 from runner.risk_parity_optimizer import (
     _project_to_capped_simplex,
     resolve_weight_bounds,
 )
+from shared.constants import ensure_path_within_workspace
+from shared.logging import get_logger
 
 logger = get_logger("scripts.run-risk-parity-backtest")
 
@@ -233,7 +233,9 @@ def apply_volatility_scaling(
 
 
 
-def first_available_trading_dates(index: pd.DatetimeIndex, scheduled_dates: pd.DatetimeIndex) -> list[pd.Timestamp]:
+def first_available_trading_dates(
+    index: pd.DatetimeIndex, scheduled_dates: pd.DatetimeIndex
+) -> list[pd.Timestamp]:
     """Map scheduled calendar dates to the next available trading date."""
     dates: list[pd.Timestamp] = []
     for scheduled in scheduled_dates:
@@ -355,7 +357,11 @@ def _portfolio_performance_stats(
         # byte-identical — do not "fix" toward the textbook definition here,
         # it would diverge from LEAN.
         downside = port_returns[port_returns < 0]
-        sortino = float(excess_ann / (downside.std() * np.sqrt(252))) if len(downside) and downside.std() > 0 else 0.0
+        sortino = (
+            float(excess_ann / (downside.std() * np.sqrt(252)))
+            if len(downside) and downside.std() > 0
+            else 0.0
+        )
     else:
         # A-L3: textbook downside deviation for the non-lean path — mean of
         # squared downside vs the daily risk-free target over ALL
@@ -706,7 +712,10 @@ def build_validation_reference(result: dict[str, Any]) -> ValidationReference:
         trades=trades,
         stats=result["stats"],
         raw_metadata={
-            "note": "Python reimplementation using yfinance daily data. Not a native LEAN run due to missing credentials/local equity data.",
+            "note": (
+                "Python reimplementation using yfinance daily data. Not a native "
+                "LEAN run due to missing credentials/local equity data."
+            ),
             "assets": TICKERS,
         },
     )

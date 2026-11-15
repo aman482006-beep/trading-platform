@@ -297,7 +297,8 @@ def score_risk_parity_universe(
     corr = np.corrcoef(returns, rowvar=False) if returns.shape[0] > 1 else np.eye(len(symbols))
     corr = np.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0)
     if len(symbols) > 1:
-        avg_abs_corr = float((np.sum(np.abs(corr)) - len(symbols)) / (len(symbols) ** 2 - len(symbols)))
+        off_diagonal = (len(symbols) ** 2 - len(symbols))
+        avg_abs_corr = float((np.sum(np.abs(corr)) - len(symbols)) / off_diagonal)
     else:
         avg_abs_corr = 0.0
     rc = risk_contributions(weights_array, cov)
@@ -307,7 +308,12 @@ def score_risk_parity_universe(
     # average absolute correlation (0-1 scale), 2.0 penalizes squared
     # risk-budget deviation (small scale, needs the larger multiplier to
     # bind). Tune explicitly if the selection over/under-weights one axis.
-    score = (sharpe or 0.0) + (0.35 * diversification_ratio) - (0.5 * avg_abs_corr) - (2.0 * rc_error)
+    score = (
+        (sharpe or 0.0)
+        + (0.35 * diversification_ratio)
+        - (0.5 * avg_abs_corr)
+        - (2.0 * rc_error)
+    )
     weights = {symbol: float(weight) for symbol, weight in zip(symbols, weights_array)}
     risk = {symbol: float(value) for symbol, value in zip(symbols, rc)}
     return RiskParitySelection(
