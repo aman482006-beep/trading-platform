@@ -52,7 +52,10 @@ _guard.ensure_own_checkout("run_risk_parity_backtest")
 import shared  # noqa: F401
 from shared.constants import ensure_path_within_workspace
 from shared.logging import get_logger
-from runner.risk_parity_optimizer import _project_to_capped_simplex
+from runner.risk_parity_optimizer import (
+    _project_to_capped_simplex,
+    resolve_weight_bounds,
+)
 
 logger = get_logger("scripts.run-risk-parity-backtest")
 
@@ -124,11 +127,11 @@ def calculate_risk_parity_weights(
 ) -> dict[str, float]:
     """Equal risk contribution weights via SLSQP optimisation."""
     n = len(tickers)
-    # #129: fail closed on infeasible bounds, like runner.risk_parity_optimizer.
-    if min_weight * n > 1.0 + 1e-12:
-        raise ValueError("min_weight is infeasible for the number of assets")
-    if max_weight * n < 1.0 - 1e-12:
-        raise ValueError("max_weight is infeasible for the number of assets")
+    # #129: fail closed on infeasible bounds, and clamp them onto the long-only
+    # simplex, with the module's own resolver so the two cannot drift apart
+    # (this copy used to pass a negative min_weight / max_weight > 1 straight
+    # into SLSQP and the projection).
+    lower, upper = resolve_weight_bounds(min_weight, max_weight, n)
 
     def portfolio_vol(w):
         return float(np.sqrt(w @ cov @ w))
@@ -142,7 +145,7 @@ def calculate_risk_parity_weights(
         target_rc = np.ones(n) / n
         return float(np.sum((rc - target_rc) ** 2))
 
-    bounds = [(min_weight, max_weight) for _ in range(n)]
+    bounds = [(lower, upper) for _ in range(n)]
     constraints = [{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}]
     x0 = np.ones(n) / n
     result = minimize(
@@ -162,7 +165,7 @@ def calculate_risk_parity_weights(
     # #129: the inverse-vol fallback ignores the bounds and SLSQP can overshoot
     # them by float noise; project onto the capped simplex on every path.
     weights = _project_to_capped_simplex(
-        np.asarray(weights, dtype=float), lower=min_weight, upper=max_weight
+        np.asarray(weights, dtype=float), lower=lower, upper=upper
     )
 
     return {ticker: float(weights[i]) for i, ticker in enumerate(tickers)}

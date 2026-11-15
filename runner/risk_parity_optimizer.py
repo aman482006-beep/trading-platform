@@ -138,6 +138,56 @@ def risk_contributions(weights: np.ndarray, covariance: np.ndarray) -> np.ndarra
     return contributions
 
 
+def clamp_weight_bounds(min_weight: float, max_weight: float) -> tuple[float, float]:
+    """Clamp raw weight bounds onto the long-only simplex ``[0.0, 1.0]``.
+
+    Risk parity is long-only, so a negative ``min_weight`` or a ``max_weight``
+    above 1 is a caller mistake rather than a wider search: clamp it here so no
+    caller can hand out-of-range bounds to SLSQP or to the simplex projection.
+    """
+    return max(0.0, float(min_weight)), min(1.0, float(max_weight))
+
+
+def weight_bounds_feasible(lower: float, upper: float, n_assets: int) -> bool:
+    """Whether a weight vector with ``sum(w) == 1`` exists inside the bounds.
+
+    ``lower`` and ``upper`` must already be clamped (see
+    :func:`clamp_weight_bounds`). ``upper >= lower`` is part of the condition:
+    bounds that cross leave the capped simplex empty, and numpy's clip with
+    ``a_min > a_max`` returns ``a_max`` everywhere - weights that sum to
+    ``1 - (upper - lower) * n`` while looking bounded.
+    """
+    if n_assets < 1:
+        return False
+    return (
+        lower * n_assets <= 1.0 + _FEASIBILITY_TOL
+        and upper * n_assets >= 1.0 - _FEASIBILITY_TOL
+        and upper >= lower
+    )
+
+
+def resolve_weight_bounds(
+    min_weight: float, max_weight: float, n_assets: int
+) -> tuple[float, float]:
+    """Clamp the bounds onto the simplex and return them, or fail closed.
+
+    The single place that decides whether a weight-bound pair can be solved at
+    all, so the runner and the standalone backtest script cannot disagree
+    about it (#129).
+    """
+    lower, upper = clamp_weight_bounds(min_weight, max_weight)
+    if not weight_bounds_feasible(lower, upper, n_assets):
+        if lower * n_assets > 1.0 + _FEASIBILITY_TOL:
+            raise ValueError("min_weight is infeasible for the number of assets")
+        if upper < lower:
+            raise ValueError(
+                "min_weight must not exceed max_weight: the bounds leave the "
+                "capped simplex empty"
+            )
+        raise ValueError("max_weight is infeasible for the number of assets")
+    return lower, upper
+
+
 def _project_to_capped_simplex(values: np.ndarray, *, lower: float, upper: float) -> np.ndarray:
     """Euclidean projection onto {w : sum(w) == 1, lower <= w_i <= upper}.
 
@@ -175,15 +225,8 @@ def solve_risk_parity_weights(
     if cov.ndim != 2 or cov.shape[0] != cov.shape[1] or cov.shape[0] == 0:
         raise ValueError("covariance must be a non-empty square matrix")
     n_assets = cov.shape[0]
-    lower = max(0.0, float(min_weight))
-    upper = min(1.0, float(max_weight))
     # #129: fail closed on infeasible bounds instead of silently relaxing them.
-    # (upper < lower is caught by one of the two checks below unless both
-    # bounds equal 1/n within float noise, which is feasible.)
-    if lower * n_assets > 1.0 + _FEASIBILITY_TOL:
-        raise ValueError("min_weight is infeasible for the number of assets")
-    if upper * n_assets < 1.0 - _FEASIBILITY_TOL:
-        raise ValueError("max_weight is infeasible for the number of assets")
+    lower, upper = resolve_weight_bounds(min_weight, max_weight, n_assets)
 
     target = np.full(n_assets, 1.0 / n_assets)
     initial = np.full(n_assets, 1.0 / n_assets)
@@ -338,11 +381,9 @@ def select_best_risk_parity_universe(
             continue
         # #129: bounds that are infeasible for this universe size (e.g.
         # max_weight=0.4 with 2 assets) must not abort the whole search; skip
-        # that universe explicitly and say so.
-        if (
-            max(0.0, float(min_weight)) * len(columns) > 1.0 + _FEASIBILITY_TOL
-            or min(1.0, float(max_weight)) * len(columns) < 1.0 - _FEASIBILITY_TOL
-        ):
+        # that universe explicitly and say so (also in the returned payload).
+        lower, upper = clamp_weight_bounds(min_weight, max_weight)
+        if not weight_bounds_feasible(lower, upper, len(columns)):
             logger.warning(
                 "Skipping risk parity universe %s: min_weight=%s / max_weight=%s "
                 "are infeasible for %d assets",
@@ -396,6 +437,10 @@ def select_best_risk_parity_universe(
         "best_diversification_ratio": best.diversification_ratio,
         "best_avg_abs_correlation": best.avg_abs_correlation,
         "best_risk_contributions": best.risk_contributions,
+        # Universes the bounds made infeasible for their asset count: they were
+        # considered and skipped, so evaluated_universes alone under-reports the
+        # search.
+        "infeasible_skipped": infeasible_skipped,
         "evaluated_universes": [
             {
                 "symbols": item.symbols,
