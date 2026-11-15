@@ -172,10 +172,13 @@ def _solve_assignment(
     may pair. The bipartite graph is split into connected components first
     and each component is solved on its own dense matrix. That is exact (no
     pair crosses components, so the optimum is the union of the per-component
-    optima) and keeps memory bounded by the largest component instead of
-    ``ref_count * act_count``, which would be gigabytes for long trade lists.
-    Components are processed in canonical position order, so the result is
-    deterministic.
+    optima). Materialising ``feasible`` is already ``O(E)`` in the ``E`` pairs
+    the matcher may pair, and the dense solve adds
+    ``O(largest_component ** 2)``, so peak memory is
+    ``O(E + largest_component ** 2)`` instead of the single
+    ``ref_count * act_count`` matrix, which would be gigabytes for long trade
+    lists. Components are processed in canonical position order, so the
+    result is deterministic.
     """
     if ref_count == 0 or act_count == 0 or not feasible:
         return {}
@@ -225,8 +228,8 @@ class TradeMatcher:
 
     Both lists are canonicalised before the solve, so the result does not
     depend on their order; exact cost ties resolve to the first actual in that
-    canonical order (times, symbol, direction, price, quantity, id), which
-    keeps the old deterministic tie-breaking.
+    canonical order (times, symbol, direction, price, quantity, id).  That
+    keeps ties deterministic without depending on input order.
     """
 
     @classmethod
@@ -322,9 +325,11 @@ class TradeMatcher:
                     price_weight=price_weight,
                     quantity_weight=quantity_weight,
                 )
-                # A non-finite cost can only come from astronomically large
-                # weights. Such a pair was never selected before either, and
-                # ``inf`` must not reach the solver.
+                # A non-finite cost comes from a non-finite entry price or
+                # quantity, or from astronomically large weights.  Such a pair
+                # was never selected before either (the greedy comparison also
+                # never picks a non-finite cost), and ``inf``/``nan`` must not
+                # reach the solver.
                 if math.isfinite(cost):
                     feasible.append((ref_pos, act_pos, cost))
 
