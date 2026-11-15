@@ -5695,6 +5695,34 @@ def test_deduplicate_backtests_kept_id_skipped(viewer_client, monkeypatch, tmp_p
     assert deleted_calls == []
 
 
+def test_deduplicate_backtests_keeps_newest_real_grouping(viewer_client, monkeypatch, tmp_path):
+    import viewer.main as viewer_app_module
+
+    monkeypatch.setattr(viewer_app_module, "list_portfolio_records", lambda: [])
+    monkeypatch.setattr(viewer_app_module, "delete_portfolio_record", lambda _portfolio_id: False)
+    monkeypatch.setattr(viewer_app_module, "_snapshot_backtest_meta_cache", lambda: [])
+    # Same fingerprint fields, different created_at: the real grouping must keep the newer one
+    shared_fields = {
+        "strategy_name": "Test",
+        "symbols": ["AAPL"],
+        "timeframe": "1d",
+        "start_date": "2025-01-01",
+        "end_date": "2025-12-31",
+        "engine": "vectorbt",
+    }
+    rows = [
+        {"id": "backtest-older", "created_at": "2026-01-01T00:00:00Z", **shared_fields},
+        {"id": "backtest-newer", "created_at": "2026-01-02T00:00:00Z", **shared_fields},
+    ]
+    monkeypatch.setattr(viewer_app_module, "list_backtest_fingerprint_rows", lambda: rows)
+
+    response = viewer_client.post("/api/backtests/deduplicate")
+    assert response.status_code == 200
+    dry_run_payload = response.json()
+    assert dry_run_payload["kept_ids"] == ["backtest-newer"]
+    assert dry_run_payload["candidate_ids"] == ["backtest-older"]
+
+
 def test_remove_empty_portfolios_partial_failure_middle_leaves_earlier_deleted(
     viewer_client, monkeypatch, tmp_path
 ):
