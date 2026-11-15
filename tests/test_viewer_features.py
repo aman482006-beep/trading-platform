@@ -5448,6 +5448,72 @@ def test_deduplicate_portfolios_id_now_kept_skipped(viewer_client, monkeypatch, 
     assert payload["items"][0]["reason"] == "no_longer_duplicate"
 
 
+def test_deduplicate_portfolios_kept_id_skipped(viewer_client, monkeypatch, tmp_path):
+    import viewer.main as viewer_app_module
+
+    monkeypatch.setattr(viewer_app_module, "list_portfolio_records", lambda: [])
+    monkeypatch.setattr(viewer_app_module, "delete_portfolio_record", lambda _portfolio_id: False)
+
+    portfolios_dir = tmp_path / "portfolios"
+    portfolios_dir.mkdir(parents=True, exist_ok=True)
+    # Three identical portfolios: A is the newest, so it is the kept entry
+    for portfolio_id, created_at in (
+        ("portfolio-a", "2026-01-03T00:00:00Z"),
+        ("portfolio-b", "2026-01-02T00:00:00Z"),
+        ("portfolio-c", "2026-01-01T00:00:00Z"),
+    ):
+        (portfolios_dir / f"{portfolio_id}.json").write_text(
+            json.dumps(
+                {
+                    "id": portfolio_id,
+                    "name": "Duplicate Portfolio",
+                    "created_at": created_at,
+                    "account_capital": 100000.0,
+                    "components": [
+                        {
+                            "component_id": "component-001",
+                            "strategy_name": "Strategy A",
+                            "symbol": "AAPL",
+                            "timeframe": "1h",
+                            "weight": 1.0,
+                            "risk_config": {},
+                            "settings": {},
+                            "backtest_id": "",
+                        }
+                    ],
+                    "trades": [],
+                    "combined_stats": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    # Phase 1: dry run keeps A and proposes B and C
+    response = viewer_client.post("/api/portfolios/deduplicate")
+    assert response.status_code == 200
+    dry_run_payload = response.json()
+    assert dry_run_payload["kept_ids"] == ["portfolio-a"]
+    assert dry_run_payload["candidate_ids"] == ["portfolio-b", "portfolio-c"]
+
+    # The kept entry disappears between the phases, so B becomes the newest (kept) entry
+    (portfolios_dir / "portfolio-a.json").unlink()
+
+    # Phase 2: confirm B and C - B must be skipped, C deleted
+    response = viewer_client.post(
+        "/api/portfolios/deduplicate",
+        json={"dry_run": False, "ids": ["portfolio-b", "portfolio-c"]},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["deleted_ids"] == ["portfolio-c"]
+    assert payload["skipped_ids"] == ["portfolio-b"]
+    items_by_id = {item["id"]: item for item in payload["items"]}
+    assert items_by_id["portfolio-b"]["status"] == "skipped"
+    assert items_by_id["portfolio-b"]["reason"] == "now_kept_entry"
+    assert (portfolios_dir / "portfolio-b.json").exists()
+    assert not (portfolios_dir / "portfolio-c.json").exists()
+
+
 def test_deduplicate_backtests_dry_run_and_confirm(viewer_client, monkeypatch, tmp_path):
     import viewer.main as viewer_app_module
 
