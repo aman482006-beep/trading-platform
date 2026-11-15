@@ -130,15 +130,17 @@ Ohne Allowlist startet der Listener nicht (fail-closed). Zusätzlich gilt:
   nach Snowflake-ID chronologisch emittiert, und der Cursor rückt nur bis zur
   neuesten tatsächlich emittierten Nachricht vor. Pro Poll werden höchstens
   `MAX_BACKFILL_PAGES` (5) Seiten geholt; eine größere Lücke wird in den nächsten
-  Poll übernommen (nichts geht verloren) und als Warnung mit Kanal und den
+  Poll übernommen (im laufenden Betrieb geht nichts verloren) und als Warnung mit Kanal und den
   Grenz-IDs (`last_seen_message_id`, `newest_fetched_message_id`, `pages_fetched`)
   geloggt. IDs unterhalb des Cursors werden nie erneut emittiert; ein nicht
   numerischer Cursor wird verworfen und neu aufgesetzt (Warnung). Snowflake-IDs
   sind nicht fortlaufend, daher wird keine Nachrichtenanzahl berechnet.
   Der Cursor liegt nur im Speicher: beim Start (`_prime_cursors`) wird er auf die
   neueste Seite gesetzt, ohne sie zu emittieren. Nachrichten aus einer Downtime,
-  die älter als diese Seite sind, werden daher nicht nachgeholt; das ist gewollt,
-  weil der Daemon Signale älter als `max_signal_age_seconds` ohnehin ablehnt.
+  die älter als diese Seite sind, werden daher nicht nachgeholt und erreichen auch
+  die Altersprüfung (`max_signal_age_seconds`) nie. Bei langen Timeframes
+  (z. B. `1d`, Budget 2 Tage) kann so ein während eines Neustarts geposteter Exit
+  verloren gehen; ein persistierter Cursor ist als Follow-up offen.
 - Ein Discord-Signal wird auf jedes passende Deployment verteilt (Fan-out), nicht
   nur auf das erste.
 - Transiente Reconnect-Fehler schreiben einen Bot-Service nicht dauerhaft auf

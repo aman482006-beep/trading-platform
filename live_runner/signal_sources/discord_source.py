@@ -1312,10 +1312,10 @@ class DiscordSignalSource(BaseSignalSource):
             return
 
         # B2: close the gap by paginating FORWARD from the cursor with `after`.
-        # Discord returns an `after` page newest-first, holding the messages
-        # immediately after the anchor, so reversing each page emits strict
-        # chronological order and each full page anchors the next request; a
-        # short page proves the newest message was reached. The per-poll page
+        # Discord returns an `after` page holding the messages immediately
+        # after the anchor; each page is emitted in snowflake-id order (the
+        # response order is not relied on) and each full page anchors the next
+        # request; a short page proves the newest message was reached. The per-poll page
         # bound caps REST traffic and a larger gap is carried into the next
         # poll, because the cursor advances only to the newest message actually
         # emitted -- never past unfetched history. A 429 or error raised while
@@ -1363,7 +1363,22 @@ class DiscordSignalSource(BaseSignalSource):
             newest_in_page = _newest_numeric_id(fresh)
             if newest_in_page is None:
                 # Nothing in the page can anchor another request; stop and let
-                # the next poll retry from the last good cursor.
+                # the next poll retry from the last good cursor. A page that is
+                # all non-numeric ids is logged, so a stalled channel is
+                # visible in ops instead of looking idle.
+                if fresh:
+                    logger.warning(
+                        "Discord page has no numeric message id; cursor not advanced",
+                        extra={
+                            "data": {
+                                "bot_name": self.bot_name,
+                                "service_id": self.service_id,
+                                "channel_id": channel_id,
+                                "anchor": anchor,
+                                "page_size": len(page),
+                            }
+                        },
+                    )
                 break
             if not self._advance_cursor(channel_id, newest_in_page):
                 # The page did not move past the cursor (a server ignoring

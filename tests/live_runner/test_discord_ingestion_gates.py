@@ -1395,6 +1395,25 @@ class TestIssueB2Backfill:
 
         assert calls == ["1000"]
 
+    def test_full_page_of_poison_ids_warns_and_keeps_the_cursor(self, caplog) -> None:
+        """An all-poison page cannot anchor a request; the stall must be logged."""
+        import asyncio
+        import logging
+
+        source = _source(trusted_author_ids={"bot-1"})
+        source._last_seen_message_ids["channel-1"] = "1000"
+        page = [{**_burst_message(i), "id": f"poison-{i}"} for i in range(ds.POLL_LIMIT)]
+
+        async def _fetch(_channel_id, *, after=None, **kwargs):
+            return list(page)
+
+        source._fetch_messages = _fetch
+        with caplog.at_level(logging.WARNING):
+            asyncio.run(source._poll_once("channel-1"))
+
+        assert source._last_seen_message_ids["channel-1"] == "1000"
+        assert any("no numeric message id" in r.message for r in caplog.records)
+
     def test_stale_ids_are_not_emitted_even_after_seen_set_pruning(self) -> None:
         """A below-cursor id the seen-set forgot must still not be re-emitted."""
         import asyncio
