@@ -10,17 +10,19 @@ new coin.
 Anything that cannot be classified raises :class:`UnclassifiableSymbolError`. Callers
 must refuse to subscribe / fetch rather than fall back to the stock feed, because a
 crypto pair routed to the stock feed silently produces no data.
+
+The quote currencies come from :mod:`shared.alpaca_symbols` (one list for the fee
+backfill and this routing), while the base allowlist stays local: it is the
+intentional difference that makes an unknown base fail closed here.
 """
 
 from __future__ import annotations
 
 import re
 
-AssetClass = str  # "crypto" | "stock"
+from shared.alpaca_symbols import CRYPTO_QUOTES
 
-# Quote currencies Alpaca lists crypto pairs against. Longest first so USDT/USDC are
-# not read as "USD" with a stray trailing letter.
-CRYPTO_QUOTES: tuple[str, ...] = ("USDT", "USDC", "USD", "BTC")
+AssetClass = str  # "crypto" | "stock"
 
 # Base currencies tradable on Alpaca crypto. Keep sorted.
 CRYPTO_BASES: frozenset[str] = frozenset(

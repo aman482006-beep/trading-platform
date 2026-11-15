@@ -21,7 +21,10 @@ from __future__ import annotations
 import re
 from typing import Any, Literal
 
-#: Quote currencies Alpaca crypto pairs trade against, longest first so ``SOLUSDT`` is SOL/USDT.
+#: Quote currencies Alpaca crypto pairs trade against, longest first so a quote that is
+#: a suffix of another (a future ``D`` alongside ``USD``) still resolves deterministically.
+#: Shared with ``live_runner/symbol_class.py``, which routes market data by asset class
+#: and pairs these with its own, stricter base allowlist.
 CRYPTO_QUOTES: tuple[str, ...] = ("USDT", "USDC", "USD", "BTC")
 
 _MIN_CRYPTO_BASE = 3

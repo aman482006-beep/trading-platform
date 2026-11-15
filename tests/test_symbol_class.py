@@ -12,6 +12,7 @@ import pytest
 from live_runner import market_data_stream as mds
 from live_runner.alpaca_adapter import AlpacaLiveAdapter
 from live_runner.symbol_class import (
+    CRYPTO_QUOTES,
     UnclassifiableSymbolError,
     canonical_crypto_symbol,
     classify_symbol,
@@ -26,6 +27,28 @@ from shared.models import LiveAccountConfig, LiveDeploymentConfig
 def test_crypto_forms(symbol: str) -> None:
     assert classify_symbol(symbol) == "crypto"
     assert mds._is_crypto_symbol(symbol) is True
+
+
+def test_crypto_quotes_come_from_the_shared_alpaca_symbol_module() -> None:
+    """One quote list: fee backfill (#124) and market-data routing (#122) must not drift."""
+    from shared import alpaca_symbols
+
+    assert CRYPTO_QUOTES == alpaca_symbols.CRYPTO_QUOTES
+
+
+@pytest.mark.parametrize("symbol", ["BTCUSD", "BTCUSDT", "ETHUSDC", "SOLBTC", "LINKBTC"])
+def test_quote_parsing_matches_shared_alpaca_symbol_module(symbol: str) -> None:
+    """Both modules must read the same quote out of the same spelling.
+
+    Scoped to pairs both recognise: the base allowlist here is deliberately
+    stricter (that strictness is what makes an unknown base fail closed), so
+    ``FOO/USD`` is crypto for the fee backfill and refused for market data.
+    """
+    from shared.alpaca_symbols import split_crypto_pair
+
+    base, quote = split_crypto_pair(symbol)
+
+    assert canonical_crypto_symbol(symbol) == f"{base}/{quote}"
 
 
 @pytest.mark.parametrize(
