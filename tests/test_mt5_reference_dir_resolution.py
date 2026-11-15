@@ -158,6 +158,20 @@ def test_cli_argument_resolves_to_existing_directory(tmp_path):
     assert _PARSER._resolve_reference_dir(str(ref)) == ref.resolve()
 
 
+def test_relative_reference_dir_resolves_against_cwd(tmp_path, monkeypatch):
+    """A relative ``--reference-dir`` must resolve to an absolute path.
+
+    The log paths are built from the resolved directory, so a bare relative
+    value must not survive as one (that would also let the same argument name
+    two different directories depending on the caller's cwd).
+    """
+    monkeypatch.chdir(tmp_path)
+    ref = tmp_path / "refs"
+    ref.mkdir()
+
+    assert _PARSER._resolve_reference_dir("refs") == ref.resolve()
+
+
 def test_env_var_is_used_when_cli_argument_is_absent(tmp_path, monkeypatch):
     ref = tmp_path / "refs"
     ref.mkdir()
