@@ -5221,6 +5221,60 @@ def test_remove_empty_backtests_recheck_failure_skips(viewer_client, monkeypatch
     assert (backtests_dir / "backtest-empty.trades.json").exists()
 
 
+def test_remove_empty_portfolios_recheck_failure_skips(viewer_client, monkeypatch, tmp_path):
+    import viewer.main as viewer_app_module
+
+    monkeypatch.setattr(viewer_app_module, "list_portfolio_records", lambda: [])
+    monkeypatch.setattr(viewer_app_module, "delete_portfolio_record", lambda _portfolio_id: False)
+
+    portfolios_dir = tmp_path / "portfolios"
+    portfolios_dir.mkdir(parents=True, exist_ok=True)
+    (portfolios_dir / "portfolio-empty.json").write_text(
+        json.dumps(
+            {
+                "id": "portfolio-empty",
+                "name": "Empty Portfolio",
+                "components": [],
+                "trades": [],
+                "combined_stats": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Phase 1: dry run reads the snapshot normally
+    response = viewer_client.post("/api/portfolios/remove-empty")
+    assert response.status_code == 200
+    dry_run_payload = response.json()
+    assert dry_run_payload["candidate_ids"] == ["portfolio-empty"]
+
+    # Arm the failure only now: the first snapshot read after this is the confirm
+    # re-check (it runs before any deletion), so that is the read that fails.
+    real_snapshot = viewer_app_module._snapshot_portfolio_payloads
+    snapshot_calls: list[int] = []
+
+    def flaky_snapshot():
+        snapshot_calls.append(1)
+        if len(snapshot_calls) == 1:
+            raise RuntimeError("portfolio store is unavailable")
+        return real_snapshot()
+
+    monkeypatch.setattr(viewer_app_module, "_snapshot_portfolio_payloads", flaky_snapshot)
+
+    response = viewer_client.post(
+        "/api/portfolios/remove-empty",
+        json={"dry_run": False, "ids": dry_run_payload["candidate_ids"]},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["deleted"] == 0
+    assert payload["skipped"] == 1
+    assert payload["items"][0]["status"] == "skipped"
+    assert payload["items"][0]["reason"] == "recheck_failed"
+    # Fail closed: an unreadable re-check leaves the portfolio alone
+    assert (portfolios_dir / "portfolio-empty.json").exists()
+
+
 def test_remove_empty_backtests_recheck_still_empty_deletes(viewer_client, monkeypatch, tmp_path):
     backtests_dir = _seed_zero_trade_backtest(monkeypatch, tmp_path)
     _patch_backtest_metadata_row(monkeypatch, {"id": "backtest-empty", "trade_count": 0})
