@@ -2843,3 +2843,87 @@ def test_discord_deployment_routing_uses_the_configured_account_label(monkeypatc
     response = client.post("/api/live/deployments", json=payload)
     assert response.status_code == 400
     assert "must route to Alpaca account" in response.json()["detail"]
+
+
+def _store_backtest(database, backtest_id: str, *, stats: dict, equity_curve: list[dict]) -> None:
+    with database.get_session() as session:
+        session.add(
+            database.BacktestRecord(
+                id=backtest_id,
+                strategies=["demo"],
+                engine="native",
+                stats=stats,
+                equity_curve=equity_curve,
+            )
+        )
+        session.commit()
+
+
+def test_load_backtest_metadata_row_surfaces_ruined(isolated_db):
+    """#132: the stored ruin flag reaches the row that live-deployment selection reads."""
+    database, _engine, _data_dir = isolated_db
+    healthy_curve = [
+        {"time": "2021-01-04", "equity": 100.0},
+        {"time": "2021-01-05", "equity": 90.0},
+    ]
+    _store_backtest(database, "ruined", stats={"ruined": True}, equity_curve=healthy_curve)
+    _store_backtest(database, "healthy", stats={"ruined": False}, equity_curve=healthy_curve)
+
+    assert database.load_backtest_metadata_row("ruined")["ruined"] is True
+    assert database.load_backtest_metadata_row("healthy")["ruined"] is False
+    by_id = {row["id"]: row["ruined"] for row in database.list_backtest_metadata_rows()}
+    assert by_id == {"ruined": True, "healthy": False}
+
+
+def test_legacy_backtest_without_flag_derives_ruin_from_equity_curve(isolated_db):
+    """A pre-#132 artifact has no ``ruined`` key; its stored curve decides, fail-closed."""
+    database, _engine, _data_dir = isolated_db
+    legacy_stats = {"sharpe_ratio": 2.5, "cagr": 0.4}
+    _store_backtest(
+        database,
+        "legacy-ruined",
+        stats=legacy_stats,
+        equity_curve=[
+            {"time": "2021-01-04", "equity": 100.0},
+            {"time": "2021-01-05", "equity": 0.0},
+            {"time": "2021-01-06", "equity": 80.0},
+        ],
+    )
+    _store_backtest(
+        database,
+        "legacy-healthy",
+        stats=legacy_stats,
+        equity_curve=[
+            {"time": "2021-01-04", "equity": 100.0},
+            {"time": "2021-01-05", "equity": 110.0},
+        ],
+    )
+    _store_backtest(database, "legacy-no-curve", stats=legacy_stats, equity_curve=[])
+
+    assert database.load_backtest_metadata_row("legacy-ruined")["ruined"] is True
+    assert database.load_backtest_metadata_row("legacy-healthy")["ruined"] is False
+    assert database.load_backtest_metadata_row("legacy-no-curve")["ruined"] is False
+
+
+def test_explicit_not_ruined_flag_is_authoritative_over_curve(isolated_db):
+    database, _engine, _data_dir = isolated_db
+    _store_backtest(
+        database,
+        "flagged-healthy",
+        stats={"ruined": False},
+        equity_curve=[{"time": "2021-01-04", "equity": 0.0}],
+    )
+
+    assert database.load_backtest_metadata_row("flagged-healthy")["ruined"] is False
+
+
+def test_ruined_backtest_metadata_publishes_null_cagr(isolated_db):
+    database, _engine, _data_dir = isolated_db
+    _store_backtest(
+        database,
+        "ruined-cagr",
+        stats={"ruined": True, "cagr": None, "undefined_metrics": ["cagr"]},
+        equity_curve=[],
+    )
+
+    assert database.load_backtest_metadata_row("ruined-cagr")["cagr"] is None

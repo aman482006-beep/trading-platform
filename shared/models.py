@@ -713,8 +713,8 @@ class BacktestStats:
     max_drawdown_duration: int = 0
     sharpe_ratio: float | None = 0.0
     sortino_ratio: float | None = 0.0
-    calmar_ratio: float = 0.0
-    cagr: float = 0.0
+    calmar_ratio: float | None = 0.0
+    cagr: float | None = 0.0
     total_return: float = 0.0
     psr: float | None = None
     p_value: float | None = 1.0

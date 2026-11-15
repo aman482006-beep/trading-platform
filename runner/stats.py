@@ -248,11 +248,20 @@ def compute_stats(
         # path. Publishing ratios measured on the pre-ruin subset is exactly
         # the failure this flag exists to prevent; `undefined_metrics` names
         # them so a consumer cannot read a null as "not computed yet".
-        undefined_metrics.update({"sharpe_ratio", "sortino_ratio", "psr", "p_value"})
+        #
+        # CAGR and Calmar are undefined too: an account that reached zero has
+        # no annualised growth rate. Publishing the 0.0 that the CAGR guard
+        # returns would rank a liquidated run above every honest losing run
+        # for a consumer that maximises CAGR or Calmar.
+        undefined_metrics.update(
+            {"sharpe_ratio", "sortino_ratio", "psr", "p_value", "cagr", "calmar_ratio"}
+        )
         sharpe_ratio = None
         sortino_ratio = None
         psr = None
         p_value = None
+        cagr = None
+        calmar_ratio = None
 
     return BacktestStats(
         total_trades=total_trades,
@@ -270,8 +279,8 @@ def compute_stats(
         max_drawdown_duration=max_drawdown_duration,
         sharpe_ratio=round(float(sharpe_ratio), 4) if sharpe_ratio is not None else None,
         sortino_ratio=round(float(sortino_ratio), 4) if sortino_ratio is not None else None,
-        calmar_ratio=round(float(calmar_ratio), 4),
-        cagr=round(float(cagr), 6),
+        calmar_ratio=round(float(calmar_ratio), 4) if calmar_ratio is not None else None,
+        cagr=round(float(cagr), 6) if cagr is not None else None,
         total_return=round(float(total_return), 6),
         psr=round(float(psr), 4) if psr is not None else None,
         p_value=round(float(p_value), 6) if p_value is not None else None,

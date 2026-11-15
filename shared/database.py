@@ -4358,6 +4358,41 @@ def _stat_number_or_undefined(
     return numeric if math.isfinite(numeric) else None
 
 
+def _backtest_is_ruined(backtest: BacktestRecord, stats: dict[str, Any]) -> bool:
+    """Whether a stored backtest's account reached zero (#132).
+
+    Artifacts saved after the flag existed carry ``ruined`` in their stats and
+    that is authoritative. Older artifacts carry no such key, and reading that
+    as "not ruined" would let a liquidated legacy run (whose pre-ruin Sharpe can
+    look excellent) reach live deployment selection. For those the persisted
+    equity curve is checked directly: any non-positive equity point means ruin.
+    A legacy artifact with no readable curve keeps the previous reading (not
+    ruined) because there is nothing to derive it from.
+    """
+    flag = stats.get("ruined")
+    if isinstance(flag, bool):
+        return flag
+    curve = backtest.equity_curve
+    if not isinstance(curve, list):
+        return False
+    for point in curve:
+        if not isinstance(point, dict):
+            continue
+        try:
+            equity = float(point.get("equity"))
+        except (TypeError, ValueError):
+            continue
+        if equity <= 0:
+            logger.warning(
+                "Backtest %s predates the ruin flag and its equity curve reaches %s; "
+                "treating it as ruined",
+                backtest.id,
+                equity,
+            )
+            return True
+    return False
+
+
 def _backtest_metadata_payload(backtest: BacktestRecord, trade_count: int) -> dict[str, Any]:
     data = backtest.data or {}
     stats = backtest.stats or {}
@@ -4381,7 +4416,7 @@ def _backtest_metadata_payload(backtest: BacktestRecord, trade_count: int) -> di
         "start_date": str(backtest.backtest_start or ""),
         "end_date": str(backtest.backtest_end or ""),
         "total_return": _safe_stat_number(stats.get("total_return"), 0.0),
-        "cagr": _safe_stat_number(stats.get("cagr"), 0.0),
+        "cagr": _stat_number_or_undefined(stats, "cagr", 0.0),
         "sharpe_ratio": _stat_number_or_undefined(stats, "sharpe_ratio", 0.0),
         "psr": _stat_number_or_undefined(stats, "psr", 0.0),
         "p_value": _stat_number_or_undefined(stats, "p_value", 1.0),
@@ -4390,7 +4425,7 @@ def _backtest_metadata_payload(backtest: BacktestRecord, trade_count: int) -> di
         "trade_count": max(int(trade_count), 0),
         # #132: a ruined run has undefined return metrics; consumers that rank
         # backtests (live deployment selection) must be able to exclude it.
-        "ruined": stats.get("ruined") is True,
+        "ruined": _backtest_is_ruined(backtest, stats),
         "created_at": str(backtest.created_at or ""),
         "tags": tags,
     }

@@ -780,6 +780,64 @@ def test_undefined_target_metric_trial_never_wins_the_study(monkeypatch, tmp_pat
     assert penalties == {1: True, 2: False}
 
 
+def test_zero_target_metric_trial_is_rankable(monkeypatch, tmp_path: Path):
+    """A measured 0.0 is a metric value, not an undefined one: it can win."""
+    _patch_optimizer_env(monkeypatch, tmp_path, grid_choices=[1, 2], pass_through_stats=True)
+
+    def fake_run_backtest(config, strategy_path):
+        window = int(config.parameters["window"])
+        return _trial_result(config, metric=0.0 if window == 1 else -0.5, trade_count=1)
+
+    monkeypatch.setattr(optimizer_module, "_run_vectorbt_backtest", fake_run_backtest)
+
+    payload = optimizer_module.run_optimization(
+        optimizer_module.OptimizationConfig(
+            base_backtest_id="base-demo",
+            target_metric="sharpe",
+            n_trials=2,
+            train_split_pct=0.7,
+            parameter_ranges={"window": {"type": "int", "min": 1, "max": 2, "step": 1}},
+        ),
+    )
+
+    assert payload["best_params"] == {"window": 1}
+    assert payload["best_value"] == 0.0
+    assert {t["params"]["window"]: t["penalty_applied"] for t in payload["top_trials"]} == {
+        1: False,
+        2: False,
+    }
+
+
+def test_ruined_cagr_target_trial_never_wins_the_study(monkeypatch, tmp_path: Path):
+    """#132: a ruined trial's CAGR is undefined (None), so it cannot beat an honest loser."""
+    _patch_optimizer_env(monkeypatch, tmp_path, grid_choices=[1, 2], pass_through_stats=True)
+
+    def fake_run_backtest(config, strategy_path):
+        window = int(config.parameters["window"])
+        result = _trial_result(config, metric=-0.5, trade_count=1)
+        result.stats["cagr"] = None if window == 1 else -0.5
+        result.stats["ruined"] = window == 1
+        return result
+
+    monkeypatch.setattr(optimizer_module, "_run_vectorbt_backtest", fake_run_backtest)
+
+    payload = optimizer_module.run_optimization(
+        optimizer_module.OptimizationConfig(
+            base_backtest_id="base-demo",
+            target_metric="cagr",
+            n_trials=2,
+            train_split_pct=0.7,
+            parameter_ranges={"window": {"type": "int", "min": 1, "max": 2, "step": 1}},
+        ),
+    )
+
+    assert payload["best_params"] == {"window": 2}
+    assert {t["params"]["window"]: t["penalty_applied"] for t in payload["top_trials"]} == {
+        1: True,
+        2: False,
+    }
+
+
 def _patch_grid_sampler(monkeypatch, choices: list[int]) -> None:
     """Pin optuna.create_study to a deterministic GridSampler over choices."""
     original_create_study = optuna.create_study

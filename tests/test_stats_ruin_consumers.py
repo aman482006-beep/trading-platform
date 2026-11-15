@@ -101,3 +101,15 @@ def test_ruined_backtest_is_never_selected_for_live_deployment() -> None:
 
     assert score_backtest_for_live(ruined) == float("-inf")
     assert [row["id"] for row in top_backtests_for_ctrader([ruined, healthy])] == ["a"]
+
+
+def test_viewer_summary_keeps_ruined_cagr_null() -> None:
+    from viewer.main import _backtest_summary_from_meta
+
+    summary = _backtest_summary_from_meta(
+        {"id": "r", "total_return": -1.0, "cagr": None, "ruined": True}
+    )
+    assert summary["cagr"] is None
+
+    legacy = _backtest_summary_from_meta({"id": "l", "total_return": 0.25})
+    assert legacy["cagr"] == 25.0

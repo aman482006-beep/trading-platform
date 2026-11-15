@@ -174,6 +174,27 @@ def _study_direction(target_metric: str) -> str:
     return direction
 
 
+def _penalize_trial(
+    trial: Any,
+    metric_name: str,
+    completed_trading_values: list[float],
+    target_metric: str,
+) -> float:
+    """Mark ``trial`` as penalised and return a value that can never win.
+
+    Shared by the no-trade and undefined-metric branches so both always set the
+    ``penalty_applied`` marker and the recorded value together.
+    """
+    trial.set_user_attr("penalty_applied", True)
+    trial.set_user_attr("metric_name", metric_name)
+    penalty = _no_trade_penalty_value(
+        completed_trading_values,
+        direction=_study_direction(target_metric),
+    )
+    trial.set_user_attr("metric_value", float(penalty))
+    return penalty
+
+
 def _no_trade_penalty_value(
     completed_trading_values: list[float],
     *,
@@ -553,14 +574,12 @@ def run_optimization(
             # The explicit penalty is strictly below the value of the worst
             # trading trial observed so far, and the marker stays on the trial
             # for downstream validation.
-            trial.set_user_attr("penalty_applied", True)
-            trial.set_user_attr("metric_name", _metric_key(config.target_metric, train_stats))
-            penalty = _no_trade_penalty_value(
+            return _penalize_trial(
+                trial,
+                _metric_key(config.target_metric, train_stats),
                 completed_trading_values,
-                direction=_study_direction(config.target_metric),
+                config.target_metric,
             )
-            trial.set_user_attr("metric_value", float(penalty))
-            return penalty
 
         metric_key = _metric_key(config.target_metric, train_stats)
         if train_stats.get(metric_key) is None:
@@ -570,14 +589,9 @@ def run_optimization(
             # worst-trial penalty as a no-trade trial so it can never be
             # selected as the best parameter set, and the study keeps going
             # instead of aborting on the whole run.
-            trial.set_user_attr("penalty_applied", True)
-            trial.set_user_attr("metric_name", metric_key)
-            penalty = _no_trade_penalty_value(
-                completed_trading_values,
-                direction=_study_direction(config.target_metric),
+            return _penalize_trial(
+                trial, metric_key, completed_trading_values, config.target_metric
             )
-            trial.set_user_attr("metric_value", float(penalty))
-            return penalty
 
         raw_metric_value = _metric_value(train_stats, config.target_metric)
         metric_value = raw_metric_value

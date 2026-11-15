@@ -19,6 +19,7 @@ from runner.stats import compute_stats
 from shared.models import EquityPoint
 
 RETURN_METRICS = ("sharpe_ratio", "sortino_ratio", "psr", "p_value")
+RUIN_UNDEFINED_METRICS = RETURN_METRICS + ("cagr", "calmar_ratio")
 START = datetime(2021, 1, 4, tzinfo=timezone.utc)
 
 
@@ -58,6 +59,36 @@ def test_ruined_curve_return_metrics_are_null_and_undefined(quantstats_flag) -> 
     for metric in RETURN_METRICS:
         assert stats[metric] is None, metric
         assert metric in stats["undefined_metrics"], metric
+
+
+def test_ruined_curve_cagr_and_calmar_are_null_and_undefined(quantstats_flag) -> None:
+    """A liquidated run has no annualised growth rate; 0.0 would beat honest losers."""
+    for equities in (RUINED, [100_000.0, 0.0]):
+        stats = compute_stats([], initial_capital=100_000.0, equity_curve=_curve(equities))
+
+        for metric in ("cagr", "calmar_ratio"):
+            assert stats[metric] is None, (metric, equities)
+            assert metric in stats["undefined_metrics"], (metric, equities)
+
+
+def test_healthy_curve_keeps_cagr_and_calmar(quantstats_flag) -> None:
+    stats = compute_stats([], initial_capital=100_000.0, equity_curve=_curve(PRE_RUIN))
+
+    assert isinstance(stats["cagr"], float)
+    assert isinstance(stats["calmar_ratio"], float)
+    assert "cagr" not in stats["undefined_metrics"]
+    assert "calmar_ratio" not in stats["undefined_metrics"]
+
+
+def test_unsorted_curve_with_two_zero_points_picks_earliest_in_time(quantstats_flag) -> None:
+    curve = _curve([100_000, 101_000, 102_000, 0.0, 50_000, 80_000, 0.0, 90_000])
+    # The later-time zero (index 6) comes first in list order.
+    shuffled = [curve[0], curve[6], curve[1], curve[2], curve[3], curve[7], curve[4], curve[5]]
+    stats = compute_stats([], initial_capital=100_000.0, equity_curve=shuffled)
+
+    assert stats["ruined"] is True
+    assert stats["ruin_time"] == curve[3].time
+    assert stats["total_return"] == pytest.approx(-1.0)
 
 
 def test_ruined_curve_is_truncated_at_ruin(quantstats_flag) -> None:
