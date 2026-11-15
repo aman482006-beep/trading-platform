@@ -47,8 +47,8 @@ jobs:
   resolve:
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    permissions:
-      pull-requests: read
+    # Reads only the event payload; needs no token scope.
+    permissions: {}
     outputs:
       number: ${{ steps.pr.outputs.number }}
       base: ${{ steps.pr.outputs.base }}
