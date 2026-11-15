@@ -485,6 +485,7 @@ def test_native_engine_maps_pct_fractions_to_numerically_ordered_levels():
 
     _, take_profit_levels = engine._extract_levels(row)
 
+    assert [level["name"] for level in take_profit_levels] == [f"tp{i}" for i in range(1, 12)]
     fractions = {level["name"]: level["fraction"] for level in take_profit_levels}
     default_fraction = 1.0 / 11
     assert fractions["tp2"] == pytest.approx(0.5)
@@ -504,3 +505,20 @@ def test_native_engine_puts_plain_take_profit_before_numbered_levels():
     assert [level["name"] for level in take_profit_levels] == ["tp", "tp1", "tp2", "tp10"]
     assert take_profit_levels[0]["price"] == 99.0
     assert take_profit_levels[0]["fraction"] == pytest.approx(0.25)
+
+
+def test_native_engine_ignores_non_decimal_tp_suffix_columns():
+    # Regression guard: str.isdigit() accepts superscripts such as "²", which
+    # int() rejects. Such columns must be ignored, not crash the sort key.
+    engine = _engine()
+    row = pd.Series({"tp1": 101.0, "tp²": 102.0, "tp2": 103.0, "tp²_pct": 0.9})
+
+    stop_loss, take_profit_levels = engine._extract_levels(row)
+
+    assert stop_loss is None
+    assert [level["name"] for level in take_profit_levels] == ["tp1", "tp2"]
+    assert [level["price"] for level in take_profit_levels] == [101.0, 103.0]
+    assert [level["fraction"] for level in take_profit_levels] == [
+        pytest.approx(0.5),
+        pytest.approx(0.5),
+    ]
