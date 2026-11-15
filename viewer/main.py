@@ -12611,8 +12611,9 @@ async def get_live_dashboard() -> dict[str, Any]:
                 **_serialize_live_account_payload(account),
                 "current_equity": equity,
                 "current_balance": _safe_float(stats.get("current_balance"), 0.0),
-                "total_trades": stats.get("total_trades", 0),
-                "total_pnl": stats.get("total_pnl", 0.0),
+                # None means "unknown" (an unusable fill price), not zero: pass it through.
+                "total_trades": stats["total_trades"] if "total_trades" in stats else 0,
+                "total_pnl": stats["total_pnl"] if "total_pnl" in stats else 0.0,
             }
         )
         recent_fills.extend(trades_payload.get("trades", [])[:10])
