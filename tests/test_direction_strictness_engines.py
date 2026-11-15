@@ -119,10 +119,53 @@ def test_stored_legacy_row_with_bad_direction_raises_valueerror() -> None:
 
 
 def test_viewer_treats_contract_violating_stored_result_as_unavailable(monkeypatch) -> None:
+    from shared.models import TradeContractError
     from viewer import main as viewer_main
 
     def boom(_id):
-        raise ValueError("direction must be one of ('LONG', 'SHORT'), got 'long'")
+        raise TradeContractError("direction must be one of ('LONG', 'SHORT'), got 'long'")
 
     monkeypatch.setattr(viewer_main, "load_backtest_result", boom)
     assert viewer_main._load_stored_result("legacy") is None
+
+
+def test_viewer_does_not_hide_unrelated_value_errors(monkeypatch) -> None:
+    """Only the Trade-contract error is treated as unavailable; others propagate."""
+    from viewer import main as viewer_main
+
+    def boom(_id):
+        raise ValueError("corrupt stored metadata")
+
+    monkeypatch.setattr(viewer_main, "load_backtest_result", boom)
+    with pytest.raises(ValueError, match="corrupt stored metadata"):
+        viewer_main._load_stored_result("broken")
+    with pytest.raises(ValueError, match="corrupt stored metadata"):
+        viewer_main._load_result("broken")
+
+
+def test_contract_violating_row_never_falls_back_to_json_rewrite(monkeypatch, tmp_path) -> None:
+    """A row that exists but breaks the contract must not trigger the JSON fallback,
+    which would rewrite the stored rows during a read."""
+    from shared.models import TradeContractError
+    from viewer import main as viewer_main
+
+    (tmp_path / "legacy.trades.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(viewer_main, "BACKTESTS_DIR", tmp_path)
+
+    def boom(_id):
+        raise TradeContractError("direction must be one of ('LONG', 'SHORT'), got 'long'")
+
+    def no_rewrite(_result):
+        raise AssertionError("save_result_to_sqlite must not run for an existing row")
+
+    monkeypatch.setattr(viewer_main, "load_backtest_result", boom)
+    monkeypatch.setattr(viewer_main, "save_result_to_sqlite", no_rewrite)
+    assert viewer_main._load_result("legacy") is None
+
+
+def test_trade_direction_violation_is_a_trade_contract_error() -> None:
+    from shared.models import Trade, TradeContractError
+
+    with pytest.raises(TradeContractError):
+        Trade(id=1, symbol="X", direction="long", entry_time="2024-01-01T00:00:00Z",
+              entry_price=1.0, quantity=1.0, exits=[], pnl=0.0)

@@ -374,6 +374,14 @@ class Portfolio(BaseModel):
 VALID_TIMEFRAMES = ("tick", "s1", "1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w")
 VALID_DIRECTIONS = ("LONG", "SHORT")
 
+
+class TradeContractError(ValueError):
+    """A ``Trade`` violates its contract (direction outside ``VALID_DIRECTIONS``).
+
+    A ``ValueError`` subclass so existing callers keep working; readers of
+    stored results can catch exactly this instead of every ``ValueError``.
+    """
+
 # Spellings a strategy may use for a per-entry direction. Wider than
 # VALID_DIRECTIONS because signal frames commonly carry lower-case or +1/-1.
 _LONG_DIRECTION_SPELLINGS = ("LONG", "long", 1)
@@ -477,7 +485,9 @@ class Trade:
         # VALID_DIRECTIONS used to read as SHORT through ``direction_sign``
         # (and as LONG through several engine comparisons), flipping PnL sign.
         if self.direction not in VALID_DIRECTIONS:
-            raise ValueError(f"direction must be one of {VALID_DIRECTIONS}, got {self.direction!r}")
+            raise TradeContractError(
+                f"direction must be one of {VALID_DIRECTIONS}, got {self.direction!r}"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -567,7 +577,9 @@ class Trade:
             return 1
         if self.direction == "SHORT":
             return -1
-        raise ValueError(f"direction must be one of {VALID_DIRECTIONS}, got {self.direction!r}")
+        raise TradeContractError(
+            f"direction must be one of {VALID_DIRECTIONS}, got {self.direction!r}"
+        )
 
 
 # ─── Equity point ────────────────────────────────────────────────────────────

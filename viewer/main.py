@@ -156,6 +156,7 @@ from shared.models import (
     Service,
     ServiceStatus,
     ServiceType,
+    TradeContractError,
     VerificationEvidenceRecord,
     VerificationEvidenceSummary,
     resolve_defined_stat,
@@ -1817,18 +1818,36 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
     )
 
 
-def _load_stored_result(backtest_id: str) -> BacktestResult | None:
-    """``load_backtest_result`` that treats a stored row violating the Trade
-    contract (e.g. a legacy lower-case direction) as unavailable, not a 500."""
+class _StoredResultViolatesContract(Exception):
+    """A stored backtest row exists but breaks the Trade contract."""
+
+
+def _load_stored_result_or_raise(backtest_id: str) -> BacktestResult | None:
+    """``load_backtest_result``; a Trade-contract violation (e.g. a legacy
+    lower-case direction) is logged and re-raised as a private marker. Every
+    other error propagates unchanged."""
     try:
         return load_backtest_result(backtest_id)
-    except ValueError as exc:
+    except TradeContractError as exc:
         logger.warning("Stored backtest %s violates the trade contract: %s", backtest_id, exc)
+        raise _StoredResultViolatesContract(backtest_id) from exc
+
+
+def _load_stored_result(backtest_id: str) -> BacktestResult | None:
+    """Stored result, or ``None`` when it is missing or breaks the Trade contract."""
+    try:
+        return _load_stored_result_or_raise(backtest_id)
+    except _StoredResultViolatesContract:
         return None
 
 
 def _load_result(backtest_id: str) -> BacktestResult | None:
-    result = _load_stored_result(backtest_id)
+    try:
+        result = _load_stored_result_or_raise(backtest_id)
+    except _StoredResultViolatesContract:
+        # The row exists: never fall back to the JSON artifact here, since that
+        # path rewrites the stored rows on a read.
+        return None
     if result is not None:
         return result
 
