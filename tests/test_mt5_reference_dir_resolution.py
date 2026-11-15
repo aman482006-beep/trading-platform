@@ -63,13 +63,24 @@ def test_nonexistent_reference_dir_is_rejected(tmp_path):
         _PARSER._resolve_reference_dir(str(missing))
 
 
-def test_reference_dir_must_be_a_directory_not_a_file(tmp_path):
-    file_path = tmp_path / "file.txt"
-    file_path.write_text("x", encoding="utf-8")
+def test_empty_env_var_is_rejected(monkeypatch):
+    """A blanked env var (CI templates leave them empty) must not resolve to cwd."""
+    monkeypatch.setenv(_ENV_VAR, "")
 
-    with pytest.raises(ValueError, match="does not exist"):
-        _PARSER._resolve_reference_dir(str(file_path))
+    with pytest.raises(ValueError, match="no MT5 reference directory"):
+        _PARSER._resolve_reference_dir(None)
 
+
+def test_empty_reference_dir_flag_does_not_fall_back_to_env_var(tmp_path, monkeypatch):
+    """``--reference-dir ""`` must not be read as "flag absent" and silently
+    resurrect the env var: an explicitly empty flag is a clear error, so the
+    audit can never run against a directory the operator did not name."""
+    env_ref = tmp_path / "env-refs"
+    env_ref.mkdir()
+    monkeypatch.setenv(_ENV_VAR, str(env_ref))
+
+    with pytest.raises(ValueError, match="no MT5 reference directory"):
+        _PARSER._resolve_reference_dir("")
 
 def test_cli_argument_resolves_to_existing_directory(tmp_path):
     ref = tmp_path / "refs"
@@ -97,6 +108,19 @@ def test_cli_argument_takes_precedence_over_env_var(tmp_path, monkeypatch):
 
 
 def test_main_exits_with_clear_message_when_reference_dir_missing(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["parse_mt5_reference.py"])
+
+    with pytest.raises(SystemExit) as excinfo:
+        _PARSER.main()
+
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "--reference-dir" in err
+    assert _ENV_VAR in err
+
+
+def test_main_exits_with_clear_message_when_env_var_is_empty(monkeypatch, capsys):
+    monkeypatch.setenv(_ENV_VAR, "")
     monkeypatch.setattr(sys, "argv", ["parse_mt5_reference.py"])
 
     with pytest.raises(SystemExit) as excinfo:
