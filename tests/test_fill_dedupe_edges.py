@@ -320,6 +320,24 @@ def test_c19b_alpaca_timestamp_fallback_key_keeps_microsecond_precision(monkeypa
     assert len(saved) == 2 and len(keys) == 2, keys
 
 
+def test_c19a_alpaca_fallback_key_keeps_sub_cent_cumulative_distinct() -> None:
+    """Fractional cumulative quantities below a cent must stay distinct fills."""
+    from live_runner.alpaca_adapter import _alpaca_fill_dedupe_key
+
+    keys = {
+        _alpaca_fill_dedupe_key(
+            execution_id=None,
+            broker_order_id="ord-1",
+            event="partial_fill",
+            cumulative_filled_qty=cumulative,
+            raw_timestamp=None,
+            filled_qty=0.001,
+        )
+        for cumulative in (0.001, 0.002)
+    }
+    assert len(keys) == 2, keys
+
+
 def test_c19b_alpaca_without_identity_or_timestamp_is_not_persisted(monkeypatch) -> None:
     """No execution id, no usable cumulative, no timestamp: a key cannot be derived honestly.
 
