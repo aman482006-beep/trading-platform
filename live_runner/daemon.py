@@ -1196,6 +1196,9 @@ def _mint_signal_idempotency_key(
         # them right after the upgrade (a restart is exactly when producers replay) must still
         # find that row instead of placing a second broker order, so the pre-#127 key travels
         # along as a lookup-only fallback. It is never stored as the row's own key.
+        # Bound: this only dedupes a replay that carries the SAME spelling as the stored
+        # pre-#127 row. A replay re-spelled differently (``Z`` stored, ``+00:00`` replayed)
+        # misses it; closing that needs a data migration of stored keys and is not done here.
         metadata["legacy_idempotency_key"] = _key(raw_stamp)
 
 

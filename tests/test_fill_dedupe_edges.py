@@ -890,8 +890,25 @@ def test_a_key_owned_by_another_signal_is_refused_on_the_unique_constraint_race(
         broker_fill_id=None,
     )
     with get_session() as session:
+        # Force the race: the pre-insert SELECT sees nothing (as if the other writer had not
+        # committed yet), so the conflict is only discovered through the IntegrityError path.
+        real_exec = session.exec
+        calls = {"n": 0}
+
+        class _Miss:
+            def first(self):
+                return None
+
+        def _first_lookup_misses(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return _Miss()
+            return real_exec(*args, **kwargs)
+
+        session.exec = _first_lookup_misses  # type: ignore[method-assign]
         with caplog.at_level(logging.ERROR, logger="shared.database"):
             result = _insert_live_execution_locked(session, exec2)
+        assert calls["n"] == 2  # pre-check (forced miss) + the post-IntegrityError re-query
         assert result is False
         assert any(
             key in record.getMessage() and record.levelno >= logging.ERROR
@@ -970,8 +987,25 @@ def test_a_key_owned_by_another_signal_is_refused_before_the_insert(database, ca
         broker_fill_id=None,
     )
     with get_session() as session:
+        # Force the race: the pre-insert SELECT sees nothing (as if the other writer had not
+        # committed yet), so the conflict is only discovered through the IntegrityError path.
+        real_exec = session.exec
+        calls = {"n": 0}
+
+        class _Miss:
+            def first(self):
+                return None
+
+        def _first_lookup_misses(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return _Miss()
+            return real_exec(*args, **kwargs)
+
+        session.exec = _first_lookup_misses  # type: ignore[method-assign]
         with caplog.at_level(logging.ERROR, logger="shared.database"):
             result = _insert_live_execution_locked(session, exec2)
+        assert calls["n"] == 2  # pre-check (forced miss) + the post-IntegrityError re-query
         assert result is False
         assert any(
             key in record.getMessage() and record.levelno >= logging.ERROR
