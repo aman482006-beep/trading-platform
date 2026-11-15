@@ -47,7 +47,8 @@ DEAL_RE = re.compile(
     r"(\d{4}\.\d{2}\.\d{2} \d{2}:\d{2}:\d{2})\s+deal #(\d+) (buy|sell) ([\d.]+) \S+ at ([\d.]+)"
 )
 OPEN_RE = re.compile(
-    r"(\d{4}\.\d{2}\.\d{2} \d{2}:\d{2}:\d{2})\s+(Long|Short) opened @ ([\d.]+) \| Lots: ([\d.]+) \| SL: ([\d.]+)"
+    r"(\d{4}\.\d{2}\.\d{2} \d{2}:\d{2}:\d{2})\s+(Long|Short) opened @ ([\d.]+) "
+    r"\| Lots: ([\d.]+) \| SL: ([\d.]+)"
 )
 
 
@@ -193,7 +194,7 @@ def parse_log_trades(log_path: pathlib.Path, contract: float) -> list[dict]:
             }
         )
     # final balance cross-check
-    finals = [l for l in lines if "final balance" in l]
+    finals = [line for line in lines if "final balance" in line]
     if finals:
         reported = float(finals[0].split("final balance")[1].split()[0])
         implied = 100000.0 + sum(t["pnl"] for t in trades)
