@@ -1,10 +1,12 @@
 """Containment tests for the viewer matrix result path helper (#155).
 
 ``_matrix_result_path`` must only ever hand out files inside
-``MATRIX_RESULTS_DIR``. All current callers pass hard-coded names, so these
-tests guard the helper for future callers that might take user input.
-Every rejected form must answer 400, and no accepted form may resolve outside
-the results directory (symlinks included).
+``MATRIX_RESULTS_DIR``, and the file an endpoint serves must be the file that
+check approved. All current callers pass hard-coded names, so these tests
+guard the helper for future callers that might take user input. Every rejected
+form must answer 400, and no accepted form may resolve outside the results
+directory (symlinks included), neither when it is checked nor when it is
+opened.
 """
 
 from __future__ import annotations
@@ -39,6 +41,22 @@ def _symlink_or_skip(link: Path, target: Path, *, target_is_directory: bool = Fa
         pytest.skip(f"symlinks unavailable on this platform: {exc}")
 
 
+def _check_then_swap(monkeypatch, swap) -> None:
+    """Run ``swap`` immediately after the containment check, before the open.
+
+    The check and the serve are two filesystem walks, so anything renamed in
+    between the two would have been followed. This reproduces that window.
+    """
+    original = viewer_app_module._matrix_result_path
+
+    def check_then_swap_helper(filename: str) -> Path:
+        path = original(filename)
+        swap()
+        return path
+
+    monkeypatch.setattr(viewer_app_module, "_matrix_result_path", check_then_swap_helper)
+
+
 def _assert_rejected(filename: str) -> None:
     with pytest.raises(HTTPException) as excinfo:
         viewer_app_module._matrix_result_path(filename)
@@ -51,6 +69,10 @@ def test_plain_filename_resolves_inside_results_dir(results_dir):
 
     assert path.is_relative_to(results_dir.resolve())
     assert path.name == "matrix_matrix.csv"
+    # The returned path is the resolved one, so a caller opening it cannot be
+    # handed a path that still has to be resolved (and could resolve outside).
+    assert path == (results_dir / "matrix_matrix.csv").resolve()
+    assert path == path.resolve()
     assert path.read_text(encoding="utf-8") == "ok\n"
 
 
@@ -58,6 +80,47 @@ def test_surrounding_whitespace_is_stripped(results_dir):
     path = viewer_app_module._matrix_result_path("  matrix_matrix.csv  ")
 
     assert path.name == "matrix_matrix.csv"
+
+
+def test_returned_path_is_resolved_through_a_symlinked_results_dir(
+    results_dir, tmp_path, monkeypatch
+):
+    real = tmp_path / "real_results"
+    real.mkdir()
+    (real / "matrix_matrix.csv").write_text("ok\n", encoding="utf-8")
+    linked = tmp_path / "linked_results"
+    _symlink_or_skip(linked, real, target_is_directory=True)
+    monkeypatch.setattr(viewer_app_module, "MATRIX_RESULTS_DIR", linked)
+
+    path = viewer_app_module._matrix_result_path("matrix_matrix.csv")
+
+    assert path == real / "matrix_matrix.csv"
+    assert path == path.resolve()
+
+
+def test_matrix_csv_endpoint_serves_the_contained_file(results_dir):
+    response = TestClient(viewer_app_module.app).get("/api/backtests/matrix/matrix.csv")
+
+    assert response.status_code == 200
+    assert response.text == "ok\n"
+    assert response.headers["content-disposition"] == 'attachment; filename="matrix_matrix.csv"'
+    # Identity encoding keeps the middleware from replacing the headers it set.
+    identity = TestClient(viewer_app_module.app).get(
+        "/api/backtests/matrix/matrix.csv", headers={"accept-encoding": "identity"}
+    )
+    assert identity.headers["content-length"] == str(len("ok\n"))
+
+
+def test_daily_equity_csv_endpoint_serves_the_contained_file(results_dir):
+    (results_dir / "matrix_daily_equity.csv").write_text("equity\n", encoding="utf-8")
+
+    response = TestClient(viewer_app_module.app).get("/api/backtests/matrix/daily-equity.csv")
+
+    assert response.status_code == 200
+    assert response.text == "equity\n"
+    assert response.headers["content-disposition"] == (
+        'attachment; filename="matrix_daily_equity.csv"'
+    )
 
 
 @pytest.mark.parametrize("filename", ["", "   ", None])
@@ -82,6 +145,13 @@ def test_traversal_is_rejected(results_dir, filename):
 def test_absolute_posix_path_is_rejected(results_dir, tmp_path):
     _assert_rejected(str(tmp_path / "secret.csv"))
     _assert_rejected("/etc/passwd")
+
+
+@pytest.mark.parametrize("filename", [".", " . ", "./", "./."])
+def test_directory_itself_is_rejected(results_dir, filename):
+    # The results directory is inside the results directory, so containment alone
+    # would hand it out; a caller then serving it would act on a directory.
+    _assert_rejected(filename)
 
 
 @pytest.mark.parametrize(
@@ -125,6 +195,21 @@ def test_symlink_that_stays_inside_results_dir_is_accepted(results_dir):
     assert path.is_relative_to(results_dir.resolve())
 
 
+def test_directory_inside_results_dir_is_not_served(results_dir):
+    # Containment accepts a name that resolves to a directory inside the results
+    # directory, so the endpoint has to refuse it itself: a file response built
+    # for a directory fails when it opens instead of answering the caller.
+    (results_dir / "matrix_matrix.csv").unlink()
+    (results_dir / "matrix_matrix.csv").mkdir()
+
+    response = TestClient(viewer_app_module.app, raise_server_exceptions=False).get(
+        "/api/backtests/matrix/matrix.csv"
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Matrix CSV not found"
+
+
 def test_matrix_csv_endpoint_does_not_serve_symlink_escape(results_dir, tmp_path):
     # Fixed-name route: a symlink planted under the expected name must not leak
     # a file from outside the results directory.
@@ -136,3 +221,52 @@ def test_matrix_csv_endpoint_does_not_serve_symlink_escape(results_dir, tmp_path
 
     assert response.status_code == 400
     assert "secret" not in response.text
+
+
+def test_symlink_swapped_in_after_the_check_is_not_served(results_dir, tmp_path, monkeypatch):
+    # Containment is checked on one walk and the file is opened on another, so a
+    # final component replaced by a symlink between the two must be refused
+    # rather than followed: it points outside the results directory now.
+    expected_name = results_dir / "matrix_matrix.csv"
+
+    def swap() -> None:
+        expected_name.unlink()
+        expected_name.symlink_to(tmp_path / "secret.csv")
+
+    _check_then_swap(monkeypatch, swap)
+
+    response = TestClient(viewer_app_module.app, raise_server_exceptions=False).get(
+        "/api/backtests/matrix/matrix.csv"
+    )
+
+    assert response.status_code == 400
+    assert "secret" not in response.text
+
+
+def test_directory_component_swapped_in_after_the_check_is_not_served(
+    results_dir, tmp_path, monkeypatch
+):
+    # A swapped *directory* component is the same hole one level up: the checked
+    # path is inside the results directory, but by the time it is opened that
+    # component points elsewhere, so the descriptor has to be checked again.
+    inside = results_dir / "sub"
+    inside.mkdir()
+    (inside / "matrix_matrix.csv").write_text("inside\n", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "matrix_matrix.csv").write_text("secret\n", encoding="utf-8")
+
+    def swap() -> None:
+        (inside / "matrix_matrix.csv").unlink()
+        inside.rmdir()
+        _symlink_or_skip(inside, outside, target_is_directory=True)
+
+    _check_then_swap(monkeypatch, swap)
+
+    with pytest.raises(HTTPException) as excinfo:
+        viewer_app_module._checked_matrix_result(
+            "sub/matrix_matrix.csv", not_found_detail="Matrix CSV not found"
+        )
+
+    assert excinfo.value.status_code == 400
+    assert excinfo.value.detail == "Invalid matrix filename"
