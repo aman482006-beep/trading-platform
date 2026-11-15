@@ -31,8 +31,10 @@ CRYPTO_BASES: frozenset[str] = frozenset(
     }
 )
 
-# US equity tickers are at most 5 letters, optionally with a class suffix (BRK.B).
-_EQUITY_RE = re.compile(r"^[A-Z]{1,5}(?:[.][A-Z]{1,2})?$")
+# US equity tickers are at most 5 letters, optionally with a share-class suffix
+# (BRK.B, BRK-B) — same rule as shared/alpaca_symbols.py, so a holding the fee
+# backfill proves to be an equity is also routed to the stock feed here.
+_EQUITY_RE = re.compile(r"^[A-Z]{1,5}(?:[.\-][A-Z]{1,2})?$")
 _PAIR_RE = re.compile(r"^([A-Z0-9]{2,10})[/-]([A-Z]{3,4})$")
 
 
@@ -40,18 +42,26 @@ class UnclassifiableSymbolError(ValueError):
     """The symbol is neither a recognised crypto pair nor a plausible equity ticker."""
 
 
+def _is_known_pair(base: str, quote: str) -> bool:
+    """True for a pair Alpaca actually lists.
+
+    ``base == quote`` is excluded on purpose: ``BTC/BTC`` (and its unslashed
+    ``BTCBTC`` spelling) is not a listed pair, so subscribing it would be a silent
+    no-data feed — the failure mode this module exists to prevent.
+    """
+    return base != quote and base in CRYPTO_BASES and quote in CRYPTO_QUOTES
+
+
 def _split_crypto(symbol: str) -> tuple[str, str] | None:
     """Return (base, quote) for a recognised crypto pair in any supported form."""
     pair = _PAIR_RE.match(symbol)
     if pair is not None:
         base, quote = pair.groups()
-        if base in CRYPTO_BASES and quote in CRYPTO_QUOTES:
-            return base, quote
-        return None
+        return (base, quote) if _is_known_pair(base, quote) else None
     for quote in CRYPTO_QUOTES:
         if symbol.endswith(quote):
             base = symbol[: -len(quote)]
-            if base in CRYPTO_BASES:
+            if _is_known_pair(base, quote):
                 return base, quote
     return None
 
@@ -63,13 +73,15 @@ def classify_symbol(symbol: str) -> AssetClass:
         raise UnclassifiableSymbolError("empty symbol")
     if _split_crypto(normalized) is not None:
         return "crypto"
+    # A share-class equity (BRK-B) carries the same separator as a pair, so the
+    # equity rule has to be applied before the "looks like a pair" refusal.
+    if _EQUITY_RE.match(normalized):
+        return "stock"
     if "/" in normalized or "-" in normalized:
         raise UnclassifiableSymbolError(
             f"{normalized!r} looks like a pair but its base/quote is not a known crypto "
             "pair; refusing to route it to the stock feed"
         )
-    if _EQUITY_RE.match(normalized):
-        return "stock"
     raise UnclassifiableSymbolError(
         f"{normalized!r} is neither a known crypto pair nor a valid equity ticker"
     )

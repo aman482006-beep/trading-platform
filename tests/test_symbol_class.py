@@ -27,18 +27,54 @@ def test_crypto_forms(symbol: str) -> None:
     assert mds._is_crypto_symbol(symbol) is True
 
 
-@pytest.mark.parametrize("symbol", ["AAPL", "SPY", "BRK.B", "ABUSD", "TUSD", "MUSD"])
+@pytest.mark.parametrize(
+    "symbol",
+    # BRK-B / BF-B are real NYSE share-class forms (shared/alpaca_symbols.py accepts
+    # them as us_equity); refusing them here would take a valid holding dark.
+    ["AAPL", "SPY", "BRK.B", "BRK-B", "BF-B", "ABUSD", "TUSD", "MUSD"],
+)
 def test_equities_including_usd_suffix_stay_stock(symbol: str) -> None:
     assert classify_symbol(symbol) == "stock"
     assert mds._is_crypto_symbol(symbol) is False
 
 
-@pytest.mark.parametrize("symbol", ["", "  ", "FOOBARUSD", "FOO/USD", "XYZ-USD", "AAPL!"])
+@pytest.mark.parametrize(
+    "symbol",
+    [
+        "",
+        "  ",
+        "FOOBARUSD",
+        "FOO/USD",
+        "XYZ-USD",
+        "AAPL!",
+        # No US equity ticker is six letters: an unknown one must be refused, not
+        # routed to the stock feed by a widened bound.
+        "ZZZZZZ",
+        # A base equal to its quote is not a pair Alpaca lists.
+        "BTCBTC",
+        "BTC/BTC",
+    ],
+)
 def test_unclassifiable_fails_closed(symbol: str) -> None:
     with pytest.raises(UnclassifiableSymbolError):
         classify_symbol(symbol)
     with pytest.raises(UnclassifiableSymbolError):
         mds._is_crypto_symbol(symbol)
+
+
+def test_equity_ticker_length_boundary() -> None:
+    """The stock branch is bounded at five letters, so a longer ticker is refused."""
+    assert classify_symbol("ABCDE") == "stock"
+    with pytest.raises(UnclassifiableSymbolError):
+        classify_symbol("ABCDEF")
+
+
+def test_same_base_and_quote_is_not_a_crypto_pair() -> None:
+    """``BTCBTC`` / ``BTC/BTC`` must not canonicalize to a pair Alpaca never lists."""
+    with pytest.raises(UnclassifiableSymbolError):
+        canonical_crypto_symbol("BTCBTC")
+    with pytest.raises(UnclassifiableSymbolError):
+        canonical_crypto_symbol("BTC/BTC")
 
 
 def test_canonical_crypto_symbol() -> None:
