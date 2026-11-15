@@ -129,12 +129,13 @@ def test_infeasible_pairs_are_never_matched() -> None:
     assert sorted(t.id for t in result.extra) == [101, 102, 103]
 
 
-def test_exact_ties_are_deterministic_lowest_actual_index() -> None:
+def test_exact_ties_are_deterministic_by_canonical_order() -> None:
+    """An exact tie resolves by canonical order, not by the input position."""
     ref = _trade(1, "2024-01-02T10:00:00Z", "2024-01-02T11:00:00Z")
-    twin_a = _trade(101, "2024-01-02T10:00:10Z", "2024-01-02T11:00:10Z")
-    twin_b = _trade(102, "2024-01-02T10:00:10Z", "2024-01-02T11:00:10Z")
+    twin_102 = _trade(102, "2024-01-02T10:00:10Z", "2024-01-02T11:00:10Z")
+    twin_101 = _trade(101, "2024-01-02T10:00:10Z", "2024-01-02T11:00:10Z")
 
-    result = TradeMatcher.match([ref], [twin_a, twin_b], **TOLERANCE)
+    result = TradeMatcher.match([ref], [twin_102, twin_101], **TOLERANCE)
 
     assert _pairs(result) == {(1, 101)}
     assert [t.id for t in result.extra] == [102]
