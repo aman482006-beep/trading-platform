@@ -6354,3 +6354,54 @@ def test_live_websocket_payload_redacts_nested_secrets_and_unknown_objects():
     assert safe["data"]["opaque"] == "[Filtered]"
     assert safe["data"]["unknown"] == "gateway api_key=[Filtered] status=ok"
     assert safe["data"]["safe"] == "visible"
+
+
+def test_strategy_detail_accepts_relative_file_path_identifier(viewer_client, monkeypatch, tmp_path):
+    # The {name:path} converter keeps slash-containing identifiers routable;
+    # matches_strategy_identifier accepts the relative file path as an alias.
+    import viewer.main as viewer_app_module
+
+    strategies_root = tmp_path / "strategies"
+    strategy_dir = strategies_root / "demo"
+    strategy_dir.mkdir(parents=True, exist_ok=True)
+    strategy_dir.joinpath("demo.py").write_text(
+        """
+STRATEGY_META = {"name": "Demo Strategy", "version": "1.0.0"}
+
+def generate_signals(df, params):
+    return df["close"] > df["close"], df["close"] < df["close"], {"noop": df["close"]}
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(viewer_app_module, "STRATEGIES_DIR", strategies_root)
+
+    resp = viewer_client.get("/api/strategies/demo/demo.py")
+
+    assert resp.status_code == 200
+    assert resp.json()["slug"] == "demo"
+
+
+def _openapi_json_schema_for(spec: dict, path: str, method: str) -> dict:
+    operation = spec["paths"][path][method]
+    return operation["responses"]["200"]["content"]["application/json"]["schema"]
+
+
+@pytest.mark.parametrize(
+    ("path", "method"),
+    [
+        ("/api/strategies/{name}", "get"),
+        ("/api/data/cache/invalidate", "post"),
+    ],
+)
+def test_viewer_routes_without_response_model_keep_object_schema(path, method):
+    # These routes dropped explicit response_model=dict[str, Any] in favour of
+    # the return annotation. Pin the resulting OpenAPI 200 schema so that
+    # removing the annotation (or the inference) fails loudly.
+    import viewer.main as viewer_app_module
+
+    spec = viewer_app_module.app.openapi()
+
+    schema = _openapi_json_schema_for(spec, path, method)
+    assert schema.get("type") == "object", f"{method.upper()} {path} lost its object schema: {schema}"
+    assert schema.get("additionalProperties") is True
