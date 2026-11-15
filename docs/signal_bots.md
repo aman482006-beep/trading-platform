@@ -143,8 +143,11 @@ Ohne Allowlist startet der Listener nicht (fail-closed). Zusätzlich gilt:
   ([Get Channel Messages](https://docs.discord.com/developers/resources/message#get-channel-messages):
   "Returns an array of message objects from newest to oldest"). Dass es die
   ältesten N nach der ID sind, steht dort nicht wörtlich; discord.py verlässt sich
-  aber genauso darauf (`Messageable.history(after=...)`, `_after_strategy` setzt
-  `after` auf `data[0]` und dreht die Seite um).
+  aber genauso darauf: in der gepinnten Version `discord-py==2.7.1`
+  (`discord/abc.py`, `Messageable.history`, `_after_strategy`) setzt die
+  Vorwärts-Paginierung `after` auf `data[0]` (die neueste Nachricht der Seite) und
+  dreht die Seite für die chronologische Ausgabe um; das funktioniert nur, wenn
+  `after` die direkt folgenden Nachrichten liefert.
   Der Cursor liegt nur im Speicher: beim Start (`_prime_cursors`) wird er auf die
   neueste Seite gesetzt, ohne sie zu emittieren. Nachrichten aus einer Downtime,
   die älter als diese Seite sind, werden daher nicht nachgeholt und erreichen auch

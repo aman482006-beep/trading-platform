@@ -1260,9 +1260,10 @@ class DiscordSignalSource(BaseSignalSource):
     def _advance_cursor(self, channel_id: str, newest: str) -> bool:
         """Move the monotonic cursor forward to ``newest``.
 
-        Returns whether it moved. The cursor only ever points at a message
-        that was fetched and emitted, and only ever moves forward, so it can
-        never jump past history that is still to be backfilled. A non-numeric
+        Returns whether it moved. Within a running process the poll path only
+        advances it to a message that was fetched and emitted, and only ever
+        forward, so it never jumps past history still to be backfilled (startup
+        priming in ``_prime_cursors`` is the documented exception). A non-numeric
         id (a poison message or a malformed response) cannot anchor the next
         ``after`` request and reports ``False``.
         """
