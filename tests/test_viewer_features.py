@@ -5422,6 +5422,179 @@ def test_remove_empty_portfolios_partial_failure_middle_leaves_earlier_deleted(
     assert statuses == ["deleted", "failed", "deleted"]
 
 
+def test_deduplicate_portfolios_partial_failure_reports_per_item(
+    viewer_client, monkeypatch, tmp_path
+):
+    import viewer.main as viewer_app_module
+    from viewer.main import _delete_portfolio_with_artifacts
+
+    monkeypatch.setattr(viewer_app_module, "list_portfolio_records", lambda: [])
+    monkeypatch.setattr(viewer_app_module, "delete_portfolio_record", lambda _portfolio_id: False)
+
+    portfolios_dir = tmp_path / "portfolios"
+    portfolios_dir.mkdir(parents=True, exist_ok=True)
+    # Four duplicates of the same portfolio; the newest is kept, the other
+    # three are the delete candidates (newest first).
+    created_dates = {
+        "portfolio-dup-a": "2026-01-04T00:00:00Z",
+        "portfolio-dup-b": "2026-01-03T00:00:00Z",
+        "portfolio-dup-c": "2026-01-02T00:00:00Z",
+        "portfolio-dup-d": "2026-01-01T00:00:00Z",
+    }
+    for portfolio_id, created_at in created_dates.items():
+        (portfolios_dir / f"{portfolio_id}.json").write_text(
+            json.dumps(
+                {
+                    "id": portfolio_id,
+                    "name": "Duplicate Portfolio",
+                    "created_at": created_at,
+                    "account_capital": 100000.0,
+                    "components": [
+                        {
+                            "component_id": "component-001",
+                            "strategy_name": "Strategy A",
+                            "symbol": "AAPL",
+                            "timeframe": "1h",
+                            "weight": 1.0,
+                            "risk_config": {},
+                            "settings": {},
+                            "backtest_id": "",
+                        }
+                    ],
+                    "trades": [],
+                    "combined_stats": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    # Phase 1: dry run
+    response = viewer_client.post("/api/portfolios/deduplicate")
+    assert response.status_code == 200
+    dry_run_payload = response.json()
+    candidate_ids = dry_run_payload["candidate_ids"]
+    assert len(candidate_ids) == 3
+    assert dry_run_payload["kept_ids"] == ["portfolio-dup-a"]
+
+    # Make the middle deletion fail
+    original_delete = _delete_portfolio_with_artifacts
+    def failing_delete(portfolio_id):
+        if portfolio_id == candidate_ids[1]:
+            raise RuntimeError("Simulated failure")
+        return original_delete(portfolio_id)
+    monkeypatch.setattr(viewer_app_module, "_delete_portfolio_with_artifacts", failing_delete)
+
+    # Phase 2: confirm with all three candidate ids
+    response = viewer_client.post(
+        "/api/portfolios/deduplicate",
+        json={"dry_run": False, "ids": candidate_ids},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["dry_run"] is False
+    # The failure is contained: the earlier and the later id are still deleted
+    assert payload["deleted_ids"] == [candidate_ids[0], candidate_ids[2]]
+    assert payload["skipped_ids"] == []
+    assert not (portfolios_dir / f"{candidate_ids[0]}.json").exists()
+    assert (portfolios_dir / f"{candidate_ids[1]}.json").exists()
+    assert not (portfolios_dir / f"{candidate_ids[2]}.json").exists()
+    assert (portfolios_dir / "portfolio-dup-a.json").exists()
+    # items reports every submitted id
+    statuses = [item["status"] for item in payload["items"]]
+    assert statuses == ["deleted", "failed", "deleted"]
+    failed_item = payload["items"][1]
+    assert failed_item["id"] == candidate_ids[1]
+    assert failed_item["database"] == "not_attempted"
+    assert failed_item["error"]
+
+
+def test_deduplicate_backtests_partial_failure_reports_per_item(
+    viewer_client, monkeypatch, tmp_path
+):
+    import viewer.main as viewer_app_module
+
+    monkeypatch.setattr(viewer_app_module, "list_portfolio_records", lambda: [])
+    monkeypatch.setattr(viewer_app_module, "delete_portfolio_record", lambda _portfolio_id: False)
+    monkeypatch.setattr(
+        viewer_app_module,
+        "_duplicate_backtest_members",
+        lambda: [
+            {
+                "id": "backtest-dup1",
+                "display_name": "Duplicate Backtest",
+                "strategy_name": "Test",
+                "symbols": ["AAPL"],
+                "timeframe": "1d",
+                "trade_count": 1,
+                "created_at": "2026-01-03T00:00:00Z",
+                "fingerprint": "fp1",
+                "kept_id": "backtest-dup1",
+                "is_kept": True,
+            },
+            {
+                "id": "backtest-dup2",
+                "display_name": "Duplicate Backtest",
+                "strategy_name": "Test",
+                "symbols": ["AAPL"],
+                "timeframe": "1d",
+                "trade_count": 1,
+                "created_at": "2026-01-02T00:00:00Z",
+                "fingerprint": "fp1",
+                "kept_id": "backtest-dup1",
+                "is_kept": False,
+            },
+            {
+                "id": "backtest-dup3",
+                "display_name": "Duplicate Backtest",
+                "strategy_name": "Test",
+                "symbols": ["AAPL"],
+                "timeframe": "1d",
+                "trade_count": 1,
+                "created_at": "2026-01-01T00:00:00Z",
+                "fingerprint": "fp1",
+                "kept_id": "backtest-dup1",
+                "is_kept": False,
+            },
+        ],
+    )
+    deleted_files: set[str] = set()
+    def fake_delete(backtest_id):
+        if backtest_id == "backtest-dup2":
+            raise RuntimeError("Simulated failure")
+        deleted_files.add(backtest_id)
+        return {"id": backtest_id, "status": "deleted", "database": "deleted", "artifact": "deleted"}
+    monkeypatch.setattr(viewer_app_module, "_delete_backtest_with_artifacts", fake_delete)
+
+    # Phase 1: dry run
+    response = viewer_client.post("/api/backtests/deduplicate")
+    assert response.status_code == 200
+    dry_run_payload = response.json()
+    candidate_ids = dry_run_payload["candidate_ids"]
+    assert candidate_ids == ["backtest-dup2", "backtest-dup3"]
+
+    # Phase 2: confirm with both candidate ids
+    response = viewer_client.post(
+        "/api/backtests/deduplicate",
+        json={"dry_run": False, "ids": candidate_ids},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["dry_run"] is False
+    # The failure is contained: the other candidate is still deleted
+    assert payload["deleted_ids"] == ["backtest-dup3"]
+    assert payload["skipped_ids"] == []
+    assert payload["kept_ids"] == ["backtest-dup1"]
+    assert deleted_files == {"backtest-dup3"}
+    statuses = [item["status"] for item in payload["items"]]
+    assert statuses == ["failed", "deleted"]
+    failed_item = payload["items"][0]
+    assert failed_item["id"] == "backtest-dup2"
+    assert failed_item["database"] == "not_attempted"
+    assert failed_item["error"]
+    # One group was still affected
+    assert payload["groups_affected"] == 1
+
+
 def test_portfolio_trades_normalize_qty_and_side_fields(viewer_client, monkeypatch, tmp_path):
     import viewer.main as viewer_app_module
 
