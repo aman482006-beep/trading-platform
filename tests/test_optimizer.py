@@ -738,11 +738,6 @@ def test_no_trade_trials_lose_against_honest_negative_trials(monkeypatch, tmp_pa
         for trial in payload["top_trials"]
     }
     assert penalties == {1: True, 2: False}
-    penalised = next(t for t in payload["top_trials"] if t["params"]["window"] == 1)
-    assert penalised["metric_value"] == optimizer_module._no_trade_penalty_value(
-        [-0.5], direction="maximize"
-    )
-    assert penalised["metric_value"] != 0.0
     no_trade_trial = next(t for t in payload["top_trials"] if t["params"]["window"] == 1)
     assert no_trade_trial["value"] is None or no_trade_trial["value"] < -0.5
 
@@ -754,6 +749,15 @@ def test_undefined_target_metric_trial_never_wins_the_study(monkeypatch, tmp_pat
     would be selected as "best".
     """
     _patch_optimizer_env(monkeypatch, tmp_path, grid_choices=[1, 2], pass_through_stats=True)
+    studies = []
+    create_study = optimizer_module.optuna.create_study
+
+    def capturing_create_study(*args, **kwargs):
+        study = create_study(*args, **kwargs)
+        studies.append(study)
+        return study
+
+    monkeypatch.setattr(optimizer_module.optuna, "create_study", capturing_create_study)
 
     def fake_run_backtest(config, strategy_path):
         window = int(config.parameters["window"])
@@ -783,6 +787,9 @@ def test_undefined_target_metric_trial_never_wins_the_study(monkeypatch, tmp_pat
         for trial in payload["top_trials"]
     }
     assert penalties == {1: True, 2: False}
+    recorded = {t.params["window"]: t.user_attrs["metric_value"] for t in studies[0].trials}
+    assert recorded[1] == optimizer_module._no_trade_penalty_value([-0.5], direction="maximize")
+    assert recorded[1] != 0.0
 
 
 def test_zero_target_metric_trial_is_rankable(monkeypatch, tmp_path: Path):
