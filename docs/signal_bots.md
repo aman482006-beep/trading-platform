@@ -135,6 +135,10 @@ Ohne Allowlist startet der Listener nicht (fail-closed). Zusätzlich gilt:
   geloggt. IDs unterhalb des Cursors werden nie erneut emittiert; ein nicht
   numerischer Cursor wird verworfen und neu aufgesetzt (Warnung). Snowflake-IDs
   sind nicht fortlaufend, daher wird keine Nachrichtenanzahl berechnet.
+  Der Cursor liegt nur im Speicher: beim Start (`_prime_cursors`) wird er auf die
+  neueste Seite gesetzt, ohne sie zu emittieren. Nachrichten aus einer Downtime,
+  die älter als diese Seite sind, werden daher nicht nachgeholt; das ist gewollt,
+  weil der Daemon Signale älter als `max_signal_age_seconds` ohnehin ablehnt.
 - Ein Discord-Signal wird auf jedes passende Deployment verteilt (Fan-out), nicht
   nur auf das erste.
 - Transiente Reconnect-Fehler schreiben einen Bot-Service nicht dauerhaft auf

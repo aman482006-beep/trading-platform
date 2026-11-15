@@ -1371,6 +1371,30 @@ class TestIssueB2Backfill:
         assert source._last_seen_message_ids["channel-1"] == cursor
         assert source._queue.qsize() == 0, "stale ids must never be re-emitted"
 
+    def test_advance_cursor_refusal_stops_after_one_request(self) -> None:
+        """A full fresh page whose cursor advance is refused ends the poll.
+
+        Defence in depth: the stale-id filter makes this practically
+        unreachable, but if it ever regresses the poll must not re-request the
+        same `after=` anchor up to `MAX_BACKFILL_PAGES` times.
+        """
+        import asyncio
+
+        source = _source(trusted_author_ids={"bot-1"})
+        source._last_seen_message_ids["channel-1"] = "1000"
+        page = [_burst_message(i) for i in range(ds.POLL_LIMIT, 0, -1)]
+        calls: list[str | None] = []
+
+        async def _fetch(_channel_id, *, after=None, **kwargs):
+            calls.append(after)
+            return list(page)
+
+        source._fetch_messages = _fetch
+        source._advance_cursor = lambda _channel_id, _message_id: False
+        asyncio.run(source._poll_once("channel-1"))
+
+        assert calls == ["1000"]
+
     def test_stale_ids_are_not_emitted_even_after_seen_set_pruning(self) -> None:
         """A below-cursor id the seen-set forgot must still not be re-emitted."""
         import asyncio
