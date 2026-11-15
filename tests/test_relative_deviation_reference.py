@@ -68,6 +68,20 @@ def test_metric_delta_relative_is_signed_against_reference() -> None:
     assert delta.relative_delta == pytest.approx(-0.5)
 
 
+def test_metric_delta_negative_reference_keeps_zero_below_delta_positive() -> None:
+    # Both values negative: -50 is above -100, so the drift away from the
+    # reference is +0.5 of the reference magnitude, not -0.5.
+    delta = _metric_delta("total_return", -100.0, -50.0)
+    assert delta.absolute_delta == pytest.approx(50.0)
+    assert delta.relative_delta == pytest.approx(0.5)
+
+
+def test_metric_delta_negative_reference_keeps_zero_above_delta_negative() -> None:
+    delta = _metric_delta("total_return", -100.0, -150.0)
+    assert delta.absolute_delta == pytest.approx(-50.0)
+    assert delta.relative_delta == pytest.approx(-0.5)
+
+
 def test_metric_delta_sign_flip_is_200_percent() -> None:
     delta = _metric_delta("total_return", -100.0, 100.0)
     assert delta.absolute_delta == pytest.approx(200.0)
