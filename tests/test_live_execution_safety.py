@@ -559,7 +559,11 @@ def test_alpaca_discord_redelivery_submits_once_with_canonical_signal_id(monkeyp
         action="buy",
         theoretical_price=100.0,
         timestamp=datetime(2026, 7, 15, 10, 1, tzinfo=timezone.utc),
-        metadata={"qty": 1.0, "discord_message_id": "discord-123"},
+        metadata={
+            "qty": 1.0, "discord_message_id": "discord-123",
+            "stop_loss": 95.0,
+            "take_profit": 110.0,
+        },
     )
 
     assert asyncio.run(adapter.submit_order(first, qty=1.0)) == _alpaca_order_id("order-1")
@@ -585,7 +589,11 @@ def test_alpaca_redelivery_recovers_accepted_order_without_resubmitting(monkeypa
         action="buy",
         theoretical_price=100.0,
         timestamp=datetime(2026, 7, 15, 10, 1, tzinfo=timezone.utc),
-        metadata={"qty": 1.0, "discord_message_id": "discord-timeout"},
+        metadata={
+            "qty": 1.0, "discord_message_id": "discord-timeout",
+            "stop_loss": 95.0,
+            "take_profit": 110.0,
+        },
     )
     submit_calls: list[Any] = []
     lookup_calls: list[str] = []
@@ -631,7 +639,11 @@ def test_alpaca_redelivery_uses_persisted_order_id_without_broker_call(monkeypat
         action="buy",
         theoretical_price=100.0,
         timestamp=datetime(2026, 7, 15, 10, 2, tzinfo=timezone.utc),
-        metadata={"qty": 1.0, "discord_message_id": "discord-persisted"},
+        metadata={
+            "qty": 1.0, "discord_message_id": "discord-persisted",
+            "stop_loss": 95.0,
+            "take_profit": 110.0,
+        },
     )
 
     def _forbidden(*_args, **_kwargs):
@@ -4799,6 +4811,7 @@ def test_alpaca_bracket_entry_floors_qty_and_rounds_levels_toward_entry(monkeypa
     assert float(request.take_profit.limit_price) == 369.04
     # The persisted signal records exactly what was submitted.
     assert saved[0].metadata["qty"] == 7.0
+    assert saved[0].metadata["explicit_qty"] == 7.0
     assert saved[0].metadata["stop_loss"] == 347.76
     assert saved[0].metadata["take_profit"] == 369.04
 
@@ -4816,12 +4829,13 @@ def test_alpaca_short_bracket_entry_rounds_levels_toward_entry(monkeypatch):
 
 
 def test_alpaca_sub_dollar_bracket_uses_four_decimal_tick(monkeypatch):
-    adapter, submitted, _saved = _alpaca_bracket_adapter(monkeypatch)
+    adapter, submitted, saved = _alpaca_bracket_adapter(monkeypatch)
     signal = _alpaca_entry("buy", 0.5, 0.480012345, 0.540098765)
 
     asyncio.run(adapter.submit_order(signal, qty=1000.4))
 
     request = submitted[0]
+    assert saved[0].metadata["explicit_qty"] == 1000.0
     assert float(request.stop_loss.stop_price) == 0.4801
     assert float(request.take_profit.limit_price) == 0.5400
 
@@ -4886,3 +4900,97 @@ def test_alpaca_bracket_level_on_wrong_side_is_refused_before_persistence(
 
     assert submitted == []
     assert saved == []
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"take_profit": 110.0},  # missing stop
+        {"stop_loss": 95.0},  # missing take profit
+        {"stop_loss": float("nan"), "take_profit": 110.0},
+        {"stop_loss": 95.0, "take_profit": float("inf")},
+        {"stop_loss": -1.0, "take_profit": 110.0},
+    ],
+)
+def test_alpaca_missing_or_invalid_sl_tp_is_refused_before_persistence(monkeypatch, metadata):
+    # Refusing after save_live_signal would wedge redelivery (B-8).
+    adapter, submitted, saved = _alpaca_bracket_adapter(monkeypatch)
+    signal = _alpaca_entry("buy", 100.0, 95.0, 110.0).model_copy(update={"metadata": metadata})
+
+    submission = adapter.submit_order(signal, qty=5.0)
+    with pytest.raises(ValueError):
+        asyncio.run(submission)
+
+    assert submitted == []
+    assert saved == []
+
+
+def test_alpaca_extended_hours_bracket_is_refused_before_persistence(monkeypatch):
+    adapter, submitted, saved = _alpaca_bracket_adapter(monkeypatch)
+    signal = _alpaca_entry("buy", 100.0, 95.0, 110.0)
+    signal = signal.model_copy(update={"metadata": {**signal.metadata, "extended_hours": True}})
+
+    submission = adapter.submit_order(signal, qty=5.0)
+    with pytest.raises(ValueError, match="Extended-hours"):
+        asyncio.run(submission)
+
+    assert submitted == []
+    assert saved == []
+
+
+@pytest.mark.parametrize("symbol", ["BTC/USD", "ETHUSD"])
+def test_alpaca_crypto_bracket_entry_is_refused_before_persistence(monkeypatch, symbol):
+    # Alpaca crypto has no bracket/OTO orders; refuse instead of a post-persist 422.
+    adapter, submitted, saved = _alpaca_bracket_adapter(monkeypatch)
+    signal = _alpaca_entry("buy", 3000.0, 2900.0, 3200.0).model_copy(update={"symbol": symbol})
+
+    submission = adapter.submit_order(signal, qty=11.4)
+    with pytest.raises(ValueError, match="crypto"):
+        asyncio.run(submission)
+
+    assert submitted == []
+    assert saved == []
+
+
+def test_alpaca_unbounded_tp_entry_rounds_stop_and_submits_stop_only_oto(monkeypatch):
+    adapter, submitted, saved = _alpaca_bracket_adapter(monkeypatch)
+    signal = _alpaca_entry("buy", 100.0, 95.003, 110.0).model_copy(
+        update={
+            "metadata": {
+                "stop_loss": 95.003,
+                "take_profit_policy": "unbounded_exit_on_opposite_signal",
+            }
+        }
+    )
+
+    asyncio.run(adapter.submit_order(signal, qty=2.7))
+
+    request = submitted[0]
+    assert str(getattr(request.order_class, "value", request.order_class)).lower() == "oto"
+    assert float(request.qty) == 2.0
+    assert float(request.stop_loss.stop_price) == 95.01
+    assert getattr(request, "take_profit", None) is None
+    assert saved[0].metadata["stop_loss"] == 95.01
+    assert saved[0].metadata["explicit_qty"] == 2.0
+    assert "take_profit" not in saved[0].metadata
+
+
+def test_alpaca_exit_only_entry_passes_through_normalization_unchanged(monkeypatch):
+    from live_runner.base_adapter import EXIT_ONLY_RISK_SIZING_MODE
+
+    adapter, submitted, saved = _alpaca_bracket_adapter(monkeypatch)
+
+    async def _positions():
+        return [{"symbol": "AAPL", "qty": "10"}]
+
+    monkeypatch.setattr(adapter, "get_positions", _positions)
+    signal = _alpaca_entry("sell", 100.0, 95.0, 110.0).model_copy(
+        update={"metadata": {"risk_sizing_mode": EXIT_ONLY_RISK_SIZING_MODE}}
+    )
+
+    asyncio.run(adapter.submit_order(signal, qty=3.9))
+
+    request = submitted[0]
+    assert float(request.qty) == 3.9
+    assert getattr(request, "stop_loss", None) is None
+    assert saved[0].metadata == {"risk_sizing_mode": EXIT_ONLY_RISK_SIZING_MODE}

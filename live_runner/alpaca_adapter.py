@@ -68,6 +68,12 @@ _TP_METADATA_KEYS = ("take_profit", "tp_price")
 _ALPACA_TICK_AT_OR_ABOVE_ONE = Decimal("0.01")
 _ALPACA_TICK_BELOW_ONE = Decimal("0.0001")
 
+_EXTENDED_HOURS_BRACKET_MESSAGE = (
+    "Extended-hours entry with mandatory SL/TP is not supported: "
+    "the broker rejects bracket orders with extended_hours enabled "
+    "(signal_id={signal_id}, symbol={symbol})."
+)
+
 
 def _round_bracket_price_toward_entry(price: float, *, entry_price: float) -> float:
     """Round a bracket leg price onto Alpaca's tick, toward the entry.
@@ -1139,6 +1145,17 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         metadata = dict(signal.metadata or {})
         if str(metadata.get("risk_sizing_mode") or "") == EXIT_ONLY_RISK_SIZING_MODE:
             return signal, qty
+        if classify_alpaca_symbol(signal.symbol) == "crypto":
+            raise ValueError(
+                f"Alpaca does not support bracket/OTO orders for crypto ({signal.symbol}); "
+                f"refusing to submit before persistence (signal_id={signal.id})."
+            )
+        if metadata.get("extended_hours"):
+            raise ValueError(
+                _EXTENDED_HOURS_BRACKET_MESSAGE.format(
+                    signal_id=signal.id, symbol=signal.symbol
+                )
+            )
         whole_qty = _floor_to_whole_shares(qty)
         if whole_qty < 1:
             raise ValueError(
@@ -1167,7 +1184,11 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 f"{signal.theoretical_price!r}; refusing to submit."
             )
         _round_bracket_levels_in_place(metadata, entry_price=entry_price, signal=signal)
-        return signal.model_copy(update={"metadata": metadata}), whole_qty
+        normalized = signal.model_copy(update={"metadata": metadata})
+        # Missing/NaN/inf/non-positive levels are refused here, not after
+        # persistence, so a refusal never leaves a signal row without an order.
+        self._resolve_broker_sl_tp(normalized)
+        return normalized, whole_qty
 
     def _build_order_request(
         self,
@@ -1201,9 +1222,9 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             # sizing assumed: the caller must choose bounded-hours bracket or
             # naked extended-hours — and naked entries are not allowed.
             raise ValueError(
-                "Extended-hours entry with mandatory SL/TP is not supported: "
-                "the broker rejects bracket orders with extended_hours enabled "
-                f"(signal_id={signal.id}, symbol={signal.symbol})."
+                _EXTENDED_HOURS_BRACKET_MESSAGE.format(
+                    signal_id=signal.id, symbol=signal.symbol
+                )
             )
         # C1: explicit unbounded policy rides as OTO (entry + stop leg,
         # no take-profit leg) instead of an invented bracket.

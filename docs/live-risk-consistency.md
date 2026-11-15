@@ -77,6 +77,11 @@ jede Entry vor dem Persistieren: die risk-gesizte `qty` wird auf ganze Stück
 gerundet. Damit liegt das tatsächliche Risiko nie über dem gesizten Budget. Exit-only
 Orders (simple) bleiben unverändert.
 
+Vor dem Persistieren werden zusätzlich abgelehnt (ValueError, kein Signal-Row, keine
+Order): SL/TP auf der falschen Seite des Entry, SL/TP innerhalb eines Ticks vom Entry,
+fehlende/ungültige SL/TP-Level, Extended-Hours-Brackets und Crypto-Symbole (Alpaca
+kennt keine Bracket-/OTO-Orders für Crypto).
+
 ## Implizite Divergenz
 
 Der Unterschied bei `enforce_stop_direction` führt dazu, dass:
