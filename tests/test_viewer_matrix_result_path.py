@@ -31,8 +31,8 @@ def results_dir(monkeypatch, tmp_path) -> Path:
     root = tmp_path / "matrix_runner"
     root.mkdir()
     monkeypatch.setattr(viewer_app_module, "MATRIX_RESULTS_DIR", root)
-    (tmp_path / "secret.csv").write_text("secret\n", encoding="utf-8")
-    (root / "matrix_matrix.csv").write_text("ok\n", encoding="utf-8")
+    (tmp_path / "secret.csv").write_bytes(b"secret\n")
+    (root / "matrix_matrix.csv").write_bytes(b"ok\n")
     return root
 
 
@@ -111,7 +111,7 @@ def test_returned_path_is_resolved_through_a_symlinked_results_dir(
 ):
     real = tmp_path / "real_results"
     real.mkdir()
-    (real / "matrix_matrix.csv").write_text("ok\n", encoding="utf-8")
+    (real / "matrix_matrix.csv").write_bytes(b"ok\n")
     linked = tmp_path / "linked_results"
     _symlink_or_skip(linked, real, target_is_directory=True)
     monkeypatch.setattr(viewer_app_module, "MATRIX_RESULTS_DIR", linked)
@@ -135,8 +135,22 @@ def test_matrix_csv_endpoint_serves_the_contained_file(results_dir):
     assert identity.headers["content-length"] == str(len("ok\n"))
 
 
+def test_matrix_csv_is_served_byte_for_byte(results_dir):
+    """CRLF line endings and a 0x1A byte survive unchanged (no text-mode read on Windows)."""
+    payload = b"a,b\r\n1,2\r\n\x1a3,4\r\n"
+    (results_dir / "matrix_matrix.csv").write_bytes(payload)
+
+    response = TestClient(viewer_app_module.app).get(
+        "/api/backtests/matrix/matrix.csv", headers={"accept-encoding": "identity"}
+    )
+
+    assert response.status_code == 200
+    assert response.content == payload
+    assert response.headers["content-length"] == str(len(payload))
+
+
 def test_daily_equity_csv_endpoint_serves_the_contained_file(results_dir):
-    (results_dir / "matrix_daily_equity.csv").write_text("equity\n", encoding="utf-8")
+    (results_dir / "matrix_daily_equity.csv").write_bytes(b"equity\n")
 
     response = TestClient(viewer_app_module.app).get("/api/backtests/matrix/daily-equity.csv")
 
@@ -205,7 +219,7 @@ def test_symlink_to_file_outside_results_dir_is_rejected(results_dir, tmp_path):
 def test_symlinked_directory_outside_results_dir_is_rejected(results_dir, tmp_path):
     outside_dir = tmp_path / "outside"
     outside_dir.mkdir()
-    (outside_dir / "secret.csv").write_text("secret\n", encoding="utf-8")
+    (outside_dir / "secret.csv").write_bytes(b"secret\n")
     _symlink_or_skip(results_dir / "linked", outside_dir, target_is_directory=True)
 
     _assert_rejected("linked/secret.csv")
@@ -297,7 +311,7 @@ def test_symlink_swapped_in_after_the_check_is_refused_even_inside_results_dir(
     if not getattr(os, "O_NOFOLLOW", 0):
         pytest.skip("O_NOFOLLOW is not available on this platform")
     inside = results_dir / "other.csv"
-    inside.write_text("inside\n", encoding="utf-8")
+    inside.write_bytes(b"inside\n")
 
     def swap() -> None:
         (results_dir / "matrix_matrix.csv").unlink()
@@ -318,11 +332,11 @@ def test_served_bytes_come_from_the_file_that_was_checked(results_dir, monkeypat
     # the response's own open must not reach the client -- the PR's central claim,
     # and the one a re-open by path breaks.
     expected_name = results_dir / "matrix_matrix.csv"
-    expected_name.write_text("ok\n", encoding="utf-8")
+    expected_name.write_bytes(b"ok\n")
 
     def swap() -> None:
         staged = results_dir / "matrix_matrix.csv.staged"
-        staged.write_text("secret\n", encoding="utf-8")
+        staged.write_bytes(b"secret\n")
         os.replace(staged, expected_name)  # a new inode under the checked name
 
     _check_then_swap(monkeypatch, swap, after="_checked_matrix_result")
@@ -362,10 +376,10 @@ def test_directory_component_swapped_in_after_the_check_is_not_served(
     # component points elsewhere, so the descriptor has to be checked again.
     inside = results_dir / "sub"
     inside.mkdir()
-    (inside / "matrix_matrix.csv").write_text("inside\n", encoding="utf-8")
+    (inside / "matrix_matrix.csv").write_bytes(b"inside\n")
     outside = tmp_path / "outside"
     outside.mkdir()
-    (outside / "matrix_matrix.csv").write_text("secret\n", encoding="utf-8")
+    (outside / "matrix_matrix.csv").write_bytes(b"secret\n")
 
     def swap() -> None:
         (inside / "matrix_matrix.csv").unlink()

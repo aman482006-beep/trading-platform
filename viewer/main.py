@@ -8811,8 +8811,11 @@ def _checked_matrix_result(filename: str, *, not_found_detail: str) -> _CheckedM
     path = _matrix_result_path(filename)
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     nonblock = getattr(os, "O_NONBLOCK", 0)
+    # Windows opens in text mode unless O_BINARY is passed: reads would turn
+    # CRLF into LF and stop at 0x1A, so the body would not match Content-Length.
+    binary = getattr(os, "O_BINARY", 0)
     try:
-        descriptor = os.open(path, os.O_RDONLY | nofollow | nonblock)
+        descriptor = os.open(path, os.O_RDONLY | binary | nofollow | nonblock)
     except OSError as exc:
         if exc.errno == getattr(errno, "ELOOP", None):
             # A symlink stands where the check found a regular file.
