@@ -9219,9 +9219,10 @@ async def deduplicate_backtests(
     without ``ids`` deletes nothing and returns HTTP 400.
 
     Deletion is journaled per item, so a failure in the middle leaves earlier
-    items deleted; ``items`` reports every item and retrying with the same id
-    list is safe (already-deleted ids come back as ``not_found``). Nothing
-    outside the submitted list is ever touched.
+    items deleted; ``items`` reports every item (``deleted`` / ``skipped`` /
+    ``failed``) and retrying with the same id list is safe (an id that is no
+    longer a duplicate comes back as ``no_longer_duplicate``). Nothing outside
+    the submitted list is ever touched.
     """
     request = payload or BacktestsDeduplicateRequest()
     members = _duplicate_backtest_members()
@@ -9274,7 +9275,14 @@ async def deduplicate_backtests(
             items.append(_bulk_delete_skipped_item(backtest_id, "now_kept_entry"))
             skipped_ids.append(backtest_id)
             continue
-        result = _delete_backtest_with_artifacts(backtest_id)
+        try:
+            result = _delete_backtest_with_artifacts(backtest_id)
+        except Exception as exc:
+            logger.exception(
+                "Backtest bulk delete failed",
+                extra={"data": {"backtest": _log_safe(backtest_id), "error": str(exc)}},
+            )
+            result = _bulk_delete_failed_item(backtest_id, exc)
         items.append(result)
         if result.get("status") == "deleted":
             deleted_ids.append(backtest_id)
@@ -11852,9 +11860,10 @@ async def deduplicate_portfolios(
     call without ``ids`` deletes nothing and returns HTTP 400.
 
     Deletion is journaled per item, so a failure in the middle leaves earlier
-    items deleted; ``items`` reports every item and retrying with the same id
-    list is safe (already-deleted ids come back as ``not_found``). Nothing
-    outside the submitted list is ever touched.
+    items deleted; ``items`` reports every item (``deleted`` / ``skipped`` /
+    ``failed``) and retrying with the same id list is safe (an id that is no
+    longer a duplicate comes back as ``no_longer_duplicate``). Nothing outside
+    the submitted list is ever touched.
     """
     request = payload or PortfoliosDeduplicateRequest()
     members = _duplicate_portfolio_members()
@@ -11907,7 +11916,14 @@ async def deduplicate_portfolios(
             items.append(_bulk_delete_skipped_item(portfolio_id, "now_kept_entry"))
             skipped_ids.append(portfolio_id)
             continue
-        result = _delete_portfolio_with_artifacts(portfolio_id)
+        try:
+            result = _delete_portfolio_with_artifacts(portfolio_id)
+        except Exception as exc:
+            logger.exception(
+                "Portfolio bulk delete failed",
+                extra={"data": {"portfolio": _log_safe(portfolio_id), "error": str(exc)}},
+            )
+            result = _bulk_delete_failed_item(portfolio_id, exc)
         items.append(result)
         if result.get("status") == "deleted":
             deleted_ids.append(portfolio_id)
