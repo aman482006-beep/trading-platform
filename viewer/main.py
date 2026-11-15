@@ -8796,7 +8796,10 @@ def _checked_matrix_result(filename: str, *, not_found_detail: str) -> _CheckedM
       up, and one the kernel cannot see at the final component;
     * a regular file is required, so a name that resolves to a directory, or to
       a file that is gone, answers the caller instead of failing inside the
-      response.
+      response;
+    * ``O_NONBLOCK`` keeps the open itself from blocking, so a FIFO or device
+      planted under the name answers instead of stalling the request -- and with
+      it the event loop every other request shares.
 
     ``O_NOFOLLOW`` is read through ``getattr`` because it is not in every
     platform's ``os`` module; where it is missing, the containment re-check is
@@ -8807,8 +8810,9 @@ def _checked_matrix_result(filename: str, *, not_found_detail: str) -> _CheckedM
     """
     path = _matrix_result_path(filename)
     nofollow = getattr(os, "O_NOFOLLOW", 0)
+    nonblock = getattr(os, "O_NONBLOCK", 0)
     try:
-        descriptor = os.open(path, os.O_RDONLY | nofollow)
+        descriptor = os.open(path, os.O_RDONLY | nofollow | nonblock)
     except OSError as exc:
         if exc.errno == getattr(errno, "ELOOP", None):
             # A symlink stands where the check found a regular file.

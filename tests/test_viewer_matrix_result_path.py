@@ -220,6 +220,25 @@ def test_directory_inside_results_dir_is_not_served(results_dir):
     assert response.json()["detail"] == "Matrix CSV not found"
 
 
+def test_fifo_under_the_name_answers_instead_of_stalling(results_dir):
+    # A special file under the expected name is refused, and refused now: opening
+    # it without O_NONBLOCK would block the request, and with it the event loop
+    # every other request shares.
+    expected_name = results_dir / "matrix_matrix.csv"
+    expected_name.unlink()
+    try:
+        os.mkfifo(expected_name)
+    except (AttributeError, OSError, NotImplementedError) as exc:  # POSIX only
+        pytest.skip(f"FIFOs are unavailable on this platform: {exc}")
+
+    response = TestClient(viewer_app_module.app, raise_server_exceptions=False).get(
+        "/api/backtests/matrix/matrix.csv"
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Matrix CSV not found"
+
+
 def test_matrix_csv_endpoint_does_not_serve_symlink_escape(results_dir, tmp_path):
     # Fixed-name route: a symlink planted under the expected name must not leak
     # a file from outside the results directory.
