@@ -174,6 +174,46 @@ def test_more_references_than_actuals_matches_only_the_actuals() -> None:
         assert sorted([result.matched[0][0].id, result.missing[0].id]) == [1, 2]
 
 
+def test_huge_weights_take_the_rescale_path_and_keep_the_global_optimum() -> None:
+    """Each cost is finite but their sum overflows, so big-M is rescaled.
+
+    With ``time_weight=1e308`` the three feasible costs are ~5e307, ~8.3e307
+    and ~5e307: finite one by one, ``inf`` once summed. The rescaled solve
+    must still find the same global assignment as the unscaled case.
+    """
+    for refs in ([REF_A, REF_B], [REF_B, REF_A]):
+        for acts in ([ACT_SHARED, ACT_ONLY_A], [ACT_ONLY_A, ACT_SHARED]):
+            result = TradeMatcher.match(refs, acts, time_weight=1.0e308, **TOLERANCE)
+            assert _pairs(result) == {(1, 102), (2, 101)}
+            assert result.missing == []
+            assert result.extra == []
+
+
+def test_nonfinite_price_keeps_order_independence() -> None:
+    """NaN-price trades never match (their cost is non-finite) in any input order.
+
+    The canonical-key clamp of non-finite prices only orders such trades; since
+    they can never be matched, the outcome is the same with or without it.
+    """
+    nan_ref_1 = _trade(1, "2024-01-02T10:00:00Z", "2024-01-02T11:00:00Z", price=float("nan"))
+    nan_ref_2 = _trade(2, "2024-01-02T10:00:00Z", "2024-01-02T11:00:00Z", price=float("nan"))
+    act_1 = _trade(101, "2024-01-02T10:00:00Z", "2024-01-02T11:00:00Z")
+    act_2 = _trade(102, "2024-01-02T10:00:00Z", "2024-01-02T11:00:00Z")
+
+    outcomes = set()
+    for refs in ([nan_ref_1, nan_ref_2], [nan_ref_2, nan_ref_1]):
+        for acts in ([act_1, act_2], [act_2, act_1]):
+            result = TradeMatcher.match(refs, acts, **TOLERANCE)
+            outcomes.add(
+                (
+                    frozenset(_pairs(result)),
+                    frozenset(t.id for t in result.missing),
+                    frozenset(t.id for t in result.extra),
+                )
+            )
+    assert len(outcomes) == 1
+
+
 def test_empty_inputs() -> None:
     assert TradeMatcher.match([], []).matched == []
     only_ref = TradeMatcher.match([REF_A], [], **TOLERANCE)

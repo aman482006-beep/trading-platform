@@ -226,10 +226,13 @@ class TradeMatcher:
     symbol when ``match_symbol`` is set, and entry *and* exit within
     ``time_tolerance_seconds``.
 
-    Both lists are canonicalised before the solve, so the result does not
-    depend on their order; exact cost ties resolve to the first actual in that
-    canonical order (times, symbol, direction, price, quantity, id).  That
-    keeps ties deterministic without depending on input order.
+    Both lists are canonicalised before the solve (times, symbol, direction,
+    price, quantity, id), so which pairs are matched does not depend on input
+    order; the output lists still follow input order (``matched``/``missing``
+    the references, ``extra`` the actuals).  Exact cost ties are resolved
+    deterministically by the solver on that canonical order; scipy documents
+    no general tie rule, and the tests pin the single-reference twin case
+    (first actual in canonical order wins).
     """
 
     @classmethod
