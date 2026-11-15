@@ -103,6 +103,23 @@ def test_ruined_backtest_is_never_selected_for_live_deployment() -> None:
     assert [row["id"] for row in top_backtests_for_ctrader([ruined, healthy])] == ["a"]
 
 
+def test_undefined_metric_row_is_unrankable_for_live_deployment() -> None:
+    """A null score input (producer-undefined) must not be read as a measured 0.0."""
+    from live_runner.ctrader_deployment import score_backtest_for_live, top_backtests_for_ctrader
+
+    healthy = {
+        "id": "a", "symbols": ["EURUSD"], "sharpe_ratio": -0.5, "cagr": -0.05, "psr": 0.1,
+        "max_drawdown": 10.0, "trade_count": 50, "oos_status": "available", "ruined": False,
+    }
+    for key in ("sharpe_ratio", "cagr", "psr", "max_drawdown"):
+        undefined = {**healthy, "id": "b", key: None}
+        assert score_backtest_for_live(undefined) == float("-inf"), key
+        assert [row["id"] for row in top_backtests_for_ctrader([undefined, healthy])] == ["a"]
+
+    absent = {k: v for k, v in healthy.items() if k != "psr"}
+    assert score_backtest_for_live(absent) != float("-inf")
+
+
 def test_viewer_summary_keeps_ruined_cagr_null() -> None:
     from viewer.main import _backtest_summary_from_meta
 

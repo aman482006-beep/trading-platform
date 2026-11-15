@@ -41,6 +41,13 @@ def score_backtest_for_live(row: dict[str, Any]) -> float:
         # #132: equity hit zero, so Sharpe/PSR are undefined (null). Reading
         # them as 0.0 would still let a blown-up run be ranked; never deploy it.
         return float("-inf")
+    # A key that is present but null was undefined at the producer (ratios on a
+    # too-short curve, drawdown on a degenerate one). Scoring it as 0.0 would
+    # outrank honest losing runs, so such a row is unrankable. Keys that are
+    # absent (rows predating the convention) keep their numeric defaults.
+    for key in ("sharpe_ratio", "cagr", "psr", "max_drawdown"):
+        if key in row and row[key] is None:
+            return float("-inf")
     sharpe = _metric(row, "sharpe_ratio")
     cagr = min(max(_metric(row, "cagr"), -1.0), 1.0)
     psr = min(max(_metric(row, "psr"), 0.0), 1.0)
