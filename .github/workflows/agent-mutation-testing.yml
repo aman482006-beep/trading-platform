@@ -22,8 +22,8 @@ name: Agent Mutation Testing
 #   PR's copy. Accepted, since only collaborators with write access can open
 #   same-repo PRs. Fork PRs are skipped.
 #
-# Manual run on any open PR (also before this workflow is on main):
-#   gh workflow run agent-mutation-testing.yml --ref <branch-with-this-workflow> -f pr_number=<N>
+# A run that failed for a transient reason (e.g. a model rate limit) is
+# restarted with "Re-run jobs" on the run page or `gh run rerun <run-id>`.
 #
 # Configuration (Settings -> Secrets and variables -> Actions -> Variables):
 #   MUTATION_MODEL    opencode model, provider/model (default: opencode/inkling-2-small-free)
@@ -32,15 +32,9 @@ name: Agent Mutation Testing
 on:
   pull_request:
     types: [opened, synchronize, reopened]
-  workflow_dispatch:
-    inputs:
-      pr_number:
-        description: Number of the open PR to mutation-test
-        required: true
-        type: number
 
 concurrency:
-  group: agent-mutation-testing-${{ github.event.pull_request.number || inputs.pr_number }}
+  group: agent-mutation-testing-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 env:
@@ -50,7 +44,7 @@ env:
   SKILL_PATH: .agents/skills/actions-mutation-testing/SKILL.md
 
 jobs:
-  # Resolves the PR for both triggers and writes its metadata (title and body
+  # Resolves the PR from the event and writes its metadata (title and body
   # via jq, never via ${{ }} interpolation into a shell script).
   resolve:
     runs-on: ubuntu-latest
@@ -65,20 +59,9 @@ jobs:
     steps:
       - name: Resolve PR
         id: pr
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          INPUT_PR: ${{ inputs.pr_number }}
         run: |
           set -euo pipefail
-          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
-            jq '.pull_request' "$GITHUB_EVENT_PATH" > pr.json
-          else
-            gh api "repos/${GITHUB_REPOSITORY}/pulls/${INPUT_PR}" > pr.json
-            if [ "$(jq -r .state pr.json)" != "open" ]; then
-              echo "::error::PR #${INPUT_PR} is not open."
-              exit 1
-            fi
-          fi
+          jq '.pull_request' "$GITHUB_EVENT_PATH" > pr.json
           jq '{number, title, body, base: .base.sha, head: .head.sha}' pr.json > meta.json
           {
             echo "number=$(jq -r .number pr.json)"
@@ -152,17 +135,18 @@ jobs:
         with:
           node-version: 22
 
-      # Not --ignore-scripts: @opencode/cli needs its postinstall step to fetch
-      # the platform binary. The job holds no token, so the exposure is bounded.
+      # --ignore-scripts keeps every dependency's lifecycle scripts from running;
+      # only @opencode/cli's own postinstall (it links the platform binary from
+      # the optional dependency) is then run explicitly.
       - name: Install opencode
         if: steps.scope.outputs.empty == 'false'
         run: |
-          npm install -g "@opencode/cli@${OPENCODE_VERSION}"
+          npm install -g --ignore-scripts "@opencode/cli@${OPENCODE_VERSION}"
+          (cd "$(npm root -g)/@opencode/cli" && node ./postinstall.mjs)
           opencode --version
 
       # Rules: the base branch's skill if it has one. Otherwise (only while the
-      # skill is not merged yet) the copy from the commit this workflow runs
-      # from, then the PR's own copy.
+      # skill is not merged yet) the PR's own copy.
       - name: Select skill revision
         if: steps.scope.outputs.empty == 'false'
         run: |
@@ -170,14 +154,11 @@ jobs:
           if git cat-file -e "${BASE_SHA}:${SKILL_PATH}" 2>/dev/null; then
             git show "${BASE_SHA}:${SKILL_PATH}" > "$skill"
             echo "SKILL_SOURCE=base branch" >> "$GITHUB_ENV"
-          elif git cat-file -e "${GITHUB_SHA}:${SKILL_PATH}" 2>/dev/null; then
-            git show "${GITHUB_SHA}:${SKILL_PATH}" > "$skill"
-            echo "SKILL_SOURCE=workflow ref ${GITHUB_REF_NAME} (not on the base branch yet)" >> "$GITHUB_ENV"
           elif [ -f "$SKILL_PATH" ]; then
             cp "$SKILL_PATH" "$skill"
             echo "SKILL_SOURCE=this PR (not on the base branch yet)" >> "$GITHUB_ENV"
           else
-            echo "::error::No mutation-testing skill found at base, workflow ref or PR head."
+            echo "::error::No mutation-testing skill found at base or PR head."
             exit 1
           fi
 
