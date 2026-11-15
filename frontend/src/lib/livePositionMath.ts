@@ -149,7 +149,11 @@ export function calculateRealizedTradeStats(trades: readonly PricedFill[]): Real
   }
 
   if (!stats.complete) {
+    // Win/loss counts come from the same walk as the PnL: an unpriced fill leaves them as
+    // incomplete as the total, never a measured win or loss.
     stats.totalPnl = Number.NaN;
+    stats.winningTrades = Number.NaN;
+    stats.losingTrades = Number.NaN;
   }
   return stats;
 }

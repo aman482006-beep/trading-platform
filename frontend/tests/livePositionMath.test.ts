@@ -157,3 +157,17 @@ test("fillPriceIsUsable rejects a verdict it does not know", () => {
   assert.equal(fillPriceIsUsable(trade("buy", 100, 1, 1, "")), false);
   assert.equal(fillPriceIsUsable(trade("buy", 100, 1, 1, "something_new")), false);
 });
+
+test("win and loss counts are unknown, not measured, once a fill is unpriced", () => {
+  const stats = calculateRealizedTradeStats([
+    trade("buy", 100, 1, 1),
+    trade("sell", null, 1, 2, "sent_bad"),
+    trade("buy", 100, 1, 3),
+    trade("sell", 110, 1, 4),
+  ]);
+
+  assert.equal(stats.complete, false);
+  assert.ok(Number.isNaN(stats.totalPnl));
+  assert.ok(Number.isNaN(stats.winningTrades));
+  assert.ok(Number.isNaN(stats.losingTrades));
+});

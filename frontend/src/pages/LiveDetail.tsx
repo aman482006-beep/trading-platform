@@ -497,10 +497,13 @@ export function LiveDetailPage() {
           marginBottom: "16px",
         }}
       >
-        <MetricCard label="Total Trades" value={String(stats.totalTrades)} />
-        <MetricCard label="Winning" value={String(stats.winningTrades)} valueColor="#86efac" />
-        <MetricCard label="Losing" value={String(stats.losingTrades)} valueColor="#fecaca" />
-        <MetricCard label="Win Rate" value={formatPercent(stats.winRate)} />
+        <MetricCard label="Total Trades" value={formatCount(stats.totalTrades)} />
+        <MetricCard label="Winning" value={formatCount(stats.winningTrades)} valueColor="#86efac" />
+        <MetricCard label="Losing" value={formatCount(stats.losingTrades)} valueColor="#fecaca" />
+        <MetricCard
+          label="Win Rate"
+          value={Number.isFinite(stats.winRate) ? formatPercent(stats.winRate) : "incomplete"}
+        />
         <MetricCard
           label="Total PnL"
           value={Number.isFinite(stats.totalPnl) ? formatSignedUsd(stats.totalPnl) : "incomplete"}
@@ -712,17 +715,31 @@ const primaryButtonStyle: React.CSSProperties = {
   cursor: "pointer",
 };
 
+function formatCount(value: number): string {
+  return Number.isFinite(value) ? String(value) : "incomplete";
+}
+
 function normalizeStats(
   stats: LiveAccountStats,
   balances: LiveBalanceRecord[],
   trades: LiveTradeSlippage[],
 ): LiveDetailStats {
   const fallback = buildFallbackStats(balances, trades);
+  const pnlIncomplete = stats.pnl_complete === false || stats.total_pnl === null;
   return {
-    totalTrades: asFiniteNumber(stats.total_trades, fallback.totalTrades),
-    winningTrades: asFiniteNumber(stats.winning_trades, fallback.winningTrades),
-    losingTrades: asFiniteNumber(stats.losing_trades, fallback.losingTrades),
-    winRate: liveWinRateToPoints(stats.win_rate) ?? fallback.winRate,
+    // Win/loss counts are as incomplete as the PnL: unknown (NaN), never a fallback number.
+    totalTrades: pnlIncomplete
+      ? Number.NaN
+      : asFiniteNumber(stats.total_trades, fallback.totalTrades),
+    winningTrades: pnlIncomplete
+      ? Number.NaN
+      : asFiniteNumber(stats.winning_trades, fallback.winningTrades),
+    losingTrades: pnlIncomplete
+      ? Number.NaN
+      : asFiniteNumber(stats.losing_trades, fallback.losingTrades),
+    winRate: pnlIncomplete
+      ? Number.NaN
+      : (liveWinRateToPoints(stats.win_rate) ?? fallback.winRate),
     // An incomplete server result stays unknown; it must not fall back to a number (#124).
     totalPnl:
       stats.pnl_complete === false || stats.total_pnl === null
@@ -744,6 +761,7 @@ function buildFallbackStats(
   const totalTrades = trades.length;
   const realized = calculateRealizedTradeStats(trades);
   const winRate = totalTrades > 0 ? (realized.winningTrades / totalTrades) * 100 : 0;
+  // NaN winningTrades (an unpriced fill) propagates into winRate: unknown, not 0.
   const currentBalance =
     balances.length > 0
       ? asFiniteNumber(balances.at(-1)?.balance, 0)

@@ -1440,7 +1440,9 @@ export function LiveHubPage() {
                 >
                   <div style={miniStatStyle}>
                     <span style={miniStatLabelStyle}>Trades</span>
-                    <span style={miniStatValueStyle}>{tradesCount}</span>
+                    <span style={miniStatValueStyle}>
+                      {Number.isFinite(tradesCount) ? tradesCount : "incomplete"}
+                    </span>
                   </div>
                   <div style={miniStatStyle}>
                     <span style={miniStatLabelStyle}>Total PnL</span>
@@ -1459,7 +1461,9 @@ export function LiveHubPage() {
                   </div>
                   <div style={miniStatStyle}>
                     <span style={miniStatLabelStyle}>Win Rate</span>
-                    <span style={winRateBadgeStyle(winRate)}>{formatPercent(winRate)}</span>
+                    <span style={winRateBadgeStyle(winRate)}>
+                      {Number.isFinite(winRate) ? formatPercent(winRate) : "incomplete"}
+                    </span>
                   </div>
                 </div>
 
@@ -1682,8 +1686,10 @@ function normalizeLiveHubStats(
   balances: LiveBalanceRecord[],
   openPositions: number,
 ): LiveHubAccountStats {
-  const tradesCount = asFiniteNumber(stats.total_trades, 0);
-  const winRate = liveWinRateToPoints(stats.win_rate) ?? 0;
+  const pnlIncomplete = stats.pnl_complete === false || stats.total_pnl === null;
+  const tradesCount = pnlIncomplete ? Number.NaN : asFiniteNumber(stats.total_trades, 0);
+  // Win rate is as incomplete as the PnL it is counted from: NaN, shown as "incomplete".
+  const winRate = pnlIncomplete ? Number.NaN : (liveWinRateToPoints(stats.win_rate) ?? 0);
   // An incomplete server result is unknown (NaN, shown as "incomplete"), never 0 (#124).
   const totalPnl =
     stats.pnl_complete === false || stats.total_pnl === null

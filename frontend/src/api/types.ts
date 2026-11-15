@@ -656,10 +656,11 @@ export interface LiveEquitySeriesPoint {
 
 export interface LiveAccountStats {
   account_id: string;
-  total_trades: number;
-  winning_trades: number;
-  losing_trades: number;
-  win_rate: number;
+  /** The four win/loss fields are null, like `total_pnl`, when `pnl_complete` is false. */
+  total_trades: number | null;
+  winning_trades: number | null;
+  losing_trades: number | null;
+  win_rate: number | null;
   /** null when a fill's price is unknown: realized PnL is then incomplete, not smaller. */
   total_pnl: number | null;
   pnl_complete?: boolean;
