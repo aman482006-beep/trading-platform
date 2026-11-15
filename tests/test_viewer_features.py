@@ -5092,6 +5092,156 @@ def test_remove_empty_backtests_dry_run_and_confirm(viewer_client, monkeypatch, 
     assert "backtest-empty" in deleted_files
 
 
+def _seed_zero_trade_backtest(monkeypatch, tmp_path, *, backtest_id="backtest-empty"):
+    """One zero-trade backtest whose confirm re-check reads the real row.
+
+    The dry-run candidate list comes from the metadata cache (like the rest of
+    this module's tests), but nothing in the confirm path is faked: the
+    re-check calls the real :func:`_empty_backtest_skip_reason`, which reads a
+    fresh row through ``load_backtest_metadata_row``, and the delete calls the
+    real :func:`_delete_backtest_with_artifacts`.
+    """
+    import viewer.main as viewer_app_module
+
+    monkeypatch.setattr(viewer_app_module, "list_portfolio_records", lambda: [])
+    monkeypatch.setattr(viewer_app_module, "delete_portfolio_record", lambda _portfolio_id: False)
+    monkeypatch.setattr(viewer_app_module, "delete_backtest", lambda _backtest_id: False)
+    monkeypatch.setattr(
+        viewer_app_module,
+        "_snapshot_backtest_meta_cache",
+        lambda: [
+            {
+                "id": backtest_id,
+                "display_name": "Empty Backtest",
+                "strategy_name": "Test",
+                "symbols": ["AAPL"],
+                "timeframe": "1d",
+                "trade_count": 0,
+                "created_at": "2026-01-01T00:00:00Z",
+            }
+        ],
+    )
+    backtests_dir = tmp_path / "backtests"
+    backtests_dir.mkdir(parents=True, exist_ok=True)
+    (backtests_dir / f"{backtest_id}.trades.json").write_text(
+        json.dumps({"id": backtest_id, "trades": [], "equity_curve": []}),
+        encoding="utf-8",
+    )
+    return backtests_dir
+
+
+def _patch_backtest_metadata_row(monkeypatch, row):
+    """Stub the fresh database row the confirm re-check reads.
+
+    ``row`` is the returned payload, or an exception instance for the unreadable
+    row case; ``None`` means "row is gone".
+    """
+    import viewer.main as viewer_app_module
+
+    if isinstance(row, Exception):
+        def unreadable_row(_backtest_id):
+            raise row
+
+        monkeypatch.setattr(viewer_app_module, "load_backtest_metadata_row", unreadable_row)
+        return
+    monkeypatch.setattr(
+        viewer_app_module,
+        "load_backtest_metadata_row",
+        lambda _backtest_id: row,
+    )
+
+
+def test_remove_empty_backtests_id_no_longer_empty_skipped(viewer_client, monkeypatch, tmp_path):
+    backtests_dir = _seed_zero_trade_backtest(monkeypatch, tmp_path)
+    # The backtest gained a trade between the dry run and the confirm call
+    _patch_backtest_metadata_row(monkeypatch, {"id": "backtest-empty", "trade_count": 1})
+
+    # Phase 1: dry run
+    response = viewer_client.post("/api/backtests/remove-empty")
+    assert response.status_code == 200
+    dry_run_payload = response.json()
+    assert dry_run_payload["candidate_ids"] == ["backtest-empty"]
+
+    # Phase 2: confirm - the real re-check must refuse to delete it
+    response = viewer_client.post(
+        "/api/backtests/remove-empty",
+        json={"dry_run": False, "ids": dry_run_payload["candidate_ids"]},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["dry_run"] is False
+    assert payload["deleted"] == 0
+    assert payload["skipped"] == 1
+    assert payload["removed_ids"] == []
+    assert payload["items"][0]["status"] == "skipped"
+    assert payload["items"][0]["reason"] == "no_longer_empty"
+    assert (backtests_dir / "backtest-empty.trades.json").exists()
+
+
+def test_remove_empty_backtests_id_gone_skipped(viewer_client, monkeypatch, tmp_path):
+    backtests_dir = _seed_zero_trade_backtest(monkeypatch, tmp_path)
+    _patch_backtest_metadata_row(monkeypatch, None)
+
+    response = viewer_client.post("/api/backtests/remove-empty")
+    assert response.status_code == 200
+    dry_run_payload = response.json()
+
+    response = viewer_client.post(
+        "/api/backtests/remove-empty",
+        json={"dry_run": False, "ids": dry_run_payload["candidate_ids"]},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["deleted"] == 0
+    assert payload["skipped"] == 1
+    assert payload["items"][0]["status"] == "skipped"
+    assert payload["items"][0]["reason"] == "not_found"
+    assert (backtests_dir / "backtest-empty.trades.json").exists()
+
+
+def test_remove_empty_backtests_recheck_failure_skips(viewer_client, monkeypatch, tmp_path):
+    backtests_dir = _seed_zero_trade_backtest(monkeypatch, tmp_path)
+    _patch_backtest_metadata_row(monkeypatch, RuntimeError("database is unavailable"))
+
+    response = viewer_client.post("/api/backtests/remove-empty")
+    assert response.status_code == 200
+    dry_run_payload = response.json()
+
+    response = viewer_client.post(
+        "/api/backtests/remove-empty",
+        json={"dry_run": False, "ids": dry_run_payload["candidate_ids"]},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["deleted"] == 0
+    assert payload["skipped"] == 1
+    assert payload["items"][0]["status"] == "skipped"
+    assert payload["items"][0]["reason"] == "recheck_failed"
+    # Fail closed: an unreadable re-check leaves the backtest alone
+    assert (backtests_dir / "backtest-empty.trades.json").exists()
+
+
+def test_remove_empty_backtests_recheck_still_empty_deletes(viewer_client, monkeypatch, tmp_path):
+    backtests_dir = _seed_zero_trade_backtest(monkeypatch, tmp_path)
+    _patch_backtest_metadata_row(monkeypatch, {"id": "backtest-empty", "trade_count": 0})
+
+    response = viewer_client.post("/api/backtests/remove-empty")
+    assert response.status_code == 200
+    dry_run_payload = response.json()
+
+    response = viewer_client.post(
+        "/api/backtests/remove-empty",
+        json={"dry_run": False, "ids": dry_run_payload["candidate_ids"]},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["deleted"] == 1
+    assert payload["skipped"] == 0
+    assert payload["removed_ids"] == ["backtest-empty"]
+    assert payload["items"][0]["status"] == "deleted"
+    assert not (backtests_dir / "backtest-empty.trades.json").exists()
+
+
 def test_deduplicate_portfolios_dry_run_and_confirm(viewer_client, monkeypatch, tmp_path):
     import viewer.main as viewer_app_module
 
