@@ -292,10 +292,32 @@ def test_c19b_alpaca_fallback_key_ignores_timestamp_spelling(monkeypatch) -> Non
         "2026-07-15T10:00:00.123456Z",
         "2026-07-15T10:00:00.123456+00:00",
     ):
-        asyncio.run(adapter._on_trade_update(_alpaca_update(signal_id=signal_id, timestamp=stamp)))
+        # cumulative=None: no usable cumulative, so the key must come from the timestamp branch.
+        asyncio.run(
+            adapter._on_trade_update(
+                _alpaca_update(signal_id=signal_id, timestamp=stamp, cumulative=None)
+            )
+        )
 
     keys = {execution.dedupe_key for execution, _ in saved}
     assert len(saved) == 5 and len(keys) == 1, keys
+    assert ":cum:" not in next(iter(keys))
+
+
+def test_c19b_alpaca_timestamp_fallback_key_keeps_microsecond_precision(monkeypatch) -> None:
+    """Stamps a microsecond apart are two fills: the canonical stamp is never rounded."""
+    adapter, saved = _alpaca_capture(monkeypatch)
+    signal_id = str(uuid4())
+    instant = datetime(2026, 7, 15, 10, 0, 0, 123456, tzinfo=timezone.utc)
+    for stamp in (instant, instant + timedelta(microseconds=1)):
+        asyncio.run(
+            adapter._on_trade_update(
+                _alpaca_update(signal_id=signal_id, timestamp=stamp, cumulative=None)
+            )
+        )
+
+    keys = {execution.dedupe_key for execution, _ in saved}
+    assert len(saved) == 2 and len(keys) == 2, keys
 
 
 def test_c19b_alpaca_without_identity_or_timestamp_is_not_persisted(monkeypatch) -> None:
@@ -448,6 +470,45 @@ def test_c18_distinct_instants_are_not_merged_by_stamp_normalisation() -> None:
         _live_signal(stamp=base + timedelta(days=1)).metadata["idempotency_key"],
     }
     assert len(keys) == 4
+
+
+def test_c18_symbol_case_variant_is_one_key() -> None:
+    """A redelivery spelling the symbol in another case is the same producer event."""
+    from live_runner.daemon import _trade_signal_to_live_signal
+
+    keys = set()
+    for symbol in ("EURUSD", "Eurusd", "eurusd"):
+        trade = TradeSignal(
+            action="buy",
+            symbol=symbol,
+            entry_price=1.1,
+            stop_loss=None,
+            take_profit=None,
+            timeframe="1h",
+            metadata={"signal_timestamp": "2026-07-15T10:00:00+00:00"},
+        )
+        keys.add(_trade_signal_to_live_signal(trade, _deployment()).metadata["idempotency_key"])
+    assert len(keys) == 1, keys
+
+
+@pytest.mark.parametrize("metadata", [{}, {"signal_timestamp": ""}, {"timestamp": None}])
+def test_timestamp_less_signal_mints_no_idempotency_key(metadata) -> None:
+    """No producer timestamp, no key: two distinct timestamp-less signals must not be merged."""
+    from live_runner.daemon import _mint_signal_idempotency_key
+
+    trade = TradeSignal(
+        action="buy",
+        symbol="EURUSD",
+        entry_price=1.1,
+        stop_loss=None,
+        take_profit=None,
+        timeframe="1h",
+        metadata=dict(metadata),
+    )
+    minted = dict(metadata)
+    _mint_signal_idempotency_key(trade, _deployment(), minted)
+    assert "idempotency_key" not in minted
+    assert "legacy_idempotency_key" not in minted
 
 
 def test_c18_unparseable_stamp_still_keys_on_its_text() -> None:
