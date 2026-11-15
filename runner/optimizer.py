@@ -889,7 +889,9 @@ def _trade_net_pnl(trade: Any) -> float:
         return float("nan")
 
 
-def _trial_subperiod_pnl(result: BacktestResult, subperiods: list[dict[str, Any]]) -> dict[str, float]:
+def _trial_subperiod_pnl(
+    result: BacktestResult, subperiods: list[dict[str, Any]]
+) -> dict[str, float]:
     """Realized net PnL of one trial, per stability sub-period."""
     if not subperiods:
         return {}
