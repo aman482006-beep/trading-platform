@@ -1,7 +1,8 @@
 """
 Centralized logging module for trading-platform services.
 
-Provides structured JSON logging with file rotation and stdout output.
+Provides structured JSON logging with file rotation and console output (stdout,
+or stderr after route_console_logs_to_stderr()).
 
 Usage:
     from shared.logging import get_logger
@@ -245,7 +246,8 @@ def get_logger(service: str) -> logging.Logger:
 
     Each service gets:
     - A RotatingFileHandler writing JSON to ~/logs/<service>.log
-    - A StreamHandler writing JSON to stdout
+    - A StreamHandler writing JSON to stdout (stderr after
+      route_console_logs_to_stderr())
     """
     if service in _loggers:
         return _loggers[service]
