@@ -831,12 +831,6 @@ def _patch_exit_ledger(monkeypatch, deployment: LiveDeploymentConfig, qty: float
         lambda _account_id, _symbol, **_kwargs: [],
         raising=False,
     )
-    monkeypatch.setattr(
-        daemon,
-        "get_live_deployment_net_filled_qty",
-        lambda _deployment_id, _symbol: qty,
-        raising=False,
-    )
 
 
 def _exit_only_sell(deployment_id: str = "dep-1", **metadata: Any) -> LiveSignal:
