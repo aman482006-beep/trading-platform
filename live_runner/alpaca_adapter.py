@@ -32,6 +32,7 @@ from live_runner.base_adapter import (
     order_not_submitted,
 )
 from live_runner.credential_env import parse_bool_env, resolve_env_value
+from live_runner.exit_signals import ExitBelowStepError, round_exit_qty_down
 from live_runner.symbol_class import canonical_crypto_symbol, classify_symbol
 from shared.alpaca_symbols import classify_alpaca_symbol, crypto_pair_key
 from shared.database import (
@@ -1288,7 +1289,8 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         open it unbounded. The same is true of an order larger than the position:
         the excess becomes a new naked position on the other side.
 
-        Returns the quantity to submit, capped at the broker's current position.
+        Returns the quantity to submit, capped at the broker's current position
+        and rounded down to the quantity step (#121 review).
         Capping rather than refusing is deliberate: the order's intent is to
         close what exists, and refusing would leave the exposure in place. The
         cap is logged because a size mismatch means the daemon's book moved
@@ -1345,8 +1347,26 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     }
                 },
             )
-            return position_qty
-        return qty
+            qty = position_qty
+        return self._floor_exit_qty(symbol, qty)
+
+    def _floor_exit_qty(self, symbol: str, qty: float) -> float:
+        """An exit qty rounded DOWN to Alpaca's quantity step (#121 review).
+
+        A partial of a fractional position (1/3 of 0.5 = 0.1666...) has more
+        decimals than Alpaca accepts; rounding it to nearest could close more
+        than asked. Raises :class:`ExitBelowStepError` below one step.
+        """
+        step = self.exit_qty_step(symbol)
+        floored = round_exit_qty_down(qty, step)
+        if floored <= 0.0:
+            raise ExitBelowStepError(
+                f"Alpaca exit for {symbol} ignored: the requested qty {qty:g} is below "
+                f"the quantity step {step:g}.",
+                requested_qty=qty,
+                qty_step=step,
+            )
+        return floored
 
     async def submit_order(self, signal: LiveSignal, *, qty: float | None = None) -> str:
         # Everything up to and including the request build is provably before
@@ -1599,8 +1619,25 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             raise RuntimeError("Alpaca trading client is unavailable after connect.")
         return client
 
-    async def _list_open_orders(self, client: Any) -> list[Any]:
-        """Every working order, or a hard failure - never a silent empty list."""
+    #: Alpaca's maximum page size for the orders listing (its default is 50).
+    _OPEN_ORDERS_LIMIT = 500
+
+    async def _list_open_orders(self, client: Any, *, nested: bool = False) -> list[Any]:
+        """Every working order, or a hard failure - never a silent empty list.
+
+        Asks for the maximum page (the default of 50 would silently drop orders on
+        a busy account) and fails when the page comes back full, since orders may
+        then be missing. ``nested`` returns bracket legs under their parent.
+        """
+        orders = await self._list_open_orders_page(client, nested=nested)
+        if len(orders) >= self._OPEN_ORDERS_LIMIT:
+            raise RuntimeError(
+                f"Alpaca returned {len(orders)} open orders, the page limit; "
+                "refusing to treat the list as complete"
+            )
+        return orders
+
+    async def _list_open_orders_page(self, client: Any, *, nested: bool) -> list[Any]:
         get_orders = getattr(client, "get_orders", None)
         if not callable(get_orders):
             raise RuntimeError(
@@ -1610,7 +1647,11 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             from alpaca.trading.enums import QueryOrderStatus
             from alpaca.trading.requests import GetOrdersRequest
 
-            request = GetOrdersRequest(status=QueryOrderStatus.OPEN)
+            request = GetOrdersRequest(
+                status=QueryOrderStatus.OPEN,
+                limit=self._OPEN_ORDERS_LIMIT,
+                nested=nested,
+            )
             result = await asyncio.to_thread(get_orders, filter=request)
         except ModuleNotFoundError:
             result = await asyncio.to_thread(get_orders)
@@ -1631,6 +1672,36 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             f"Alpaca order list has an unrecognised shape ({type(result).__name__}); "
             "refusing to report a clean sweep"
         )
+
+    async def working_order_ids(self) -> set[str]:
+        """Ids of every working (open) order: broker ids and client order ids.
+
+        Used before sizing an exit, to tell whether an earlier exit is still
+        working (#121). The client order id is the canonical signal id, which
+        names an order whose broker id was never persisted. Nested legs are
+        included. Fails rather than returning an empty set it cannot vouch for.
+        """
+        client = await self._require_trading_client()
+        ids: set[str] = set()
+        for order in await self._list_open_orders(client, nested=True):
+            for item in (order, *_order_legs(order)):
+                for name in ("id", "client_order_id"):
+                    order_id = _control_order_id(_order_attr(item, name))
+                    if order_id is not None:
+                        ids.add(order_id)
+        return ids
+
+    def exit_qty_step(self, symbol: str) -> float:
+        """Alpaca's smallest quantity step (9 decimals): what an exit is floored to."""
+        return 1e-9
+
+    def position_qty_tolerance(self, symbol: str) -> float:
+        """Half of Alpaca's smallest quantity step (9 decimals, fractional shares).
+
+        Ledger sums and the broker position agree to that step or not at all;
+        half a step absorbs float summation noise without hiding a real share.
+        """
+        return 0.5e-9
 
     @staticmethod
     def _protection_order_ids(
