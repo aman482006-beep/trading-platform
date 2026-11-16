@@ -82,6 +82,7 @@ from shared.sentry import capture_exception, initialize_sentry
 from shared.trailing import (
     LIVE_SUPPORTED_TRAILING_MODES,
     TRAILING_SL_CONFIG_METADATA_KEY,
+    validate_live_deployment_trailing_override,
     validate_trailing_sl_config,
 )
 from signal_bots.registry import get_signal_processor
@@ -3715,6 +3716,22 @@ async def _load_db_accounts_and_deployments(
     accounts_task = asyncio.to_thread(list_live_accounts)
     deployments_task = asyncio.to_thread(list_live_deployments)
     accounts, deployments = await asyncio.gather(accounts_task, deployments_task)
+    # #150: a stored deployment whose trailing override live cannot run is still
+    # loaded (so it stays listed, stoppable and enforceable), but every signal
+    # it produces is refused by the live gates. Say so loudly at load time.
+    for deployment in deployments:
+        try:
+            validate_live_deployment_trailing_override(
+                deployment.signal_config,
+                context=f"live deployment '{deployment.strategy_name}' ({deployment.id})",
+            )
+        except ValueError as exc:
+            logger.error(
+                "Stored live deployment has an unsupported trailing mode; its entry "
+                "signals will be refused: %s",
+                exc,
+                extra={"data": {"deployment_id": str(deployment.id)}},
+            )
     return accounts, deployments
 
 

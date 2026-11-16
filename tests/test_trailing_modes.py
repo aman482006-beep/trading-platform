@@ -245,3 +245,61 @@ def test_order_preparation_lets_mode_none_through_to_sizing(monkeypatch) -> None
             daemon.prepare_order_with_risk(_UntouchableAdapter(), _deployment(), signal)
         )
     assert reached.sizing
+
+
+# ── stored rows: a bad row must not break listing ────────────────────────────
+
+
+STORED_ID = "6f1f0c52-2f0e-4e0e-9a55-3f6f2c3a1b7d"
+
+
+def _stored_row(signal_config: dict):
+    from shared.database import LiveDeploymentModel
+
+    return LiveDeploymentModel(
+        id=STORED_ID,
+        strategy_name="ramjet-live",
+        account_id="acct-1",
+        symbols_json=["AAPL"],
+        timeframe="5m",
+        status="ACTIVE",
+        signal_config_json=signal_config,
+    )
+
+
+def test_stored_row_with_unsupported_trailing_mode_still_loads() -> None:
+    """Review finding: a poisoned stored row must not make the whole list raise.
+
+    The write-path validator still rejects the same config (see above); only the
+    read path skips it, and the daemon refuses such signals at signal time.
+    """
+    loaded = _stored_row(
+        {"signal_processor_config": {"trailing_mode": "percent"}}
+    ).to_live_deployment()
+    assert str(loaded.id) == STORED_ID
+    assert loaded.signal_config["signal_processor_config"]["trailing_mode"] == "percent"
+
+
+def test_stored_row_load_logs_an_error_for_unsupported_trailing_mode(monkeypatch) -> None:
+    import live_runner.daemon as daemon_module
+
+    deployment = _stored_row(
+        {"signal_processor_config": {"trailing_mode": "percent"}}
+    ).to_live_deployment()
+    errors: list[tuple] = []
+    monkeypatch.setattr(
+        daemon_module,
+        "logger",
+        SimpleNamespace(error=lambda msg, *args, **kwargs: errors.append((msg, args, kwargs))),
+    )
+    monkeypatch.setattr(daemon_module, "list_live_accounts", lambda: [])
+    monkeypatch.setattr(daemon_module, "list_live_deployments", lambda: [deployment])
+
+    _accounts, loaded = asyncio.run(daemon_module._load_db_accounts_and_deployments())
+
+    assert [str(d.id) for d in loaded] == [STORED_ID]
+    assert len(errors) == 1
+    msg, args, kwargs = errors[0]
+    assert "unsupported trailing mode" in msg
+    assert "percent" in str(args)
+    assert kwargs["extra"]["data"]["deployment_id"] == STORED_ID

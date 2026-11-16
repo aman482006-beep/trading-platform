@@ -42,6 +42,7 @@ from shared.logging import get_logger
 from shared.models import (
     PRICE_DERIVED,
     PRICE_DERIVED_UNAVAILABLE,
+    STORED_ROW_CONTEXT,
     BacktestMeta,
     BacktestResult,
     IndicatorSeries,
@@ -961,24 +962,34 @@ class LiveDeploymentModel(SQLModel, table=True):
     def to_live_deployment(self) -> LiveDeploymentConfig:
         source_type = str(self.signal_source_type or self.signal_source or "internal").lower()
         source_name = str(self.signal_source or source_type or "internal").lower()
-        return LiveDeploymentConfig(
-            id=self.id,
-            strategy_name=self.strategy_name,
-            account_id=self.account_id,
-            symbols=self.symbols_json or [],
-            timeframe=self.timeframe,
-            status=self.status,
-            stopped_enforced_at=self.stopped_enforced_at,
-            signal_source_type=source_type if source_type in {"internal", "discord"} else "internal",
-            signal_source_id=str(self.signal_source_id or "").strip() or None,
-            symbol_filter=[
-                str(symbol).strip().upper()
-                for symbol in (self.symbol_filter_json or [])
-                if str(symbol).strip()
-            ],
-            signal_source=source_name if source_name in {"internal", "discord"} else "internal",
-            signal_config=self.signal_config_json or {},
-            settings=self.settings_json or {},
+        # Rehydrating a stored row must not raise on the write-path trailing
+        # check: one bad row would otherwise break every deployment listing.
+        # See STORED_ROW_CONTEXT in shared/models.py.
+        return LiveDeploymentConfig.model_validate(
+            {
+                "id": self.id,
+                "strategy_name": self.strategy_name,
+                "account_id": self.account_id,
+                "symbols": self.symbols_json or [],
+                "timeframe": self.timeframe,
+                "status": self.status,
+                "stopped_enforced_at": self.stopped_enforced_at,
+                "signal_source_type": (
+                    source_type if source_type in {"internal", "discord"} else "internal"
+                ),
+                "signal_source_id": str(self.signal_source_id or "").strip() or None,
+                "symbol_filter": [
+                    str(symbol).strip().upper()
+                    for symbol in (self.symbol_filter_json or [])
+                    if str(symbol).strip()
+                ],
+                "signal_source": (
+                    source_name if source_name in {"internal", "discord"} else "internal"
+                ),
+                "signal_config": self.signal_config_json or {},
+                "settings": self.settings_json or {},
+            },
+            context={STORED_ROW_CONTEXT: True},
         )
 
 
