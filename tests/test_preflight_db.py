@@ -7,11 +7,18 @@ import sqlite3
 from pathlib import Path
 from textwrap import dedent
 
+import pytest
+
 from live_runner import preflight_db
 from live_runner.preflight import main as preflight_main
 from live_runner.preflight import run_live_preflight
-from live_runner.preflight_db import run_db_preflight
+from live_runner.preflight_db import resolve_db_path, run_db_preflight
 from shared.models import LiveDeploymentConfig
+
+
+def _url(path: Path) -> str:
+    """A DATABASE_URL in the form shared.database._sqlite_url builds."""
+    return f"sqlite:///{path.as_posix()}"
 
 
 def _yaml(tmp_path: Path, deployments: str) -> Path:
@@ -33,7 +40,7 @@ def _yaml(tmp_path: Path, deployments: str) -> Path:
 
 
 # Numeric and long enough to pass validate_discord_deployment_signal_config's
- # placeholder/snowflake sanity check, so a Discord row can be seeded through the real chokepoint.
+# placeholder/snowflake sanity check, so a Discord row can be seeded through the real chokepoint.
 _DISCORD_CHANNEL = "123456789012345678"
 
 _YAML_ONE = """
@@ -402,3 +409,73 @@ def test_cli_flag_prints_the_diff(tmp_path: Path, isolated_db, capsys) -> None:
     payload = json.loads(out[out.index("{") :]) if out.lstrip().startswith("{") else None
     assert payload is not None, out[:200]
     assert payload["db_deployments"]["only_in_db"]
+
+
+def test_resolve_db_path_uses_the_file_part_of_a_plain_url(tmp_path: Path, monkeypatch) -> None:
+    path = tmp_path / "backtests.db"
+    monkeypatch.setenv("DATABASE_URL", _url(path))
+
+    assert resolve_db_path() == path
+
+
+def test_resolve_db_path_drops_a_query_string_from_the_url(tmp_path: Path, monkeypatch) -> None:
+    """SQLAlchemy reads the query as driver options; it is not part of the filename."""
+    path = tmp_path / "backtests.db"
+    monkeypatch.setenv("DATABASE_URL", f"{_url(path)}?timeout=30&mode=ro")
+
+    assert resolve_db_path() == path
+
+
+def test_resolve_db_path_decodes_a_percent_encoded_url(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path.as_posix()}/my%20db.db")
+
+    assert resolve_db_path() == tmp_path / "my db.db"
+
+
+def test_resolve_db_path_keeps_a_relative_url_relative(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("DATABASE_URL", "sqlite:///backtests.db")
+
+    assert resolve_db_path() == Path("backtests.db")
+
+
+def test_resolve_db_path_refuses_an_in_memory_url(monkeypatch) -> None:
+    """An in-memory database is not a file the check can read, and it is not empty either."""
+    monkeypatch.setenv("DATABASE_URL", "sqlite:///:memory:")
+
+    with pytest.raises(ValueError, match="in-memory"):
+        resolve_db_path()
+
+
+def test_resolve_db_path_refuses_a_non_sqlite_url(monkeypatch) -> None:
+    monkeypatch.setenv("DATABASE_URL", "postgresql://user:pw@localhost/trading")
+
+    with pytest.raises(ValueError, match="SQLite"):
+        resolve_db_path()
+
+
+def test_resolve_db_path_refuses_a_url_with_no_path(monkeypatch) -> None:
+    monkeypatch.setenv("DATABASE_URL", "sqlite://")
+
+    with pytest.raises(ValueError, match="no SQLite file path"):
+        resolve_db_path()
+
+
+def test_a_query_bearing_database_url_is_read(isolated_db, monkeypatch) -> None:
+    """The daemon accepts the query string form, so --check-db must not call it missing."""
+    database = isolated_db[0]
+    _seed(database)
+    monkeypatch.setenv("DATABASE_URL", f"{_url(_db_path(database))}?timeout=30")
+
+    report = run_db_preflight([_yaml_one()], db_path=None)
+
+    assert report.active_count == 1
+    assert report.errors == [], report.errors
+
+
+def test_an_in_memory_database_url_fails_the_check(monkeypatch) -> None:
+    monkeypatch.setenv("DATABASE_URL", "sqlite:///:memory:")
+
+    report = run_db_preflight([], db_path=None)
+
+    assert any("in-memory" in e for e in report.errors), report.errors
+    assert "not found" not in report.errors[0]

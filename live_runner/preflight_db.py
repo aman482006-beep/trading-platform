@@ -53,6 +53,19 @@ class DbPreflightReport:
     warnings: list[str] = field(default_factory=list)
 
 
+def _sqlite_url_file(url: str) -> str:
+    """The file part of a SQLite URL, with any query string and fragment stripped.
+
+    ``shared.database`` hands ``DATABASE_URL`` straight to SQLAlchemy, which reads everything
+    after the first ``?`` as driver options rather than as part of the filename, so
+    ``sqlite:////abs/backtests.db?timeout=30`` opens ``/abs/backtests.db``. Splitting the raw URL
+    kept ``?timeout=30`` in the path, and a ``Path`` carrying it is not a file: a working database
+    was reported as "Database file not found".
+    """
+    without_params = url.partition("?")[0].partition("#")[0]
+    return unquote(without_params.split("///", 1)[1]) if "///" in without_params else ""
+
+
 def resolve_db_path(explicit: str | Path | None = None) -> Path:
     """The SQLite file the daemon would use: explicit, ``DATABASE_URL`` or ``DATA_DIR``."""
     if explicit:
@@ -64,7 +77,14 @@ def resolve_db_path(explicit: str | Path | None = None) -> Path:
         parsed = urlparse(url)
         if not parsed.scheme.lower().startswith("sqlite"):
             raise ValueError(f"DB preflight supports SQLite only, got {parsed.scheme!r}.")
-        raw = unquote(url.split("///", 1)[1]) if "///" in url else ""
+        raw = _sqlite_url_file(url)
+        if raw == ":memory:":
+            # Not a missing file: the daemon would trade ACTIVE rows no on-disk path can show.
+            raise ValueError(
+                "DATABASE_URL points at an in-memory SQLite database, which this read-only check "
+                "cannot inspect; the ACTIVE deployments the daemon trades cannot be verified "
+                "here."
+            )
         if not raw:
             raise ValueError("DATABASE_URL has no SQLite file path.")
         return Path(raw)
