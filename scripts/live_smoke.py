@@ -453,10 +453,15 @@ def _ensure_ctrader_smoke_deployment(*, account_id: str, symbol: str) -> str:
         return deployment_id
 
 
-#: cTrader reports trendbar prices as integers in 1/100000 of a price unit.
+#: cTrader reports trendbar prices as integers in 1/100000 of a price unit. This is the same
+#: wire unit as the adapter's CTRADER_RELATIVE_PRICE_UNIT_DIVISOR, but the constants stay separate
+#: on purpose: a trendbar price is an absolute quote, a relative SL/TP is a distance, and the two
+#: scalings could legitimately diverge. A test pins them at the same value so a one-sided edit
+#: fails loudly instead of quietly misreading every quote.
 _CTRADER_TRENDBAR_PRICE_DIVISOR = 100_000
-#: SL/TP distance of the cTrader smoke order, as a fraction of the live price. Wide enough to clear
-#: the broker's minimum stop distance on FX and metals, and the position is closed within seconds.
+#: SL/TP distance of the cTrader smoke order, as a fraction of the live price. Chosen wide so a
+#: broker stop-distance minimum cannot refuse the smoke order; the position is closed within
+#: seconds, so the distance costs nothing either way.
 _CTRADER_SMOKE_SL_TP_FRACTION = 0.005
 #: How far back to look for the latest M1 bar; a fresh bar older than this means the market is shut.
 _CTRADER_SMOKE_QUOTE_LOOKBACK_MINUTES = 30
@@ -465,8 +470,10 @@ _CTRADER_SMOKE_QUOTE_LOOKBACK_MINUTES = 30
 def _ctrader_smoke_sl_tp(price: float, action: str) -> tuple[float, float]:
     """Real stop-loss and take-profit prices around a live ``price``.
 
-    The adapter refuses an order without both, and refuses SL/TP anchored at a made-up price, so
-    the smoke anchors them at a quote it just fetched.
+    The adapter refuses an order that is missing either leg, and refuses SL/TP on the wrong side of
+    ``theoretical_price`` or closer than one 1/100000 price unit. It cannot tell a plausible
+    invented price from a fetched one, so the smoke derives all three from one fetched quote: the
+    price the order is sized with and the prices the stops are measured from never disagree.
     """
     if not math.isfinite(price) or price <= 0:
         raise ValueError(f"Cannot derive smoke SL/TP from price {price!r}.")
