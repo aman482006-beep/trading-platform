@@ -616,6 +616,54 @@ def test_live_preflight_config_error_rewrites_file_values_to_their_ref(
     assert any("PREFLIGHT_TEST_SECRET_REF" in err for err in result.deployment_errors)
 
 
+def test_live_preflight_config_error_rewrites_process_env_values_to_their_ref(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ${VAR} that resolves from the process environment is redacted too.
+
+    The expansion view falls back to os.environ for keys the accounts file does
+    not define, so a secret can reach a config error without ever being in the
+    file. The message and the warning log must still name the reference only.
+    """
+    import live_runner.preflight as preflight
+
+    monkeypatch.setenv("PROC_ONLY_SECRET", "supersecretvalue")
+    config_path = _write_config(
+        tmp_path / "live_deployments.yaml",
+        """
+        accounts:
+          - id: x
+            broker: ctrader
+            broker_login: "${PROC_ONLY_SECRET}"
+
+        deployments:
+          - strategy_name: fx_breakout
+            account_id: x
+            symbols: [EURUSD]
+            timeframe: 15m
+        """,
+    )
+    accounts_env = tmp_path / ".accounts.env"
+    accounts_env.write_text("", encoding="utf-8")
+    logged: list[str] = []
+
+    class _Recorder:
+        def warning(self, message: str, **kwargs: object) -> None:
+            logged.append(f"{message} {kwargs}")
+
+    monkeypatch.setattr(preflight, "logger", _Recorder())
+
+    result = run_live_preflight(config_path, accounts_env_path=accounts_env)
+
+    assert result.ok is False
+    assert result.deployment_errors
+    assert not any("supersecretvalue" in err for err in result.deployment_errors)
+    assert any("${PROC_ONLY_SECRET}" in err for err in result.deployment_errors)
+    assert logged, "the config error must be logged as a warning"
+    assert not any("supersecretvalue" in line for line in logged)
+    assert any("${PROC_ONLY_SECRET}" in line for line in logged)
+
+
 def test_live_preflight_credentials_are_not_filled_from_process_env(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
