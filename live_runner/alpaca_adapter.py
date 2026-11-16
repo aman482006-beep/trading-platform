@@ -189,15 +189,23 @@ def _order_legs(order: Any) -> list[Any]:
     return list(legs) if isinstance(legs, (list, tuple)) else []
 
 
+def _enum_text(raw: Any) -> str:
+    """Lower-case text of an alpaca-py enum or plain string, without any ``Enum.`` prefix."""
+    text = str(getattr(raw, "value", raw) or "").strip().lower()
+    return text.rsplit(".", 1)[-1]
+
+
+def _order_status(order: Any) -> str:
+    return _enum_text(_order_attr(order, "status", ""))
+
+
 def _order_symbol(order: Any) -> str:
     return str(_order_attr(order, "symbol", "") or "").strip().upper()
 
 
 def _order_side(order: Any) -> str:
     """The order's side as ``buy``/``sell``, whether it arrives as an enum or a string."""
-    raw = _order_attr(order, "side", "")
-    text = str(getattr(raw, "value", raw) or "").strip().lower()
-    return text.rsplit(".", 1)[-1]
+    return _enum_text(_order_attr(order, "side", ""))
 
 
 def _alpaca_timeframe(value: str):
@@ -351,7 +359,7 @@ def _known_commission(order: Any) -> float | None:
     zero, NULL for everything else.
     """
     raw = _order_attr(order, "asset_class", None)
-    asset_class = str(getattr(raw, "value", raw) or "").strip().lower().rsplit(".", 1)[-1]
+    asset_class = _enum_text(raw)
     return 0.0 if asset_class == "us_equity" else None
 
 
@@ -1686,6 +1694,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         completed = 0
         unidentified: list[str] = []
         failed: list[str] = []
+        cancel_accepted: set[str] = set()
         for order in orders:
             order_id = _control_order_id(_order_attr(order, "id"))
             if order_id is None:
@@ -1693,9 +1702,25 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 continue
             if order_id in protected:
                 continue
+            # An order an earlier pass already cancelled is still pending_cancel. The
+            # repeat cancel is kept (it costs nothing and may nudge a stuck cancel),
+            # but a refusal of it is not a dropped cancel: the order is already on its
+            # way out. The re-read below still decides - a settled order is gone, one
+            # still pending_cancel is reported as such, anything else is a failure.
+            was_pending_cancel = _order_status(order) == "pending_cancel"
             try:
                 await self._cancel_one(client, order_id)
+                cancel_accepted.add(order_id)
             except Exception as exc:
+                if was_pending_cancel:
+                    cancel_accepted.add(order_id)
+                    logger.info(
+                        "Alpaca refused a repeat cancel of pending_cancel order %s: %s. "
+                        "Verifying on re-read.",
+                        order_id,
+                        exc,
+                    )
+                    continue
                 failed.append(f"{order_id}:{exc}")
                 logger.warning(
                     "Alpaca refused to cancel order %s: %s. Continuing the sweep.",
@@ -1716,17 +1741,42 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 unidentified=tuple(unidentified),
                 failed=tuple(failed) + (f"verify:{exc}",),
             )
+        # Alpaca keeps listing a cancel it accepted as ``pending_cancel`` until the
+        # cancel settles, so that status on an id this sweep cancelled without error
+        # is treated as an accepted request, not a dropped cancel. It is NOT proof
+        # the order can no longer fill: a pending_cancel order may still execute in
+        # a cancel/fill race. Those ids are returned in ``pending_cancel`` and the
+        # daemon refuses to stamp a STOPPED deployment enforced while any remain
+        # (fail closed); it retries until the re-read shows them cancelled or filled,
+        # and the flatten handles a fill. Only ids this sweep cancelled count; an
+        # order that was never ours to cancel and sits in ``pending_cancel`` is not
+        # vouched for.
+        def accepted_pending_cancel(order_id: str | None, order: Any) -> bool:
+            return order_id in cancel_accepted and _order_status(order) == "pending_cancel"
+
         still_working = {
-            _control_order_id(_order_attr(order, "id"))
+            order_id
             for order in remaining
-            if _control_order_id(_order_attr(order, "id")) not in protected
+            if (order_id := _control_order_id(_order_attr(order, "id"))) not in protected
+            and not accepted_pending_cancel(order_id, order)
         }
         still_working.discard(None)
         failed.extend(sorted(still_working))
+        pending_cancel = sorted(
+            {
+                order_id
+                for order in remaining
+                if (order_id := _control_order_id(_order_attr(order, "id")))
+                is not None
+                and order_id not in protected
+                and accepted_pending_cancel(order_id, order)
+            }
+        )
         return ControlOutcome(
             completed=completed,
             unidentified=tuple(unidentified),
             failed=tuple(failed),
+            pending_cancel=tuple(pending_cancel),
         )
 
     @staticmethod
