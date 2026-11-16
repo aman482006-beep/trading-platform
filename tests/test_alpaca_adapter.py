@@ -222,6 +222,30 @@ def test_cancel_open_orders_does_not_excuse_pending_cancel_after_refused_cancel(
     assert outcome.complete is False
 
 
+def test_cancel_open_orders_treats_refused_recancel_of_pending_cancel_as_pending() -> None:
+    # An order that an earlier pass already cancelled is still pending_cancel. If the
+    # broker refuses the repeat cancel, the order is still on its way out: it is
+    # reported as pending_cancel (fail closed, retried), not as a failed sweep that
+    # hides the cancel that was accepted.
+    client = _FakeTradingClient(
+        orders=[_FakeOrder("entry-1", "AAPL", "buy", status="pending_cancel")]
+    )
+
+    def refuse(order_id: str) -> None:
+        client.cancelled.append(order_id)
+        raise RuntimeError("422: order is already pending cancel")
+
+    client.cancel_order_by_id = refuse  # type: ignore[method-assign]
+
+    outcome = asyncio.run(_adapter(client).cancel_open_orders())
+
+    assert client.cancelled == ["entry-1"]
+    assert outcome.failed == ()
+    assert outcome.unidentified == ()
+    assert outcome.completed == 0
+    assert outcome.pending_cancel == ("entry-1",)
+
+
 def test_cancel_open_orders_accepts_mixed_case_pending_cancel_status() -> None:
     client = _FakeTradingClient(
         orders=[_FakeOrder("entry-1", "AAPL", "buy")], cancel_settles=False

@@ -1702,10 +1702,25 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 continue
             if order_id in protected:
                 continue
+            # An order an earlier pass already cancelled is still pending_cancel. The
+            # repeat cancel is kept (it costs nothing and may nudge a stuck cancel),
+            # but a refusal of it is not a dropped cancel: the order is already on its
+            # way out. The re-read below still decides - a settled order is gone, one
+            # still pending_cancel is reported as such, anything else is a failure.
+            was_pending_cancel = _order_status(order) == "pending_cancel"
             try:
                 await self._cancel_one(client, order_id)
                 cancel_accepted.add(order_id)
             except Exception as exc:
+                if was_pending_cancel:
+                    cancel_accepted.add(order_id)
+                    logger.info(
+                        "Alpaca refused a repeat cancel of pending_cancel order %s: %s. "
+                        "Verifying on re-read.",
+                        order_id,
+                        exc,
+                    )
+                    continue
                 failed.append(f"{order_id}:{exc}")
                 logger.warning(
                     "Alpaca refused to cancel order %s: %s. Continuing the sweep.",
