@@ -173,6 +173,79 @@ def test_cancel_open_orders_still_reports_a_cancel_the_broker_dropped() -> None:
     assert outcome.complete is False
 
 
+def test_cancel_open_orders_reports_an_uncancelled_pending_cancel_order() -> None:
+    # An order this sweep never cancelled (it appeared between the two reads) and
+    # that sits in pending_cancel is not vouched for: the sweep is incomplete.
+    client = _FakeTradingClient(orders=[_FakeOrder("entry-1", "AAPL", "buy")])
+    stranger = _FakeOrder("stranger-1", "MSFT", "buy")
+    stranger.status = "pending_cancel"
+    reads = {"n": 0}
+    original_get = client.get_orders
+
+    def get_orders(filter=None):  # noqa: A002 - mirrors alpaca-py
+        reads["n"] += 1
+        result = original_get(filter)
+        return result + [stranger] if reads["n"] > 1 else result
+
+    client.get_orders = get_orders  # type: ignore[method-assign]
+
+    outcome = asyncio.run(_adapter(client).cancel_open_orders())
+
+    assert client.cancelled == ["entry-1"]
+    assert outcome.failed == ("stranger-1",)
+    assert outcome.complete is False
+
+
+def test_cancel_open_orders_does_not_excuse_pending_cancel_after_refused_cancel() -> None:
+    client = _FakeTradingClient(orders=[_FakeOrder("entry-1", "AAPL", "buy")])
+
+    def refuse(order_id: str) -> None:
+        client.orders[0].status = "pending_cancel"
+        raise RuntimeError("refused")
+
+    client.cancel_order_by_id = refuse  # type: ignore[method-assign]
+
+    outcome = asyncio.run(_adapter(client).cancel_open_orders())
+
+    assert "entry-1" in outcome.failed
+    assert outcome.complete is False
+
+
+def test_cancel_open_orders_accepts_mixed_case_pending_cancel_status() -> None:
+    client = _FakeTradingClient(
+        orders=[_FakeOrder("entry-1", "AAPL", "buy")], cancel_settles=False
+    )
+    original = client.cancel_order_by_id
+
+    def cancel(order_id: str) -> None:
+        original(order_id)
+        client.orders[0].status = " Pending_Cancel "
+
+    client.cancel_order_by_id = cancel  # type: ignore[method-assign]
+
+    outcome = asyncio.run(_adapter(client).cancel_open_orders())
+
+    assert outcome.failed == ()
+
+
+def test_cancel_open_orders_accepts_dotted_enum_render_of_pending_cancel() -> None:
+    # An enum-like status without ``.value`` renders as ``orderstatus.pending_cancel``.
+    client = _FakeTradingClient(
+        orders=[_FakeOrder("entry-1", "AAPL", "buy")], cancel_settles=False
+    )
+    original = client.cancel_order_by_id
+
+    def cancel(order_id: str) -> None:
+        original(order_id)
+        client.orders[0].status = "OrderStatus.PENDING_CANCEL"
+
+    client.cancel_order_by_id = cancel  # type: ignore[method-assign]
+
+    outcome = asyncio.run(_adapter(client).cancel_open_orders())
+
+    assert outcome.failed == ()
+
+
 def test_cancel_open_orders_leaves_attached_sl_tp_alone() -> None:
     client = _FakeTradingClient(
         orders=[

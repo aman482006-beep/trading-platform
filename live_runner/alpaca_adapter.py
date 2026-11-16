@@ -189,9 +189,14 @@ def _order_legs(order: Any) -> list[Any]:
     return list(legs) if isinstance(legs, (list, tuple)) else []
 
 
+def _enum_text(raw: Any) -> str:
+    """Lower-case text of an alpaca-py enum or plain string, without any ``Enum.`` prefix."""
+    text = str(getattr(raw, "value", raw) or "").strip().lower()
+    return text.rsplit(".", 1)[-1]
+
+
 def _order_status(order: Any) -> str:
-    raw = _order_attr(order, "status", "")
-    return str(getattr(raw, "value", raw) or "").strip().lower()
+    return _enum_text(_order_attr(order, "status", ""))
 
 
 def _order_symbol(order: Any) -> str:
@@ -200,9 +205,7 @@ def _order_symbol(order: Any) -> str:
 
 def _order_side(order: Any) -> str:
     """The order's side as ``buy``/``sell``, whether it arrives as an enum or a string."""
-    raw = _order_attr(order, "side", "")
-    text = str(getattr(raw, "value", raw) or "").strip().lower()
-    return text.rsplit(".", 1)[-1]
+    return _enum_text(_order_attr(order, "side", ""))
 
 
 def _alpaca_timeframe(value: str):
@@ -356,7 +359,7 @@ def _known_commission(order: Any) -> float | None:
     zero, NULL for everything else.
     """
     raw = _order_attr(order, "asset_class", None)
-    asset_class = str(getattr(raw, "value", raw) or "").strip().lower().rsplit(".", 1)[-1]
+    asset_class = _enum_text(raw)
     return 0.0 if asset_class == "us_equity" else None
 
 
@@ -1724,10 +1727,13 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 failed=tuple(failed) + (f"verify:{exc}",),
             )
         # Alpaca keeps listing a cancel it accepted as ``pending_cancel`` until the
-        # cancel settles. That is the broker confirming our request, not a dropped
-        # cancel, so it must not be reported as a failure. Only ids this sweep
-        # cancelled count; an order that was never ours to cancel and sits in
-        # ``pending_cancel`` is not vouched for.
+        # cancel settles, so that status on an id this sweep cancelled without error
+        # is treated as an accepted request, not a dropped cancel. It is NOT proof
+        # the order can no longer fill: a pending_cancel order may still execute in
+        # a cancel/fill race. The STOPPED path tolerates that because the flatten
+        # and the orphan sweep that follow re-read the book and act on whatever is
+        # still there. Only ids this sweep cancelled count; an order that was never
+        # ours to cancel and sits in ``pending_cancel`` is not vouched for.
         still_working = {
             _control_order_id(_order_attr(order, "id"))
             for order in remaining
