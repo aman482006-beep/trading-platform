@@ -479,6 +479,20 @@ def test_conflict_query_applies_limit_and_newest_first_before_truncating(
     save_live_signal(
         _make_live_signal_at(base.replace(day=20), discord_message_id="q-clean")
     )
+    # An even newer signal carrying an empty ledger list is not a conflict either.
+    empty_list_id, _ = save_live_signal(
+        _make_live_signal_at(
+            base.replace(day=25), discord_message_id="q-empty", broker_order_id="BRK-A"
+        )
+    )
+    with get_session() as session:
+        empty_row = session.get(LiveSignalModel, empty_list_id)
+        empty_row.metadata_json = {
+            **empty_row.metadata_json,
+            "conflicting_broker_order_ids": [],
+        }
+        session.add(empty_row)
+        session.commit()
 
     rows = list_live_signal_broker_order_conflicts(limit=2)
     assert [row["conflicting_broker_order_ids"] for row in rows] == [["BRK-B"], ["BRK-B"]]
