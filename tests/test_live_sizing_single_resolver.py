@@ -906,9 +906,21 @@ def test_gate_rejection_is_logged_with_quote_deviation_and_rule(
     assert data["max_entry_deviation_sl_fraction"] == pytest.approx(0.25)
 
 
-def test_exit_only_orders_are_not_gated():
+def _own_ledger_of_four(monkeypatch, deployment):
+    """#142: an exit closes the deployment's own ledger quantity (here 4)."""
+    for name, value in (
+        ("get_account_net_filled_qty_by_deployment", lambda a, s: {str(deployment.id): 4.0}),
+        ("get_live_deployment_net_filled_qty", lambda d, s: 4.0),
+        ("list_live_deployment_unfilled_exit_orders", lambda d, s: []),
+        ("list_account_unfilled_exit_orders", lambda a, s, **k: []),
+    ):
+        monkeypatch.setattr(daemon, name, value, raising=False)
+
+
+def test_exit_only_orders_are_not_gated(monkeypatch):
     """Exit-only closes reduce exposure; the deviation gate is for entries."""
     deployment = _deployment()
+    _own_ledger_of_four(monkeypatch, deployment)
     adapter = _GateAdapter(
         quote_error=RuntimeError("must not be asked"),
         positions=[{"symbol": "AAPL", "qty": 4.0}],

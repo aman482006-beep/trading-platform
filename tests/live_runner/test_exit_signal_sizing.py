@@ -710,6 +710,20 @@ class _RefusingAdapter(_Adapter):
     """Refuses every order before the broker request, like a broker-side
     volume floor or Alpaca's no-position guard."""
 
+    async def get_quote(self, symbol):
+        # Entries need a fresh broker quote for the #125 deviation gate.
+        from datetime import datetime, timezone
+
+        from live_runner.base_adapter import LiveQuote
+
+        return LiveQuote(
+            bid=100.0,
+            ask=100.0,
+            timestamp=datetime.now(timezone.utc),
+            source="test",
+            timestamp_source="broker",
+        )
+
     async def submit_order(self, signal, *, qty=None):
         from live_runner.base_adapter import order_not_submitted
 
