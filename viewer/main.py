@@ -13404,19 +13404,24 @@ async def create_live_deployment_endpoint(
         signal_config_payload=signal_config_payload,
     )
 
-    deployment = LiveDeploymentConfig(
-        strategy_name=strategy_name,
-        account_id=payload.account_id,
-        symbols=symbols,
-        timeframe=payload.timeframe,
-        status="ACTIVE",
-        signal_source_type=signal_source_type,
-        signal_source_id=signal_source_id or None,
-        symbol_filter=symbol_filter,
-        signal_source=signal_source_type,
-        signal_config=signal_config_payload,
-        settings=payload.settings or {},
-    )
+    try:
+        deployment = LiveDeploymentConfig(
+            strategy_name=strategy_name,
+            account_id=payload.account_id,
+            symbols=symbols,
+            timeframe=payload.timeframe,
+            status="ACTIVE",
+            signal_source_type=signal_source_type,
+            signal_source_id=signal_source_id or None,
+            symbol_filter=symbol_filter,
+            signal_source=signal_source_type,
+            signal_config=signal_config_payload,
+            settings=payload.settings or {},
+        )
+    except ValueError as exc:
+        # Model-level config rejections (e.g. #150 trailing override) are
+        # client errors, not a 500.
+        raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
     _validate_live_deployment_route(deployment, account_payload)
     try:
         created = await asyncio.to_thread(create_live_deployment, deployment)

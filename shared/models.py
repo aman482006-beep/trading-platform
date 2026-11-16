@@ -22,9 +22,13 @@ from pathlib import Path
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, model_validator
 
 from shared.atomic_io import write_text_atomically
+from shared.trailing import validate_live_deployment_trailing_override
+
+#: Validation-context flag set when a deployment is rehydrated from the DB.
+STORED_ROW_CONTEXT = "stored_row"
 
 logger = logging.getLogger(__name__)
 
@@ -206,6 +210,29 @@ class LiveDeploymentConfig(BaseModel):
     signal_source: Literal["internal", "discord"] = "internal"
     signal_config: dict[str, Any] = Field(default_factory=dict)
     settings: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _validate_trailing_mode_override(self, info: ValidationInfo) -> "LiveDeploymentConfig":
+        # Issue #150 fail closed: the live path supports trailing mode "none"
+        # only (live trailing does not exist yet, #167). A deployment that
+        # overrides the signal-processor trailing mode to anything else is a
+        # configuration error and is rejected here — at YAML parse time and at
+        # API creation time — instead of being traded without its trailing.
+        # Deployments without the override inherit the processor's own
+        # (constructor-validated) default.
+        #
+        # Stored rows are the exception: they are rehydrated on every DB read,
+        # so a row written before/outside this check must not make the whole
+        # deployment list raise. The DB read path sets STORED_ROW_CONTEXT and
+        # the daemon refuses such signals at signal time (gates 1 and 2) and
+        # logs the row at load.
+        if isinstance(info.context, dict) and info.context.get(STORED_ROW_CONTEXT):
+            return self
+        validate_live_deployment_trailing_override(
+            self.signal_config,
+            context=f"live deployment '{self.strategy_name}'",
+        )
+        return self
 
 
 class LiveDeploymentCreateRequest(BaseModel):
