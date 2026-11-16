@@ -127,6 +127,10 @@ PARSER_TABLE: list[tuple[str, dict | None]] = [
     ("Exit long AAPL @ 100, target was 120", {
         "intent": _EXIT, "symbol": "AAPL", "entry": 100.0, "fraction": 1.0, "side": "long",
     }),
+    # A full-exit directive that also carries a size is ambiguous (trim or close?):
+    # it is rejected, never read as closing the whole position.
+    ("Exit long AAPL @ 100 30%", None),
+    ("Close AAPL @ 100 50%", None),
     # ── Partial exits: explicit fraction or percentage only ──
     ("Trim half AAPL @ 105", {
         "intent": _EXIT, "symbol": "AAPL", "entry": 105.0, "fraction": 0.5, "side": None,
