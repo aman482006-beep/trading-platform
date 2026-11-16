@@ -174,7 +174,10 @@ async def _ctrader_account_checks(
         SmokeCheck(
             "ctrader-discovery",
             bool(accounts),
-            {"accounts": len(accounts), "demo_accounts": sum(1 for account in accounts if account.is_demo)},
+            {
+                "accounts": len(accounts),
+                "demo_accounts": sum(1 for account in accounts if account.is_demo),
+            },
             "" if accounts else "No cTrader accounts discovered.",
         )
     )
@@ -1313,12 +1316,12 @@ def _stockkit_deployment_and_signal(
 ) -> tuple[Any, Any, Any]:
     from types import SimpleNamespace
 
+    from live_runner.credential_env import discord_bot_env_key, load_accounts_env_values
     from live_runner.daemon import _trade_signal_to_live_signal
+    from live_runner.service_discovery import DEFAULT_ACCOUNTS_ENV
     from live_runner.signal_sources.discord_source import _parse_trade_signal_from_message
     from live_runner.stockkit_routing import validate_stockkit_deployment_route
-    from live_runner.credential_env import discord_bot_env_key, load_accounts_env_values
-    from live_runner.service_discovery import DEFAULT_ACCOUNTS_ENV
-    from shared.models import LiveDeploymentConfig, LiveSignal
+    from shared.models import LiveDeploymentConfig
 
     message = SimpleNamespace(
         content=f"**$AAPL** is now oversold - buy signal\nPrice: ${message_price:.2f}",
