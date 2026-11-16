@@ -43,13 +43,16 @@ too. The JSON result gains `db_deployments` with `matched`, `only_in_db`, `only_
   empty;
 - two ACTIVE rows for the same `(strategy_name, account_id)` — the daemon dispatches every ACTIVE
   match, so the same strategy would submit a second order per signal;
+- a `DATABASE_URL` that points at an in-memory database, which no read-only check can inspect;
 - a missing or unreadable database.
 
 Warnings (the preflight still exits 0): a YAML deployment with no ACTIVE DB row (the daemon will
 not trade it), a YAML deployment listed twice, and any field where the DB value and the YAML
-disagree — symbols, timeframe, `signal_source` and `signal_source_id` are normalized the way the
-writers normalize them before they are compared. The DB value is what runs, so a warning means the
-daemon is about to trade something other than what the YAML says.
+disagree — `symbols`, `timeframe`, `signal_source` (the flag that routes a deployment's Discord
+signals) and `signal_source_id` (which credential it is dispatched with). Symbols and timeframes are
+normalized on both sides the way their writers normalize them, so a spelling difference is not
+reported as drift. The DB value is what runs, so a warning means the daemon is about to trade
+something other than what the YAML says.
 
 The read-only open cannot run WAL recovery. Against a WAL database left needing recovery (after an
 unclean stop) in a directory this process cannot write, the check fails with a message that says

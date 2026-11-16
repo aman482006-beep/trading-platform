@@ -62,6 +62,7 @@ def _yaml_one(signal_source: str = "internal", signal_source_id: str = "") -> Li
         signal_config={"channel_id": _DISCORD_CHANNEL} if signal_source == "discord" else {},
     )
 
+
 _ENV = {
     "ALPACA_API_KEY_ACC1": "k",
     "ALPACA_SECRET_KEY_ACC1": "s",
@@ -101,7 +102,7 @@ def _db_path(database) -> Path:
     return Path(database.DB_PATH)
 
 
-def _orphan_actives(database, *, account_id="ghost-account", id_="orphan-1") -> None:
+def _orphan_actives(database, *, account_id="ghost-account", row_id="orphan-1") -> None:
     """Insert an ACTIVE row whose account was never committed.
 
     ``create_live_deployment`` refuses an unknown account and the ``live_deployments.account_id``
@@ -118,7 +119,7 @@ def _orphan_actives(database, *, account_id="ghost-account", id_="orphan-1") -> 
             "created_at, updated_at) "
             "VALUES (?, ?, ?, ?, ?, 'ACTIVE', 'internal', 'internal', '', '[]', '{}', '{}', "
             "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
-            (id_, "orphan_strategy", account_id, '["AAPL"]', "1h"),
+            (row_id, "orphan_strategy", account_id, '["AAPL"]', "1h"),
         )
 
 
