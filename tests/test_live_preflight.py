@@ -1077,6 +1077,129 @@ def test_live_preflight_unreadable_config_crash_redacts_all_expansion_values(
     ]
 
 
+def test_live_preflight_crash_traceback_redacts_expanded_values_everywhere(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A post-parse crash whose exception text holds an expanded value must not
+    print that value to stderr, the log file, or stdout. The traceback itself
+    stays: operators need it, with the value rewritten to its ``${VAR}`` reference."""
+    import json
+
+    import live_runner.preflight as preflight
+    from shared import logging as shared_logging
+
+    monkeypatch.delenv("PREFLIGHT_TEST_SECRET_REF", raising=False)
+    config_path = _write_config(
+        tmp_path / "live_deployments.yaml",
+        """
+        accounts:
+          - id: alpaca-paper
+            broker: alpaca
+
+        deployments:
+          - strategy_name: equity_momentum
+            account_id: alpaca-paper
+            symbols: [AAPL]
+            timeframe: 1h
+            signal_source: discord
+            signal_config:
+              channel_id: "${PREFLIGHT_TEST_SECRET_REF}"
+        """,
+    )
+    accounts_env = _secret_ref_accounts_env(tmp_path)
+    log_dir = tmp_path / "logs"
+
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError(f"deployment check saw {_SECRET_REF_VALUE}")
+
+    monkeypatch.setattr(preflight, "_validate_deployments", _boom)
+    monkeypatch.setattr(shared_logging, "_loggers", {})
+    monkeypatch.setattr(shared_logging, "_console_stream_name", "stdout")
+    monkeypatch.setattr(shared_logging, "LOG_DIR", log_dir)
+    monkeypatch.setattr(preflight, "logger", shared_logging.get_logger("preflight-crash-tb"))
+
+    rc = preflight.main(["--config", str(config_path), "--accounts-env", str(accounts_env)])
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert _SECRET_REF_VALUE not in captured.out
+    assert _SECRET_REF_VALUE not in captured.err
+    # The traceback is kept, and its exception text is redacted.
+    assert "Traceback" in captured.err
+    assert "RuntimeError: deployment check saw ${PREFLIGHT_TEST_SECRET_REF}" in captured.err
+
+    log_records = [
+        json.loads(line)
+        for line in (log_dir / "preflight-crash-tb.log").read_text(encoding="utf-8").splitlines()
+    ]
+    crash_records = [r for r in log_records if r["message"].startswith("Live preflight crashed")]
+    assert len(crash_records) == 1
+    assert crash_records[0]["level"] == "ERROR"
+    assert "Traceback" in crash_records[0]["message"]
+    assert "RuntimeError: deployment check saw ${PREFLIGHT_TEST_SECRET_REF}" in (
+        crash_records[0]["message"]
+    )
+    assert _SECRET_REF_VALUE not in json.dumps(log_records)
+
+    document = json.loads(captured.out)
+    assert document["deployment_errors"] == [
+        "RuntimeError: deployment check saw ${PREFLIGHT_TEST_SECRET_REF}"
+    ]
+
+
+def test_live_preflight_ctrader_invalid_demo_value_is_redacted(tmp_path: Path) -> None:
+    """CTRADER_DEMO is parsed as a boolean; a mistyped secret in it must not be
+    echoed by the boolean error into the account's errors."""
+    secret_demo_value = "sk-live-9f8e7d6c"
+    accounts_env = tmp_path / ".accounts.env"
+    accounts_env.write_text(
+        "CTRADER_APP_ID=app-id-1\n"
+        "CTRADER_APP_SECRET=app-secret-1\n"
+        "CTRADER_ACCESS_TOKEN=access-token-1\n"
+        f"CTRADER_DEMO={secret_demo_value}\n",
+        encoding="utf-8",
+    )
+    config_path = _write_config(
+        tmp_path / "live_deployments.yaml",
+        """
+        accounts:
+          - id: "10105152"
+            broker: ctrader
+
+        deployments:
+          - strategy_name: fx_breakout
+            account_id: "10105152"
+            symbols: [EURUSD]
+            timeframe: 15m
+        """,
+    )
+
+    result = run_live_preflight(config_path, accounts_env_path=accounts_env)
+
+    account_errors = result.accounts[0].errors
+    assert result.ok is False
+    assert len(account_errors) == 1
+    assert "Invalid boolean value for CTRADER_DEMO" in account_errors[0]
+    assert secret_demo_value not in account_errors[0]
+    assert "'${CTRADER_DEMO}'" in account_errors[0]
+
+
+def test_redact_values_matches_a_value_in_its_repr_escaped_form() -> None:
+    """Exception text often quotes a value with ``!r``; a backslash or quote in
+    the value is then escaped, so the raw value alone would not match."""
+    from live_runner.preflight import _redact_values
+
+    value = "tok\\en-'quoted'-secret"
+    message = f"Invalid value: {value!r}. Raw: {value}"
+
+    reference = "${TOKEN}"
+    assert _redact_values(message, {"TOKEN": value}) == (
+        f"Invalid value: {reference!r}. Raw: {reference}"
+    )
+
+
 # ─── stdout is exactly one JSON document (#184 finding 8) ───────────────────────
 
 
