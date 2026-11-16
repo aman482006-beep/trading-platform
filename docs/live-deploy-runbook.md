@@ -43,9 +43,11 @@ uv run python scripts/live_smoke.py --mode alpaca --accounts-env .accounts.env -
 uv run python scripts/live_smoke.py --mode ctrader --accounts-env .accounts.env --reports-dir docs/reports
 ```
 
-The cTrader smoke order is anchored at a live price (the close of the latest M1 trendbar) with a
-real stop-loss and take-profit 0.5 % away. It fails with a clear message when the market is closed
-(no M1 bar in the last 30 minutes) rather than building an order on an invented price.
+Both cTrader smoke order paths - the order worker (`--mode ctrader-order-worker`) and the
+strategy-e2e worker (`--mode ctrader-e2e-worker`) - anchor on a live price (the close of the latest
+M1 trendbar) with a real stop-loss and take-profit 0.5 % away. Each fails with a clear message when
+the market is closed (no M1 bar in the last 30 minutes) rather than building an order on an
+invented price.
 
 ## Demo Daemon
 
