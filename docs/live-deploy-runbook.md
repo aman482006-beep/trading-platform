@@ -33,6 +33,8 @@ uv run python -m live_runner.preflight --config live_deployments.yaml --accounts
 uv run python scripts/live_smoke.py --mode discord-replay --reports-dir docs/reports
 ```
 
+The preflight prints exactly one JSON document on stdout (parseable with `jq`); its log lines go to stderr.
+
 `${VAR}` references in the deployment file expand here with the precedence every
 other live_runner component resolves configuration with: a key defined in
 `--accounts-env` wins - and a key present there but empty stays empty, so
@@ -62,6 +64,16 @@ For cTrader smoke, verify the configured cTrader credentials are demo credential
 uv run python scripts/live_smoke.py --mode alpaca --accounts-env .accounts.env --reports-dir docs/reports
 uv run python scripts/live_smoke.py --mode ctrader --accounts-env .accounts.env --reports-dir docs/reports
 ```
+
+Both cTrader smoke order paths - the order worker (`--mode ctrader-order-worker`) and the
+strategy-e2e worker (`--mode ctrader-e2e-worker`) - anchor on a live price (the close of the latest
+M1 trendbar) with a real stop-loss and take-profit 0.5 % away. Each fails with a clear message when
+the market is closed (no M1 bar in the last 30 minutes) rather than building an order on an
+invented price.
+
+The cTrader smoke registers the demo account in `live_accounts` if it is not there yet (a fresh
+database), because its parent deployment row has a foreign key to it. An account that already
+exists is left untouched.
 
 ## Demo Daemon
 
