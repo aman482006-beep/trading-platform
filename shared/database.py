@@ -610,6 +610,16 @@ class LiveSignalModel(SQLModel, table=True):
         discord_msg_id = _normalize_optional_id(signal.metadata.get("discord_message_id"))
         broker_order_id = _normalize_optional_id(signal.metadata.get("broker_order_id")) or ""
         idempotency_key = _normalize_optional_id(signal.metadata.get("idempotency_key"))
+        metadata = dict(signal.metadata)
+        if BROKER_ORDER_CONFLICTS_KEY in metadata:
+            # The conflict ledger is the only writer of this key; a producer must not be able
+            # to pre-seed or forge the list of untracked broker orders.
+            logger.warning(
+                "Dropping producer-supplied %s from live signal metadata (signal_id=%s)",
+                BROKER_ORDER_CONFLICTS_KEY,
+                signal.id,
+            )
+            del metadata[BROKER_ORDER_CONFLICTS_KEY]
 
         return cls(
             id=str(signal.id),
@@ -626,7 +636,7 @@ class LiveSignalModel(SQLModel, table=True):
             broker_order_id=broker_order_id or "",
             discord_message_id=discord_msg_id,
             idempotency_key=idempotency_key,
-            metadata_json=signal.metadata,
+            metadata_json=metadata,
         )
 
     def to_live_signal(self) -> LiveSignal:
@@ -2376,7 +2386,23 @@ def _find_existing_live_signal_by_idempotency_key(
 
 
 # metadata_json key holding broker order ids that conflicted with a signal's tracked id.
+# Reserved for the conflict ledger: producer-supplied values under this key are dropped.
 BROKER_ORDER_CONFLICTS_KEY = "conflicting_broker_order_ids"
+
+
+def _conflicting_broker_order_ids(metadata: Mapping[str, Any]) -> list[str]:
+    """Return the recorded conflicting ids, tolerating any malformed stored shape."""
+    raw = metadata.get(BROKER_ORDER_CONFLICTS_KEY)
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        logger.warning(
+            "Ignoring malformed %s on live signal metadata (type=%s)",
+            BROKER_ORDER_CONFLICTS_KEY,
+            type(raw).__name__,
+        )
+        return []
+    return [str(item).strip() for item in raw if str(item).strip()]
 
 
 def _reconcile_existing_live_signal(
@@ -2400,18 +2426,23 @@ def _reconcile_existing_live_signal(
         )
     elif new_broker_id and existing_broker_id and new_broker_id != existing_broker_id:
         # A second, different broker order id for one logical signal: either a second broker
-        # order was placed or the ids were mapped wrongly. Either way a broker order exists
+        # order was placed or the ids were mapped wrongly. Either way a broker order may exist
         # that the ledger does not track. The stored id is kept (never overwritten), but the
         # conflicting id is persisted on the signal so operators and reconciliation can find
         # and resolve it instead of it living only in a log line (issue #126).
+        # Take the write lock before reading the list: the copy loaded earlier in this session
+        # may be stale, and a concurrent duplicate must not commit between our read and write.
+        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        session.refresh(existing)
         metadata = dict(existing.metadata_json or {})
-        conflicts = [str(item) for item in metadata.get(BROKER_ORDER_CONFLICTS_KEY) or []]
+        conflicts = _conflicting_broker_order_ids(metadata)
         if new_broker_id not in conflicts:
             conflicts.append(new_broker_id)
             metadata[BROKER_ORDER_CONFLICTS_KEY] = conflicts
             existing.metadata_json = metadata
             session.add(existing)
-            session.commit()
+        # Ends the write transaction opened above; a no-op commit when nothing changed.
+        session.commit()
         logger.error(
             "Conflicting broker_order_id for duplicate live signal: an untracked broker "
             "order may exist (signal_id=%s, tracked=%s, conflicting=%s)",
@@ -2498,6 +2529,9 @@ def save_live_signal(signal: LiveSignal) -> tuple[str, bool]:
                 "Skipping concurrent duplicate live signal (discord_message_id=%s)",
                 discord_msg_id,
             )
+            # The loser may carry a broker id the winner lacks or contradicts; record it the
+            # same way as a sequential duplicate instead of dropping it.
+            _reconcile_existing_live_signal(session, existing, record)
             return str(existing.id), False
     return record_id, True
 
@@ -3072,26 +3106,33 @@ def list_live_signal_broker_order_conflicts(limit: int = 200) -> list[dict[str, 
     should be checked against the broker's open orders and positions.
     """
     init_db()
+    # Filter and cap in SQL so the scan is bounded by the conflicted rows, not the table.
+    # json_array_length is 0 for a non-array value and NULL when the key is absent, so only
+    # signals holding a non-empty list pass the predicate.
+    conflict_count = func.json_array_length(
+        func.json_extract(LiveSignalModel.metadata_json, f"$.{BROKER_ORDER_CONFLICTS_KEY}")
+    )
     with get_session() as session:
         rows = session.exec(
-            select(LiveSignalModel).order_by(LiveSignalModel.timestamp.desc())
+            select(LiveSignalModel)
+            .where(conflict_count > 0)
+            .order_by(LiveSignalModel.timestamp.desc())
+            .limit(max(1, int(limit)))
         ).all()
-        conflicts: list[dict[str, Any]] = []
-        for row in rows:
-            ids = (row.metadata_json or {}).get(BROKER_ORDER_CONFLICTS_KEY) or []
-            if not ids:
-                continue
-            conflicts.append(
-                {
-                    "signal_id": str(row.id),
-                    "deployment_id": str(row.deployment_id),
-                    "symbol": row.symbol,
-                    "broker_order_id": row.broker_order_id,
-                    "conflicting_broker_order_ids": [str(item) for item in ids],
-                }
-            )
-            if len(conflicts) >= max(1, int(limit)):
-                break
+    conflicts: list[dict[str, Any]] = []
+    for row in rows:
+        ids = _conflicting_broker_order_ids(row.metadata_json or {})
+        if not ids:
+            continue
+        conflicts.append(
+            {
+                "signal_id": str(row.id),
+                "deployment_id": str(row.deployment_id),
+                "symbol": row.symbol,
+                "broker_order_id": row.broker_order_id,
+                "conflicting_broker_order_ids": ids,
+            }
+        )
     return conflicts
 
 
