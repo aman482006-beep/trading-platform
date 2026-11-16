@@ -635,10 +635,11 @@ class SignalReplayAdapter:
            next bar: inside the TP1 bar the order of the touches is unknown,
            the same rule the ``percent`` trail follows.
         3. Close: the Supertrend of this bar (from bars up to and including
-           it) is evaluated once TP1 has happened, the TP1 bar included —
-           its close is the first close after the TP1 fill. Not ready counts
-           as neither green nor red. Waiting for green: green activates.
-           Active: red marks the exit for the next bar's open.
+           it) is evaluated once TP1 has happened — from the bar AFTER the
+           TP1 bar, never on the TP1 bar's own close: nothing that happens at
+           or inside the TP1 bar after the TP1 fill may move or trigger the
+           trail. Not ready counts as neither green nor red. Waiting for green:
+           green activates. Active: red marks the exit for the next bar's open.
         """
         flip = position.flip
         assert flip is not None
@@ -674,6 +675,12 @@ class SignalReplayAdapter:
             trade = self._take_tp1(position, bar_time, index)
             if trade is not None:
                 return trade
+            # The TP1 bar after the TP1 fill is dead for the workflow: its
+            # close is not read (no activation, no flip) and its range is not
+            # checked against the stop moved on it — the next bar's intrabar
+            # pass (point 2) is the first one that sees that stop. The
+            # Supertrend evaluation therefore starts on the bar after it.
+            return None
         elif (
             resolve_same_bar_exit(
                 direction=position.direction,

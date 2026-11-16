@@ -289,16 +289,61 @@ def test_red_while_waiting_for_green_does_not_exit(monkeypatch) -> None:
     assert trade.meta["supertrend_flip"]["activation_time"] is None
 
 
-def test_the_tp1_bar_close_can_activate(monkeypatch) -> None:
-    """The TP1 bar's close is the first close after the TP1 fill."""
-    frame = _frame([ENTRY_BAR, TP1_BAR, _flat(), (101.0, 101.2, 100.5, 101.0)])
-    _stub_supertrend(monkeypatch, "rgrg")
+def test_the_tp1_bar_close_does_not_activate_the_trail(monkeypatch) -> None:
+    """Decided (review of #168): the trail activates from the bar AFTER the
+    TP1 bar, never on the TP1 bar's own close.
+
+    Nothing that happens at or inside the TP1 bar after the TP1 fill may move
+    or trigger the trailing stop, so the TP1 bar's Supertrend close is not
+    evaluated at all: a green close there does not arm the workflow, and a red
+    close there cannot flip it. Here bar 1 (the TP1 bar) closes green and bar 2
+    closes red — evaluating bar 1 would activate, and bar 2 would exit at bar
+    3's open.
+    """
+    frame = _frame([ENTRY_BAR, TP1_BAR, _flat(), (104.0, 105.0, 101.0, 101.5), _flat()])
+    _stub_supertrend(monkeypatch, "rgrrr")
     trade = _run(frame).trades[0]
 
-    assert trade.meta["supertrend_flip"]["activation_time"] == _times(frame, 1)
-    assert trade.exits[-1].reason == "supertrend_flip"
-    assert trade.exits[-1].time == _times(frame, 3)
-    assert trade.exits[-1].price == 101.0
+    flip = trade.meta["supertrend_flip"]
+    assert flip["tp1_time"] == _times(frame, 1)
+    assert flip["activation_time"] is None
+    assert flip["flip_bar_time"] is None
+    assert [leg.reason for leg in trade.exits] == ["tp1", "end_of_data"]
+
+
+def test_the_activation_uses_the_first_close_after_the_tp1_bar(monkeypatch) -> None:
+    """Activation (and the flip decided from it) run on the bars after TP1."""
+    # bars: 0 entry, 1 TP1 (green, never evaluated), 2 green -> activates,
+    #       3 red -> flip, 4 fill at the open
+    frame = _frame([ENTRY_BAR, TP1_BAR, _flat(), _flat(), (104.0, 105.0, 101.0, 101.5)])
+    _stub_supertrend(monkeypatch, "rggrg")
+    trade = _run(frame).trades[0]
+
+    flip = trade.meta["supertrend_flip"]
+    assert flip["tp1_time"] == _times(frame, 1)
+    assert flip["activation_time"] == _times(frame, 2)
+    assert flip["flip_bar_time"] == _times(frame, 3)
+    flip_leg = trade.exits[-1]
+    assert flip_leg.reason == "supertrend_flip"
+    assert flip_leg.time == _times(frame, 4)
+    assert flip_leg.price == 104.0
+
+
+def test_no_bar_inside_the_tp1_bar_moves_or_triggers_the_trail(monkeypatch) -> None:
+    """Both halves of the decision: the breakeven stop moved on the TP1 bar is
+    not applied to that bar, and its close is not read for the workflow."""
+    tp1_bar_dipping_below_entry_and_closing_green = (103.0, 110.5, 99.0, 108.0)
+    frame = _frame(
+        [ENTRY_BAR, tp1_bar_dipping_below_entry_and_closing_green, _flat(), _flat(), _flat()]
+    )
+    _stub_supertrend(monkeypatch, "rgrrr")
+    trade = _run(frame).trades[0]
+
+    flip = trade.meta["supertrend_flip"]
+    assert flip["tp1_time"] == _times(frame, 1)
+    assert flip["activation_time"] is None
+    assert [leg.reason for leg in trade.exits] == ["tp1", "end_of_data"]
+    assert trade.meta["final_stop_loss"] == ENTRY
 
 
 def test_first_red_right_after_activation_is_the_flip_bar(monkeypatch) -> None:
