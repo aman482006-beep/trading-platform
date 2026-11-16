@@ -435,31 +435,146 @@ def test_a_negative_login_is_refused_not_accepted():
     )
 
 
-def test_loading_ctrader_protocol_does_not_install_twisted_reactor():
-    """Discovery must not leave an epoll reactor that breaks CTraderLiveAdapter later."""
+# Reactor implementation modules that `twisted.internet.default.install()` can pick
+# at import time of `twisted.internet.reactor`: epoll on Linux, poll on other
+# POSIX, select on Windows and macOS (`default._getInstallFunction`). The cleanup
+# must not leave whichever one the platform used installed, so this list is
+# asserted directly instead of naming a single platform.
+PLATFORM_REACTOR_MODULES = (
+    "twisted.internet.epollreactor",
+    "twisted.internet.pollreactor",
+    "twisted.internet.selectreactor",
+)
+
+
+def _run_discovery_subprocess(body: str):
+    """Run ``body`` in a fresh interpreter against this checkout.
+
+    The reactor is installed as an import side effect of `twisted.internet.reactor`,
+    which only a real import reproduces, so every reactor assertion runs in its own
+    process rather than mutating this pytest session's `sys.modules`.
+    """
     import subprocess
     import sys
     import textwrap
 
-    code = textwrap.dedent(
+    modules = ", ".join(repr(name) for name in PLATFORM_REACTOR_MODULES)
+    code = textwrap.dedent(body).format(platform_reactors=modules)
+    return subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        cwd=str(Path(__file__).resolve().parents[1]),
+    )
+
+
+def test_loading_ctrader_protocol_does_not_install_twisted_reactor():
+    """Discovery must not leave a platform reactor that breaks CTraderLiveAdapter later."""
+    result = _run_discovery_subprocess(
         """
         import sys
         import live_runner.account_discovery as d
+        import twisted.internet
+
+        platform_reactors = ({platform_reactors},)
         assert "twisted.internet.reactor" not in sys.modules, "import installed reactor"
+        assert not set(sys.modules) & set(platform_reactors), "import installed a platform reactor"
+
         d._load_ctrader_protocol()
+
         assert "twisted.internet.reactor" not in sys.modules, "load installed reactor"
-        assert "twisted.internet.epollreactor" not in sys.modules
+        assert not set(sys.modules) & set(platform_reactors), "load left a platform reactor"
+        # `from twisted.internet import reactor` falls back to the package attribute when the
+        # submodule is gone, so the attribute has to go too or it still serves the reactor
+        # this fix eliminates (ctrader_adapter._ensure_asyncio_twisted_reactor reads it).
+        assert not hasattr(twisted.internet, "reactor"), "load left the package attribute"
+
         from twisted.internet import asyncioreactor
         import asyncio
         loop = asyncio.new_event_loop()
         asyncioreactor.install(loop)
+        assert "asyncioreactor" in sys.modules["twisted.internet.reactor"].__class__.__module__
         print("ok")
         """
     )
-    result = subprocess.run(
-        [sys.executable, "-c", code],
-        capture_output=True, text=True, timeout=60,
-        cwd=str(Path(__file__).resolve().parents[1]),
+    assert result.returncode == 0, result.stderr
+    assert "ok" in result.stdout
+
+
+def test_loading_ctrader_protocol_keeps_a_pre_installed_reactor():
+    """Discovery must not uninstall a reactor the process already installed.
+
+    The live adapter installs the asyncio reactor before it touches cTrader, and
+    `_ensure_asyncio_twisted_reactor` fails closed with "Unsupported Twisted
+    reactor already installed" if discovery pops that reactor: the next
+    `from twisted.internet import reactor` re-imports
+    `twisted.internet.reactor`, which reinstalls the platform default.
+    """
+    result = _run_discovery_subprocess(
+        """
+        import asyncio
+        import sys
+        import live_runner.account_discovery as d
+        from twisted.internet import asyncioreactor
+        import twisted.internet
+
+        loop = asyncio.new_event_loop()
+        asyncioreactor.install(loop)
+        installed = sys.modules["twisted.internet.reactor"]
+        assert "asyncioreactor" in installed.__class__.__module__
+
+        d._load_ctrader_protocol()
+
+        assert sys.modules["twisted.internet.reactor"] is installed, "discovery uninstalled it"
+        assert hasattr(twisted.internet, "reactor"), "discovery dropped the package attribute"
+        from twisted.internet import reactor
+        assert reactor is installed
+        assert "asyncioreactor" in reactor.__class__.__module__
+        print("ok")
+        """
+    )
+    assert result.returncode == 0, result.stderr
+    assert "ok" in result.stdout
+
+
+def test_without_installed_reactor_clears_every_platform_reactor_module():
+    """The sweep cannot name epoll: the platform reactor is chosen at import time.
+
+    Twisted installs `epollreactor` on Linux, `pollreactor` on other POSIX and
+    `selectreactor` on Windows and macOS, so hard-coding one name leaves the
+    platform reactor module behind on every other OS (AGENTS.md: portable across
+    Linux, Windows and macOS). Module entries that were already there before the
+    import, and `asyncioreactor` (whose import installs nothing and which the
+    adapter installs itself), must survive.
+    """
+    result = _run_discovery_subprocess(
+        """
+        import sys
+        from types import ModuleType
+        import live_runner.account_discovery as d
+
+        already_loaded = ModuleType("twisted.internet.selectreactor")
+        sys.modules["twisted.internet.selectreactor"] = already_loaded
+
+        with d._without_installed_reactor():
+            for name in (
+                "twisted.internet.pollreactor",
+                "twisted.internet.kqueuereactor",
+                "twisted.internet.asyncioreactor",
+            ):
+                sys.modules[name] = ModuleType(name)
+            assert "twisted.internet.pollreactor" in sys.modules, "setup failed"
+            asyncio_reactor = sys.modules["twisted.internet.asyncioreactor"]
+
+        for name in ("twisted.internet.pollreactor", "twisted.internet.kqueuereactor"):
+            assert name not in sys.modules, name + " survived the sweep"
+        kept_asyncio = sys.modules.get("twisted.internet.asyncioreactor")
+        assert kept_asyncio is asyncio_reactor, "asyncioreactor was dropped"
+        kept_loaded = sys.modules.get("twisted.internet.selectreactor")
+        assert kept_loaded is already_loaded, "a pre-existing module was dropped"
+        print("ok")
+        """
     )
     assert result.returncode == 0, result.stderr
     assert "ok" in result.stdout
