@@ -48,7 +48,10 @@ Both failure modes report instead of crashing: an accounts env file that exists
 but cannot be read logs a warning and fails the preflight with missing
 credentials, and a config parse error reports the message type and the offending
 field, never an expanded value - that value can be a credential, and
-`deployment_errors` is printed as JSON.
+`deployment_errors` is printed as JSON. Redaction covers the values of every
+accounts env file key and every process-env key the config references through
+`${VAR}`, so a secret that only lives in the process environment is reported as
+`${VAR}` too. Process-env keys the config never names are not redacted.
 
 ## Paper Broker Smoke
 
