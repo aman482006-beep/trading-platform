@@ -56,9 +56,15 @@ problem and its line and column, never the source line, which can hold a literal
 secret. Redaction covers the values of every accounts env file key and every
 process-env key the config references through `${VAR}` or `$VAR`, so a secret
 that only lives in the process environment is reported as `${VAR}` too. Process-env
-keys the config never names are not redacted. A missing or unreadable config file
-is the one case that still crashes: the JSON document names the path, and the
-traceback goes to stderr.
+keys the config never names are not redacted. The cTrader `CTRADER_DEMO` error,
+which quotes the rejected value, is redacted the same way: every accounts env file
+value is redacted there. A missing or unreadable config file is the one case that
+still crashes: the JSON document names the path, and the traceback goes to stderr
+and the log at ERROR. That traceback, like the JSON document, is redacted with
+every accounts env file value and every process-env value, because the config is
+not re-read after a crash and its references are unknown. Only the exception type
+remains in the JSON if the accounts env file cannot be resolved at all, and then
+no traceback is printed.
 
 ## Paper Broker Smoke
 
