@@ -10,8 +10,10 @@ Status: credential-gated as of 2026-07-13.
 - cTrader credentials are demo credentials if the cTrader smoke is run.
 - Trailing stops are not executed live yet (#167). A deployment whose
   `signal_config.signal_processor_config.trailing_mode` is anything other than `none` is rejected
-  when the deployment is validated, and a signal that still carries such a trailing config is
-  refused before it reaches the broker. See `shared/trailing.py` and `docs/signal_bots.md`.
+  when it is created or parsed from YAML. A stored deployment that already has such a value still
+  loads (so it stays listed and can be stopped), the daemon logs an error for it at load, and each
+  of its signals is refused before it reaches the broker. See `shared/trailing.py` and
+  `docs/signal_bots.md`.
 
 ## Provisioning and Rotation
 
