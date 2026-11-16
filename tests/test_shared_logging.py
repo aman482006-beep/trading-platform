@@ -4,6 +4,7 @@ import json
 import logging
 import re
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
@@ -176,3 +177,26 @@ def test_route_console_logs_to_stderr_moves_existing_and_new_loggers(
         consoles = [h for h in logger.handlers if getattr(h, "_trading_console", False)]
         assert len(consoles) == 1
         assert consoles[0].stream is sys.stderr
+
+
+def test_shipped_console_stream_default_is_stdout() -> None:
+    # Read the default in a fresh interpreter: other tests (and the preflight CLI
+    # via route_console_logs_to_stderr) mutate the module global in this process.
+    # The daemon and viewer rely on this default to log to stdout for journald.
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from shared import logging as shared_logging; "
+            "print(shared_logging._console_stream_name)",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+        cwd=Path(__file__).resolve().parents[1],
+    )
+
+    assert result.stdout.strip() == "stdout"
