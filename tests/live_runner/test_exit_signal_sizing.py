@@ -296,12 +296,14 @@ def _patch_ledger(
     *,
     others: dict[str, float] | None = None,
     unfilled_exits: list[dict] | None = None,
+    other_unfilled_exits: list[dict] | None = None,
 ) -> list[tuple[str, str]]:
     """Ledgers without a database.
 
     ``qty`` is this deployment's own net filled quantity, ``others`` the other
     deployments' on the same account. ``unfilled_exits`` are this deployment's
-    earlier exit orders not known to be fully filled. Returns the
+    earlier exit orders not known to be fully filled, ``other_unfilled_exits`` the
+    same for the other deployments on the account. Returns the
     ``(account_id, symbol)`` lookups of the account ledger.
     """
     import live_runner.daemon as daemon
@@ -319,11 +321,17 @@ def _patch_ledger(
     def _unfilled_exits(deployment_id: str, symbol: str) -> list[dict]:
         return list(unfilled_exits or [])
 
+    def _account_unfilled_exits(account_id: str, symbol: str, **_kwargs) -> list[dict]:
+        return list(other_unfilled_exits or [])
+
     monkeypatch.setattr(
         daemon, "get_account_net_filled_qty_by_deployment", _account_ledgers, raising=False
     )
     monkeypatch.setattr(
         daemon, "list_live_deployment_unfilled_exit_orders", _unfilled_exits, raising=False
+    )
+    monkeypatch.setattr(
+        daemon, "list_account_unfilled_exit_orders", _account_unfilled_exits, raising=False
     )
     monkeypatch.setattr(daemon, "get_live_deployment_net_filled_qty", _own_ledger, raising=False)
     return calls
@@ -1321,3 +1329,232 @@ def test_an_adapter_below_step_refusal_is_a_warning_not_an_error(monkeypatch, ca
     assert warnings[0].data["requested_qty"] == pytest.approx(0.0004)
     assert warnings[0].data["qty_step"] == pytest.approx(0.001)
     assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
+
+
+# ─── Review (#142): exits are serialised per account and symbol ──────────────
+
+
+class _WorkingOrdersAdapter(_Adapter):
+    def __init__(self, positions, working):
+        super().__init__(positions)
+        self._working = set(working)
+
+    async def working_order_ids(self):
+        return set(self._working)
+
+
+_OTHER_DEPLOYMENT_EXIT = {
+    "signal_id": "sig-other",
+    "deployment_id": _OTHER,
+    "broker_order_id": "ord-other",
+    "requested_qty": 5.0,
+    "filled_qty": 0.0,
+}
+
+
+def test_an_exit_of_another_deployment_on_the_account_blocks_this_exit(
+    monkeypatch, caplog
+) -> None:
+    """Two deployments share one netted account: while the other's exit is still
+    working, this one must not be sized against a position without its fills."""
+    deployment = _deployment(allow_short=False)
+    _patch_ledger(
+        monkeypatch, deployment, 10.0, others={_OTHER: 5.0},
+        other_unfilled_exits=[_OTHER_DEPLOYMENT_EXIT],
+    )
+    adapter = _WorkingOrdersAdapter([{"symbol": "AAPL", "qty": 15.0}], {"ord-other"})
+
+    with caplog.at_level(logging.INFO):
+        _run_submit(adapter, deployment, _exit_trade_signal())
+
+    assert adapter.submitted == []
+    refusals = _records_at(caplog, logging.WARNING, "previous exit")
+    assert refusals, [record.getMessage() for record in caplog.records]
+    reason = refusals[0].data["reason"]
+    assert "ord-other" in reason
+    assert _OTHER in reason
+    assert deployment.account_id in reason
+    assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
+
+
+def test_the_other_deployments_exit_is_found_by_its_client_order_id_too(monkeypatch) -> None:
+    deployment = _deployment(allow_short=False)
+    row = {**_OTHER_DEPLOYMENT_EXIT, "broker_order_id": ""}
+    _patch_ledger(monkeypatch, deployment, 10.0, other_unfilled_exits=[row])
+    adapter = _WorkingOrdersAdapter([{"symbol": "AAPL", "qty": 15.0}], {"sig-other"})
+
+    _run_submit(adapter, deployment, _exit_trade_signal())
+
+    assert adapter.submitted == []
+
+
+def test_once_the_other_deployments_exit_is_done_this_exit_is_capped_to_the_fresh_broker_qty(
+    monkeypatch, caplog
+) -> None:
+    """The other exit is no longer working: this one goes ahead, sized against
+    the broker position read now (its ledger says 10, the broker holds 4)."""
+    deployment = _deployment(allow_short=False)
+    _patch_ledger(
+        monkeypatch, deployment, 10.0, others={_OTHER: 0.0},
+        other_unfilled_exits=[_OTHER_DEPLOYMENT_EXIT],
+    )
+    adapter = _WorkingOrdersAdapter([{"symbol": "AAPL", "qty": 4.0}], set())
+
+    with caplog.at_level(logging.INFO):
+        _run_submit(adapter, deployment, _exit_trade_signal())
+
+    assert len(adapter.submitted) == 1
+    assert adapter.submitted[0][1] == pytest.approx(4.0)
+    assert not _records_at(caplog, logging.WARNING, "previous exit")
+
+
+def test_the_guard_asks_for_the_account_but_not_for_this_deployment(monkeypatch) -> None:
+    import live_runner.daemon as daemon
+
+    deployment = _deployment(allow_short=False)
+    _patch_ledger(monkeypatch, deployment, 10.0)
+    seen: list[tuple] = []
+
+    def _account_unfilled(account_id, symbol, **kwargs):
+        seen.append((account_id, symbol, kwargs))
+        return []
+
+    monkeypatch.setattr(daemon, "list_account_unfilled_exit_orders", _account_unfilled)
+    _run_submit(_Adapter([{"symbol": "AAPL", "qty": 10.0}]), deployment, _exit_trade_signal())
+
+    assert seen == [
+        (deployment.account_id, "AAPL", {"exclude_deployment_id": str(deployment.id)})
+    ]
+
+
+def test_concurrent_exits_of_two_deployments_are_sized_one_after_the_other(
+    monkeypatch,
+) -> None:
+    """Both are dispatched at once. The second must not read the broker position
+    until the first has submitted, and is then sized against the fresh position."""
+    import live_runner.daemon as daemon
+
+    first, second = _deployment(allow_short=False), _deployment(allow_short=False)
+    _patch_ledger(monkeypatch, first, 10.0, others={str(second.id): 10.0})
+    events: list[str] = []
+
+    class _NettedAdapter(_Adapter):
+        def __init__(self):
+            super().__init__([{"symbol": "AAPL", "qty": 20.0}])
+            self.release_first = asyncio.Event()
+
+        async def get_positions(self):
+            events.append("positions")
+            return list(self.positions)
+
+        async def submit_order(self, signal, *, qty=None):
+            events.append(f"submit-start:{qty}")
+            if len(self.submitted) == 0:
+                self.submitted.append((signal, qty))
+                await self.release_first.wait()
+            else:
+                self.submitted.append((signal, qty))
+            self.positions = [{"symbol": "AAPL", "qty": 20.0 - sum(q for _, q in self.submitted)}]
+            events.append("submit-end")
+            return f"order-{len(self.submitted)}"
+
+    adapter = _NettedAdapter()
+
+    async def _no_wait(_signal, _timeframe):
+        return None
+
+    monkeypatch.setattr(daemon, "wait_for_candle_close", _no_wait)
+    monkeypatch.setattr(daemon, "_deployment_is_currently_active", lambda _d: True)
+    monkeypatch.setattr(daemon, "claim_live_deployment_submission", lambda *_a, **_k: True)
+    monkeypatch.setattr(daemon, "release_live_deployment_submission", lambda *_a, **_k: True)
+
+    async def _both() -> None:
+        tasks = [
+            asyncio.create_task(
+                daemon._submit_normalized_discord_signal(
+                    deployment.account_id,
+                    adapter,
+                    deployment,
+                    _exit_trade_signal(),
+                    signal_timeframe="1h",
+                    wait_enabled=False,
+                )
+            )
+            for deployment in (first, second)
+        ]
+        # The preparation runs partly in worker threads: wait for the first to
+        # reach the broker, then give the second ample time to (wrongly) follow.
+        for _ in range(500):
+            if any(event.startswith("submit-start") for event in events):
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.2)
+        # The first is parked inside submit_order; the second has not even
+        # looked at the broker position.
+        assert events == ["positions", "submit-start:10.0"]
+        adapter.release_first.set()
+        await asyncio.gather(*tasks)
+
+    asyncio.run(_both())
+
+    assert events == [
+        "positions", "submit-start:10.0", "submit-end",
+        "positions", "submit-start:10.0", "submit-end",
+    ]
+
+
+def test_account_unfilled_exits_span_deployments_of_the_account_only(isolated_db) -> None:
+    from tests.conftest import seed_live_deployments
+
+    database, _engine, _data_dir = isolated_db
+    mine, sibling, stranger = (str(uuid.uuid4()) for _ in range(3))
+    seed_live_deployments(database, [mine, sibling], account_id="shared-acc")
+    seed_live_deployments(database, [stranger], account_id="other-acc")
+
+    own = _save_exit_signal(database, deployment_id=mine, symbol="AAPL", qty=5.0, filled=0.0)
+    siblings = _save_exit_signal(
+        database, deployment_id=sibling, symbol="aapl", qty=5.0, filled=1.0, broker_order_id="o2"
+    )
+    _save_exit_signal(database, deployment_id=sibling, symbol="AAPL", qty=5.0, filled=5.0)
+    _save_exit_signal(database, deployment_id=sibling, symbol="MSFT", qty=5.0, filled=0.0)
+    _save_exit_signal(database, deployment_id=stranger, symbol="AAPL", qty=5.0, filled=0.0)
+
+    everyone = database.list_account_unfilled_exit_orders("shared-acc", "AAPL")
+    assert {row["signal_id"] for row in everyone} == {own, siblings}
+    by_id = {row["signal_id"]: row for row in everyone}
+    assert by_id[siblings]["deployment_id"] == sibling
+    assert by_id[siblings]["broker_order_id"] == "o2"
+    assert by_id[siblings]["filled_qty"] == pytest.approx(1.0)
+
+    others = database.list_account_unfilled_exit_orders(
+        "shared-acc", "AAPL", exclude_deployment_id=mine
+    )
+    assert [row["signal_id"] for row in others] == [siblings]
+    with pytest.raises(ValueError):
+        database.list_account_unfilled_exit_orders("", "AAPL")
+
+
+# ─── Review (#142): unreadable ledger actions fail closed ────────────────────
+
+
+def test_ledgers_refuse_a_filled_signal_with_an_unknown_action(isolated_db) -> None:
+    from tests.conftest import seed_live_deployments
+
+    database, _engine, _data_dir = isolated_db
+    deployment_id = str(uuid.uuid4())
+    seed_live_deployments(database, [deployment_id], account_id="acc-unknown")
+    _save_signal_with_fill(
+        database, deployment_id=deployment_id, symbol="AAPL", action="buy", qty=3.0
+    )
+    # The model's column is an unconstrained string, so a row can hold any action
+    # (an older writer, a manual fix) even though LiveSignal itself cannot.
+    with database.get_session() as session:
+        for row in session.exec(database.select(database.LiveSignalModel)).all():
+            row.action = "short"
+            session.add(row)
+        session.commit()
+
+    with pytest.raises(ValueError, match="no known position sign"):
+        database.get_live_deployment_net_filled_qty(deployment_id, "AAPL")
+    with pytest.raises(ValueError, match="no known position sign"):
+        database.get_account_net_filled_qty_by_deployment("acc-unknown", "AAPL")

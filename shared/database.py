@@ -3103,40 +3103,88 @@ def list_live_deployment_unfilled_exit_orders(
     is still *working* is the broker's to say - a cancelled or rejected one is
     listed here as well (#121).
 
-    Each row: ``signal_id``, ``broker_order_id`` (may be empty), ``requested_qty``
-    (``None`` when unreadable) and ``filled_qty``.
+    Each row: ``signal_id``, ``deployment_id``, ``broker_order_id`` (may be
+    empty), ``requested_qty`` (``None`` when unreadable) and ``filled_qty``.
     """
     normalized_deployment_id = str(deployment_id or "").strip()
     normalized_symbol = str(symbol or "").strip().upper()
     if not normalized_deployment_id or not normalized_symbol:
         raise ValueError("A deployment id and a symbol are required for pending exits")
+    return _list_unfilled_exit_orders(
+        normalized_symbol, deployment_id=normalized_deployment_id
+    )
+
+
+def list_account_unfilled_exit_orders(
+    account_id: str, symbol: str, *, exclude_deployment_id: str | None = None
+) -> list[dict[str, Any]]:
+    """Exit orders for ``symbol`` of every deployment on one account not known to be filled.
+
+    Same rows and meaning as :func:`list_live_deployment_unfilled_exit_orders`,
+    across all deployments whose ``account_id`` is ``account_id`` (whatever their
+    status), optionally leaving out one deployment. Deployments on one account
+    share a netted broker position, so an exit of one is in flight for all of
+    them (#121).
+    """
+    normalized_account_id = str(account_id or "").strip()
+    normalized_symbol = str(symbol or "").strip().upper()
+    if not normalized_account_id or not normalized_symbol:
+        raise ValueError("An account id and a symbol are required for pending exits")
+    return _list_unfilled_exit_orders(
+        normalized_symbol,
+        account_id=normalized_account_id,
+        exclude_deployment_id=str(exclude_deployment_id or "").strip() or None,
+    )
+
+
+def _list_unfilled_exit_orders(
+    normalized_symbol: str,
+    *,
+    deployment_id: str | None = None,
+    account_id: str | None = None,
+    exclude_deployment_id: str | None = None,
+) -> list[dict[str, Any]]:
     init_db()
     with get_session() as session:
         # Two queries rather than one grouped join: grouping by a JSON column is
         # not portable across database dialects.
-        signals = session.exec(
+        signal_query = (
             select(
                 LiveSignalModel.id,
+                LiveSignalModel.deployment_id,
                 LiveSignalModel.broker_order_id,
                 LiveSignalModel.metadata_json,
             )
-            .where(LiveSignalModel.deployment_id == normalized_deployment_id)
             .where(func.upper(LiveSignalModel.symbol) == normalized_symbol)
-        ).all()
-        fills = dict(
-            session.exec(
-                select(
-                    LiveExecutionModel.signal_id,
-                    func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0),
-                )
-                .join(LiveSignalModel, LiveExecutionModel.signal_id == LiveSignalModel.id)
-                .where(LiveSignalModel.deployment_id == normalized_deployment_id)
-                .where(func.upper(LiveSignalModel.symbol) == normalized_symbol)
-                .group_by(LiveExecutionModel.signal_id)
-            ).all()
         )
+        fill_query = (
+            select(
+                LiveExecutionModel.signal_id,
+                func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0),
+            )
+            .join(LiveSignalModel, LiveExecutionModel.signal_id == LiveSignalModel.id)
+            .where(func.upper(LiveSignalModel.symbol) == normalized_symbol)
+            .group_by(LiveExecutionModel.signal_id)
+        )
+        if deployment_id is not None:
+            signal_query = signal_query.where(LiveSignalModel.deployment_id == deployment_id)
+            fill_query = fill_query.where(LiveSignalModel.deployment_id == deployment_id)
+        if account_id is not None:
+            signal_query = signal_query.join(
+                LiveDeploymentModel, LiveDeploymentModel.id == LiveSignalModel.deployment_id
+            ).where(LiveDeploymentModel.account_id == account_id)
+            fill_query = fill_query.join(
+                LiveDeploymentModel, LiveDeploymentModel.id == LiveSignalModel.deployment_id
+            ).where(LiveDeploymentModel.account_id == account_id)
+        if exclude_deployment_id is not None:
+            signal_query = signal_query.where(
+                LiveSignalModel.deployment_id != exclude_deployment_id
+            )
+            fill_query = fill_query.where(LiveSignalModel.deployment_id != exclude_deployment_id)
+        signals = session.exec(signal_query).all()
+        fills = dict(session.exec(fill_query).all())
     pending: list[dict[str, Any]] = []
-    for signal_id, broker_order_id, metadata in signals:
+    for signal_id, signal_deployment_id, broker_order_id, metadata in signals:
         metadata = metadata if isinstance(metadata, dict) else {}
         # Same value as live_runner.base_adapter.EXIT_ONLY_RISK_SIZING_MODE.
         if str(metadata.get("risk_sizing_mode") or "") != "exit_only":
@@ -3154,6 +3202,7 @@ def list_live_deployment_unfilled_exit_orders(
         pending.append(
             {
                 "signal_id": str(signal_id),
+                "deployment_id": str(signal_deployment_id),
                 "broker_order_id": str(broker_order_id or ""),
                 "requested_qty": requested_qty,
                 "filled_qty": filled_qty,

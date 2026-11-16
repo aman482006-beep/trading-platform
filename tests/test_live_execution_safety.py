@@ -827,6 +827,12 @@ def _patch_exit_ledger(monkeypatch, deployment: LiveDeploymentConfig, qty: float
     )
     monkeypatch.setattr(
         daemon,
+        "list_account_unfilled_exit_orders",
+        lambda _account_id, _symbol, **_kwargs: [],
+        raising=False,
+    )
+    monkeypatch.setattr(
+        daemon,
         "get_live_deployment_net_filled_qty",
         lambda _deployment_id, _symbol: qty,
         raising=False,

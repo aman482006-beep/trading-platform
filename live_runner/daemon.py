@@ -8,9 +8,11 @@ import math
 import os
 import re
 import uuid
+import weakref
 from collections.abc import Iterable, Mapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
@@ -79,6 +81,7 @@ from shared.database import (
     get_live_account,
     get_live_deployment,
     get_service,
+    list_account_unfilled_exit_orders,
     list_live_accounts,
     list_live_deployment_unfilled_exit_orders,
     list_live_deployments,
@@ -945,24 +948,31 @@ def _log_exit_below_step(
 async def _ensure_no_exit_in_flight(
     adapter: BaseLiveAdapter, deployment: LiveDeploymentConfig, symbol: str
 ) -> None:
-    """Refuse while an earlier exit of this deployment and symbol may be working.
+    """Refuse while an earlier exit on this account and symbol may be working.
 
-    Earlier exits whose persisted fills cover what they asked for are done. Any
-    other one is checked against the broker's working orders, by broker order id
-    or by client order id (the signal id; the broker id can be missing when the
-    response was lost). An adapter that cannot list its working orders cannot
-    prove the earlier exit is over, so that refuses too. Raises
-    :class:`ExitInFlightError`.
+    Deployments on one account share a netted broker position, so an exit of any
+    of them (not only this deployment's) changes what another may close: an exit
+    sized while another's is still working would be capped against a position
+    that does not yet reflect it. Earlier exits whose persisted fills cover what
+    they asked for are done. Any other one is checked against the broker's
+    working orders, by broker order id or by client order id (the signal id; the
+    broker id can be missing when the response was lost). An adapter that cannot
+    list its working orders cannot prove the earlier exit is over, so that
+    refuses too. Raises :class:`ExitInFlightError`.
     """
-    pending = await asyncio.to_thread(
+    own = await asyncio.to_thread(
         list_live_deployment_unfilled_exit_orders, str(deployment.id), symbol
     )
+    others = await asyncio.to_thread(
+        _list_other_deployments_unfilled_exits, deployment, symbol
+    )
+    pending = [*own, *others]
     if not pending:
         return
     working_order_ids = getattr(adapter, "working_order_ids", None)
     if not callable(working_order_ids):
         raise ExitInFlightError(
-            f"Refusing exit for {symbol}: a previous exit of this deployment is not "
+            f"Refusing exit for {symbol}: a previous exit on this account is not "
             "known to be finished and this broker adapter cannot list its working "
             "orders to prove it."
         )
@@ -970,7 +980,7 @@ async def _ensure_no_exit_in_flight(
         working = {str(order_id) for order_id in await working_order_ids()}
     except Exception as exc:
         raise ExitInFlightError(
-            f"Refusing exit for {symbol}: a previous exit of this deployment is not "
+            f"Refusing exit for {symbol}: a previous exit on this account is not "
             f"known to be finished and the broker's working orders could not be read "
             f"({exc})."
         ) from exc
@@ -983,13 +993,46 @@ async def _ensure_no_exit_in_flight(
     if blocking:
         described = ", ".join(
             f"signal {row.get('signal_id')} / order {row.get('broker_order_id') or '?'}"
+            + (
+                ""
+                if str(row.get("deployment_id") or deployment.id) == str(deployment.id)
+                else f" of deployment {row.get('deployment_id')}"
+            )
             for row in blocking
         )
         raise ExitInFlightError(
-            f"Refusing exit for {symbol}: a previous exit of this deployment is still "
-            f"working at the broker ({described}); the ledger does not include its "
-            "fills yet."
+            f"Refusing exit for {symbol}: a previous exit of this deployment or of "
+            f"another deployment on account {deployment.account_id} is still "
+            f"working at the broker ({described}); the ledger and the broker "
+            "position do not include its fills yet."
         )
+
+
+def _list_other_deployments_unfilled_exits(
+    deployment: LiveDeploymentConfig, symbol: str
+) -> list[dict[str, Any]]:
+    return list_account_unfilled_exit_orders(
+        deployment.account_id, symbol, exclude_deployment_id=str(deployment.id)
+    )
+
+
+#: Exits being prepared and submitted, per running event loop, account and symbol.
+_EXIT_LOCKS: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, dict[tuple[str, str], asyncio.Lock]
+] = weakref.WeakKeyDictionary()
+
+
+def _exit_lock(account_id: str, symbol: str) -> asyncio.Lock:
+    """The lock serialising exits of every deployment on one account and symbol.
+
+    Held from sizing through submission (which persists the signal), so a second
+    exit cannot size or pass :func:`_ensure_no_exit_in_flight` in the window where
+    the first has read the broker position but not yet persisted its order. The
+    in-flight guard covers what is already persisted; this covers dispatchers of
+    this process racing before that.
+    """
+    locks = _EXIT_LOCKS.setdefault(asyncio.get_running_loop(), {})
+    return locks.setdefault((str(account_id), str(symbol).upper()), asyncio.Lock())
 
 
 def _alert_ledger_mismatch(
@@ -1923,7 +1966,28 @@ async def _submit_normalized_discord_signal(
         return
 
     is_exit = is_exit_order(live_signal.action, live_signal.metadata)
+    if is_exit:
+        # Exits of every deployment on this account and symbol go one after the
+        # other, from sizing to the persisted order (see ``_exit_lock``).
+        async with _exit_lock(account_id, live_signal.symbol):
+            await _prepare_claim_and_submit_signal(
+                account_id, adapter, deployment, normalized_signal, live_signal, is_exit=True
+            )
+        return
+    await _prepare_claim_and_submit_signal(
+        account_id, adapter, deployment, normalized_signal, live_signal, is_exit=False
+    )
 
+
+async def _prepare_claim_and_submit_signal(
+    account_id: str,
+    adapter: BaseLiveAdapter,
+    deployment: LiveDeploymentConfig,
+    normalized_signal: TradeSignal,
+    live_signal: LiveSignal,
+    *,
+    is_exit: bool,
+) -> None:
     # Prepare before claiming. Sizing and the fail-closed SL/TP validation run
     # here, and every failure in them happens before an order can reach the
     # broker. Claiming first (as this used to) held the lease for the whole TTL
@@ -1957,8 +2021,9 @@ async def _submit_normalized_discord_signal(
         # Not an error: the earlier exit is doing the work. The signal is not
         # queued; a later exit signal is sized once the earlier one is over.
         logger.warning(
-            "Exit signal refused: a previous exit of this deployment is still "
-            "working or cannot be shown to be finished",
+            "Exit signal refused: a previous exit of this deployment or of "
+            "another deployment on this account is still working or cannot be "
+            "shown to be finished",
             extra={
                 "data": {
                     "account_id": account_id,
@@ -2123,8 +2188,9 @@ async def _submit_normalized_discord_signal(
                 "deployment_id": str(deployment.id),
                 "signal_id": str(live_signal.id),
                 "broker_order_id": broker_order_id,
-                "symbol": live_signal.symbol,
-                "action": live_signal.action,
+                "symbol": prepared_signal.symbol,
+                "action": prepared_signal.action,
+                "exit": is_exit,
             }
         },
     )
