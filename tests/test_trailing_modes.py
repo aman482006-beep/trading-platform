@@ -23,6 +23,13 @@ from shared.trailing import (
 )
 
 
+def _prepare_order(signal: LiveSignal):
+    """Run order preparation with an adapter that must never be touched."""
+    return asyncio.run(
+        daemon.prepare_order_with_risk(_UntouchableAdapter(), _deployment(), signal)
+    )
+
+
 def _deployment(signal_config: dict | None = None) -> LiveDeploymentConfig:
     return LiveDeploymentConfig(
         strategy_name="ramjet-live",
@@ -133,6 +140,16 @@ def test_live_deployment_accepts_mode_none_and_no_override() -> None:
     assert _deployment().signal_config == {}
 
 
+def test_override_check_passes_a_processor_config_without_trailing_mode() -> None:
+    """A deployment that sets other processor keys inherits the processor default."""
+    assert (
+        validate_live_deployment_trailing_override(
+            {"signal_processor_config": {"atr_period": 14}}, context="test"
+        )
+        is None
+    )
+
+
 def test_deployment_override_check_ignores_unrelated_shapes() -> None:
     validate_live_deployment_trailing_override(None, context="test")
     validate_live_deployment_trailing_override({"signal_processor_config": "x"}, context="test")
@@ -226,9 +243,7 @@ def _live_signal(metadata: dict) -> LiveSignal:
 def test_order_preparation_refuses_trailing_before_touching_the_broker(trailing_cfg) -> None:
     signal = _live_signal({"trailing_sl_config": trailing_cfg, "stop_loss": 95.0})
     with pytest.raises(ValueError, match="not supported"):
-        asyncio.run(
-            daemon.prepare_order_with_risk(_UntouchableAdapter(), _deployment(), signal)
-        )
+        _prepare_order(signal)
 
 
 def test_order_preparation_lets_mode_none_through_to_sizing(monkeypatch) -> None:
@@ -241,9 +256,7 @@ def test_order_preparation_lets_mode_none_through_to_sizing(monkeypatch) -> None
     monkeypatch.setattr(daemon, "_broker_exposure_estimate", _exposure)
     signal = _live_signal({"trailing_sl_config": {"mode": "none"}, "stop_loss": 95.0})
     with pytest.raises(RuntimeError, match="stop after the gate"):
-        asyncio.run(
-            daemon.prepare_order_with_risk(_UntouchableAdapter(), _deployment(), signal)
-        )
+        _prepare_order(signal)
     assert reached.sizing
 
 

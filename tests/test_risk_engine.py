@@ -585,14 +585,16 @@ class TestIssueC1FallbackGuards:
         """
         signal = self._signal(trailing_sl_config={"mode": "supertrend_flip"})
         signal.stop_loss = 98.0
+        engine = self._engine()
         with pytest.raises(ValueError, match="supertrend_flip"):
-            self._engine().apply_trailing_stop(signal, market_price=101.0)
+            engine.apply_trailing_stop(signal, market_price=101.0)
 
     def test_unknown_trailing_mode_rejected(self) -> None:
         signal = self._signal(trailing_sl_config={"mode": "martingale_trail"})
         signal.stop_loss = 98.0
+        engine = self._engine()
         with pytest.raises(ValueError, match="Unknown trailing stop mode"):
-            self._engine().apply_trailing_stop(signal, market_price=101.0)
+            engine.apply_trailing_stop(signal, market_price=101.0)
 
     def test_none_trailing_mode_keeps_initial_stop(self) -> None:
         """#150: mode 'none' means initial stop only — no trailing, no error."""
