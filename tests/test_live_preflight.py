@@ -433,6 +433,9 @@ def test_preflight_cli_emits_json_document_even_when_config_cannot_load(
     accounts_env.write_text("", encoding="utf-8")
 
     monkeypatch.setattr(shared_logging, "_loggers", {})
+    # main() switches the module-global console stream to stderr; restore it after
+    # the test so later loggers on this worker keep the shipped stdout default.
+    monkeypatch.setattr(shared_logging, "_console_stream_name", "stdout")
     monkeypatch.setattr(shared_logging, "LOG_DIR", tmp_path / "logs")
     monkeypatch.setattr(preflight, "logger", shared_logging.get_logger(f"preflight-crash-{case}"))
 

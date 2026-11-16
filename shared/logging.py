@@ -269,7 +269,7 @@ def get_logger(service: str) -> logging.Logger:
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
-    # Stdout handler
+    # Console handler (stdout, or stderr after route_console_logs_to_stderr())
     stream_handler = logging.StreamHandler(stream=getattr(sys, _console_stream_name))
     stream_handler.setFormatter(formatter)
     stream_handler._trading_console = True  # type: ignore[attr-defined]
