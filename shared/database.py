@@ -3292,6 +3292,38 @@ def ensure_live_account(
         return current.to_live_account()
 
 
+def register_live_account_if_absent(
+    account_id: str,
+    broker: str,
+    *,
+    name: str = "",
+    ctid: str | None = None,
+    broker_login: str | None = None,
+    is_demo: bool | None = None,
+) -> bool:
+    """Insert the account row only when it does not exist, and never modify an existing one.
+
+    The existence check and the insert share one session, so there is no gap in which another
+    writer can be overwritten: if a row appears before the insert, the insert fails on the primary
+    key and the error propagates, leaving that row exactly as it was. Returns ``True`` when this
+    call created the row.
+    """
+    init_db()
+    with get_session() as session:
+        if session.get(LiveAccountModel, account_id) is not None:
+            return False
+        _create_live_account_record(
+            session,
+            account_id,
+            broker,
+            name=name,
+            ctid=ctid,
+            broker_login=broker_login,
+            is_demo=is_demo,
+        )
+    return True
+
+
 def upsert_live_accounts(accounts: list[LiveAccountConfig]) -> None:
     """Persist what discovery reported, without erasing what it did not.
 
