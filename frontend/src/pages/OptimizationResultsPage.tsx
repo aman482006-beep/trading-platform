@@ -335,8 +335,8 @@ function renderOverfittingVerdict(overfitting: ThreeWayPayload["overfitting"]) {
             Reasons
           </div>
           <ul style={{ margin: 0, paddingLeft: "18px", color: "#fecdd3", fontSize: "0.85rem", lineHeight: 1.6 }}>
-            {overfitting.reasons.map((reason, idx) => (
-              <li key={idx}>{reason}</li>
+            {overfitting.reasons.map((reason) => (
+              <li key={reason}>{reason}</li>
             ))}
           </ul>
         </div>
@@ -376,7 +376,7 @@ function renderTestDistribution(dist: ThreeWayPayload["test_distribution"], sele
         {[
           { label: "Candidates tested", value: String(dist.count) },
           { label: "Share profitable", value: `${(dist.share_profitable * 100).toFixed(1)}%` },
-          { label: "Median {dist.target_metric}", value: dist.median_target_metric?.toFixed(3) ?? "—" },
+          { label: `Median ${dist.target_metric}`, value: dist.median_target_metric?.toFixed(3) ?? "—" },
           { label: "Rank correlation (val→test)", value: dist.spearman_validation_to_test?.toFixed(2) ?? "—" },
         ].map((item) => (
           <div
@@ -555,7 +555,10 @@ export function OptimizationResultsPage() {
   const oosEvidence = classifyOptimizationOosEvidence(
     optimization.target_metric,
     compatibleInSampleValue,
-    optimization.test_stats,
+    // A three-way result's OOS evidence is the untouched holdout. Its
+    // test_stats is the validation (selection) window, so it must not be read
+    // as out-of-sample here.
+    hasThreeWay ? optimization.final_test_stats : optimization.test_stats,
     optimization.oos_status ?? "unavailable",
   );
 
@@ -699,9 +702,9 @@ export function OptimizationResultsPage() {
                 tone: "#c4b5fd",
               },
               {
-                label: hasThreeWay ? "Train split" : "Train split",
+                label: hasThreeWay ? "Train / val / test split" : "Train split",
                 value: hasThreeWay
-                  ? `${Math.round((optimization.validation_split_pct ?? optimization.train_split_pct) * 100)}% / ${Math.round((optimization.validation_split_pct ?? 0) * 100)}% / ${Math.round((optimization.test_split_pct ?? 0) * 100)}%`
+                  ? `${Math.round(optimization.train_split_pct * 100)}% / ${Math.round((optimization.validation_split_pct ?? 0) * 100)}% / ${Math.round((optimization.test_split_pct ?? 0) * 100)}%`
                   : `${Math.round(optimization.train_split_pct * 100)}%`,
                 tone: "#fbbf24",
               },
