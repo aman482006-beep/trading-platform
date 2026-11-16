@@ -417,23 +417,21 @@ def _ensure_ctrader_smoke_deployment(*, account_id: str, symbol: str) -> str:
 
     from shared.database import (
         LiveDeploymentModel,
-        ensure_live_account,
-        get_live_account,
         get_session,
         init_db,
+        register_live_account_if_absent,
     )
 
     # The worker mode reaches this before anything else touches the database, so on a fresh data
     # dir the tables do not exist yet and the select below would raise "no such table".
     init_db()
-    if get_live_account(account_id) is None:
-        ensure_live_account(
-            account_id,
-            "ctrader",
-            name=f"cTrader demo {account_id} (registered by live_smoke)",
-            ctid=account_id,
-            is_demo=True,
-        )
+    register_live_account_if_absent(
+        account_id,
+        "ctrader",
+        name=f"cTrader demo {account_id} (registered by live_smoke)",
+        ctid=account_id,
+        is_demo=True,
+    )
     strategy_name = f"ctrader-demo-smoke-{account_id}"
     with get_session() as session:
         existing = session.exec(
