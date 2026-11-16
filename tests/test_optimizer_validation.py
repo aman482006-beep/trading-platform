@@ -608,10 +608,11 @@ def test_split_period_without_embargo_stays_contiguous():
         test_split_pct=0.2,
         embargo_days=0,
     )
-    # No embargo requested: each segment starts exactly where the previous one
-    # ends. Production runs default to a one-day embargo.
-    assert pd.Timestamp(split.validation["start"]) == pd.Timestamp(split.train["end"])
-    assert pd.Timestamp(split.test["start"]) == pd.Timestamp(split.validation["end"])
+    # No embargo requested: segments still never touch. The date filter is
+    # inclusive on both ends, so a shared boundary would trade one bar twice.
+    gap = pd.Timedelta(microseconds=1)
+    assert pd.Timestamp(split.validation["start"]) == pd.Timestamp(split.train["end"]) + gap
+    assert pd.Timestamp(split.test["start"]) == pd.Timestamp(split.validation["end"]) + gap
 
 
 def test_split_period_rejects_an_embargo_that_eats_a_segment():

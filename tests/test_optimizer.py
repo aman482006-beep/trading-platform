@@ -1162,8 +1162,8 @@ class TestRiskAdjustedObjective:
         split = optimizer_module._split_backtest_period(
             "2024-01-01", "2024-01-10", 0.6, embargo_days=0
         )
-        assert split.train["end"] == split.validation["start"]
-        assert split.validation["end"] == split.test["start"]
+        assert split.train["end"] < split.validation["start"]
+        assert split.validation["end"] < split.test["start"]
 
 
 class TestGridHardening:

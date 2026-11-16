@@ -184,6 +184,19 @@ class ThreeWaySplit:
         }
 
 
+#: Smallest separation between two segments. ``apply_date_filter`` is inclusive
+#: on both ends, so segments that merely touch would both trade a bar sitting
+#: exactly on the shared boundary; one microsecond keeps every bar in at most
+#: one segment even with a zero embargo.
+_MIN_SEGMENT_GAP = pd.Timedelta(microseconds=1)
+
+
+def _segment_gap(embargo_days: int, embargo_pct: float, total: pd.Timedelta) -> pd.Timedelta:
+    """Gap between consecutive segments: the configured embargo, at least 1 µs."""
+    configured = pd.Timedelta(days=max(int(embargo_days), 0)) + (total * float(embargo_pct))
+    return max(configured, _MIN_SEGMENT_GAP)
+
+
 def three_way_split(
     start: Any,
     end: Any,
@@ -233,7 +246,7 @@ def three_way_split(
         raise ValueError(f"Invalid period: start={start!r}, end={end!r}")
 
     total = end_ts - start_ts
-    embargo_gap = pd.Timedelta(days=max(int(embargo_days), 0)) + (total * float(embargo_pct))
+    embargo_gap = _segment_gap(embargo_days, embargo_pct, total)
 
     # Compute segment boundaries working backwards from end (test ends at end)
     test_end_ts = end_ts
@@ -247,7 +260,7 @@ def three_way_split(
     train_end_ts = embargo_train_val_start_ts
     train_start_ts = start_ts
 
-    # Verify all segments have positive duration (embargo gaps can be zero)
+    # Verify all segments have positive duration (gaps are at least 1 µs)
     if train_end_ts <= train_start_ts:
         raise ValueError("train segment would be empty")
     if embargo_train_val_end_ts < embargo_train_val_start_ts:
@@ -313,7 +326,7 @@ def walk_forward_train_validation_folds(
     total = end_ts - start_ts
     # Same gap arithmetic as `three_way_split`, so the fold range ends exactly
     # where that function ends the validation segment.
-    embargo_gap = pd.Timedelta(days=max(int(embargo_days), 0)) + (total * float(embargo_pct))
+    embargo_gap = _segment_gap(embargo_days, embargo_pct, total)
     test_start_ts = end_ts - total * test_fraction
     wf_end_ts = test_start_ts - embargo_gap
     if wf_end_ts <= start_ts:

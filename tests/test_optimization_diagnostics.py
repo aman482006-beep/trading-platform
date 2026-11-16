@@ -1727,3 +1727,69 @@ def test_three_way_split_takes_the_embargo_out_of_train():
     assert length(split.validation) == total * 0.2
     assert length(split.test) == total * 0.2
     assert length(split.train) == total * 0.6 - pd.Timedelta(days=20)
+
+
+def test_zero_embargo_never_puts_a_boundary_bar_in_two_segments():
+    """With no embargo a bar exactly on a boundary lands in one segment only.
+
+    ``apply_date_filter`` is inclusive on both ends, so touching segments would
+    trade that bar in both; the split keeps at least 1 microsecond between them.
+    """
+    from runner.engines.contract import apply_date_filter
+    from runner.optimization_diagnostics import three_way_split
+
+    split = three_way_split(
+        "2024-01-01T00:00:00+00:00",
+        "2024-01-11T00:00:00+00:00",
+        train_fraction=0.6,
+        validation_fraction=0.2,
+        test_fraction=0.2,
+        embargo_days=0,
+        embargo_pct=0.0,
+    )
+    boundaries = [
+        pd.Timestamp(split.train["end"]),
+        pd.Timestamp(split.validation["start"]),
+        pd.Timestamp(split.validation["end"]),
+        pd.Timestamp(split.test["start"]),
+    ]
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.date_range(
+                "2024-01-01T00:00:00+00:00", "2024-01-11T00:00:00+00:00", freq="1D"
+            ).append(pd.DatetimeIndex(boundaries)).sort_values().unique()
+        }
+    )
+    segments = {
+        name: apply_date_filter(
+            frame, start=getattr(split, name)["start"], end=getattr(split, name)["end"]
+        )
+        for name in ("train", "validation", "test")
+    }
+    seen: list[pd.Timestamp] = []
+    for name in ("train", "validation", "test"):
+        seen.extend(segments[name]["timestamp"])
+    assert len(seen) == len(set(seen)), "a bar was traded in two segments"
+    gap = pd.Timedelta(microseconds=1)
+    assert pd.Timestamp(split.validation["start"]) - pd.Timestamp(split.train["end"]) >= gap
+    assert pd.Timestamp(split.test["start"]) - pd.Timestamp(split.validation["end"]) >= gap
+
+
+def test_zero_embargo_walk_forward_range_ends_before_the_test_holdout():
+    from runner.optimization_diagnostics import (
+        three_way_split,
+        walk_forward_train_validation_folds,
+    )
+
+    kwargs = {"embargo_days": 0, "embargo_pct": 0.0}
+    split = three_way_split(
+        "2024-01-01", "2024-01-11", train_fraction=0.6,
+        validation_fraction=0.2, test_fraction=0.2, **kwargs,
+    )
+    folds = walk_forward_train_validation_folds(
+        "2024-01-01", "2024-01-11", n_splits=2, train_fraction=0.7,
+        test_fraction=0.2, **kwargs,
+    )
+    test_start = pd.Timestamp(split.test["start"])
+    for fold in folds:
+        assert pd.Timestamp(fold["test"]["end"]) < test_start
