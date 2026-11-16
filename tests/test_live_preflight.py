@@ -411,3 +411,42 @@ def test_preflight_cli_stdout_is_a_single_json_document(
     assert document["config_path"] == str(config_path)
     assert rc == 1  # no credentials for the alpaca account
     assert "Running live preflight" in captured.err
+
+
+@pytest.mark.parametrize("case", ["missing_config", "malformed_yaml"])
+def test_preflight_cli_emits_json_document_even_when_config_cannot_load(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    import json
+
+    import live_runner.preflight as preflight
+    from shared import logging as shared_logging
+
+    if case == "missing_config":
+        config_path = tmp_path / "missing_live_deployments.yaml"
+    else:
+        config_path = _write_config(tmp_path / "live_deployments.yaml", "accounts: [\n")
+    accounts_env = tmp_path / ".accounts.env"
+    accounts_env.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(shared_logging, "_loggers", {})
+    monkeypatch.setattr(shared_logging, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(preflight, "logger", shared_logging.get_logger(f"preflight-crash-{case}"))
+
+    rc = preflight.main(["--config", str(config_path), "--accounts-env", str(accounts_env)])
+
+    captured = capsys.readouterr()
+    # The documented contract holds on failure too: stdout is one parseable document.
+    document = json.loads(captured.out)
+    assert rc == 1
+    assert document["ok"] is False
+    assert document["config_path"] == str(config_path)
+    assert document["accounts"] == []
+    assert len(document["deployment_errors"]) == 1
+    expected_type = "FileNotFoundError" if case == "missing_config" else "ParserError"
+    assert document["deployment_errors"][0].startswith(f"{expected_type}: ")
+    # The traceback goes to stderr, not stdout.
+    assert "Traceback" in captured.err

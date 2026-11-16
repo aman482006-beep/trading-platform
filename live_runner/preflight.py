@@ -417,11 +417,26 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     # stdout carries exactly one JSON result document; log lines go to stderr.
     route_console_logs_to_stderr()
-    result = run_live_preflight(
-        args.config,
-        accounts_env_path=args.accounts_env,
-        check_connectivity=args.check_connectivity,
-    )
+    try:
+        result = run_live_preflight(
+            args.config,
+            accounts_env_path=args.accounts_env,
+            check_connectivity=args.check_connectivity,
+        )
+    except Exception as exc:
+        # An unhandled failure (e.g. missing or malformed config) must still honour
+        # the stdout contract: a failed result document, traceback on stderr.
+        logger.exception(
+            "Live preflight crashed",
+            extra={"data": {"config_path": str(args.config)}},
+        )
+        result = LivePreflightResult(
+            ok=False,
+            config_path=str(args.config),
+            accounts_env_path=str(args.accounts_env),
+            accounts=[],
+            deployment_errors=[f"{type(exc).__name__}: {exc}"],
+        )
     print(json.dumps(_result_to_jsonable(result), indent=2, sort_keys=True))
     return 0 if result.ok else 1
 
