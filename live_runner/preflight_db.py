@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
+from shared.constants import normalize_symbols, normalize_timeframe
 from shared.models import LiveDeploymentConfig
 
 #: (strategy_name, account_id): how a YAML deployment and a DB row are matched.
@@ -30,6 +31,7 @@ class DbDeploymentRow:
     symbols: tuple[str, ...]
     timeframe: str
     signal_source: str
+    signal_source_id: str
 
     @property
     def key(self) -> DeploymentKey:
@@ -71,6 +73,14 @@ def resolve_db_path(explicit: str | Path | None = None) -> Path:
     return Path(constants.DATA_DIR) / "backtests.db"
 
 
+#: Appended to a read-only open failure that SQLite reports as a write error.
+_WAL_READ_ONLY_HINT = (
+    "A WAL-mode database can only be read read-only when SQLite may write its -shm index, and a "
+    "read-only connection cannot run WAL recovery; open it once with a writer (any daemon start, "
+    "or sqlite3) to checkpoint it."
+)
+
+
 def _load_symbols(raw: Any) -> tuple[str, ...]:
     try:
         parsed = json.loads(raw) if isinstance(raw, str) else raw
@@ -86,27 +96,113 @@ def read_active_db_deployments(db_path: Path) -> tuple[list[DbDeploymentRow], se
     uri = f"{db_path.resolve().as_uri()}?mode=ro"
     connection = sqlite3.connect(uri, uri=True, timeout=5)
     try:
+        connection.row_factory = sqlite3.Row
         rows = connection.execute(
-            "SELECT id, strategy_name, account_id, symbols, timeframe, signal_source "
+            "SELECT id, strategy_name, account_id, symbols, timeframe, signal_source, "
+            "signal_source_id "
             "FROM live_deployments WHERE upper(status) = 'ACTIVE' ORDER BY strategy_name, id"
         ).fetchall()
-        account_ids = {str(row[0]) for row in connection.execute("SELECT id FROM live_accounts")}
+        account_ids = {str(row["id"]) for row in connection.execute("SELECT id FROM live_accounts")}
     finally:
         connection.close()
     return (
         [
             DbDeploymentRow(
-                id=str(row[0]),
-                strategy_name=str(row[1]),
-                account_id=str(row[2]),
-                symbols=_load_symbols(row[3]),
-                timeframe=str(row[4] or ""),
-                signal_source=str(row[5] or ""),
+                id=str(row["id"]),
+                strategy_name=str(row["strategy_name"]),
+                account_id=str(row["account_id"]),
+                symbols=_load_symbols(row["symbols"]),
+                timeframe=str(row["timeframe"] or ""),
+                signal_source=str(row["signal_source"] or ""),
+                signal_source_id=str(row["signal_source_id"] or ""),
             )
             for row in rows
         ],
         account_ids,
     )
+
+
+def _signal_source(raw: object) -> str:
+    """The form the daemon compares: lowercase, blank defaulting to ``internal``."""
+    return str(raw or "").strip().lower() or "internal"
+
+
+def _db_row_errors(row: DbDeploymentRow, db_account_ids: set[str]) -> list[str]:
+    """What makes this ACTIVE row untradeable as configured, independent of the YAML."""
+    errors: list[str] = []
+    if row.account_id not in db_account_ids:
+        errors.append(f"DB deployment {row.label}: account_id is not in live_accounts.")
+    if not row.symbols:
+        errors.append(f"DB deployment {row.label}: has no symbols configured.")
+    if not row.timeframe.strip():
+        errors.append(f"DB deployment {row.label}: has no timeframe configured.")
+    return errors
+
+
+def _db_row_drift(row: DbDeploymentRow, yaml_dep: LiveDeploymentConfig) -> list[str]:
+    """Fields where this DB row and its YAML twin disagree. The DB value is what runs.
+
+    The comparison normalizes both sides the way the writers do: symbols through
+    ``shared.constants.normalize_symbols`` and timeframes through
+    ``shared.constants.normalize_timeframe``. Raw comparison would report a difference for every
+    cosmetic spelling (``" AAPL"``, ``1H`` vs ``1h``) and the warning would stop carrying
+    information.
+
+    ``signal_source`` is on this list because the daemon gates Discord dispatch on the DB value
+    (``live_runner.daemon._active_discord_deployments_for_account`` and
+    ``_discord_active_account_ids``): a row that says ``discord`` on a deployment the YAML
+    configures as ``internal`` receives Discord signals, and the YAML-side check in
+    ``live_runner.preflight._validate_deployments`` never sees the DB row.
+    ``signal_source_id`` is on this list because it names the credential the daemon resolves that
+    deployment to.
+    """
+    differences: list[str] = []
+    db_symbols = tuple(sorted(row.symbols))
+    yaml_symbols = tuple(sorted(normalize_symbols(yaml_dep.symbols)))
+    if db_symbols != yaml_symbols:
+        differences.append(f"symbols differ (DB {list(db_symbols)} vs YAML {list(yaml_symbols)})")
+    db_timeframe = normalize_timeframe(row.timeframe)
+    yaml_timeframe = normalize_timeframe(str(yaml_dep.timeframe))
+    if db_timeframe != yaml_timeframe:
+        differences.append(
+            f"timeframe differs (DB {row.timeframe!r} vs YAML {str(yaml_dep.timeframe)!r})"
+        )
+    if _signal_source(row.signal_source) != _signal_source(yaml_dep.signal_source):
+        differences.append(
+            f"signal_source differs (DB {_signal_source(row.signal_source)} vs YAML "
+            f"{_signal_source(yaml_dep.signal_source)})"
+        )
+    if row.signal_source_id.strip() != str(yaml_dep.signal_source_id or "").strip():
+        differences.append(
+            f"signal_source_id differs (DB {row.signal_source_id!r} vs YAML "
+            f"{str(yaml_dep.signal_source_id or '')!r})"
+        )
+    return differences
+
+
+def _yaml_active_by_key(
+    yaml_deployments: Sequence[LiveDeploymentConfig],
+) -> tuple[dict[DeploymentKey, LiveDeploymentConfig], list[str]]:
+    """The YAML's ACTIVE deployments by key, plus a warning per shadowed duplicate.
+
+    A dict comprehension keeps the last entry, so a YAML listing the same
+    ``(strategy_name, account_id)`` twice would be compared against only one of its two
+    definitions and the other would never be checked at all.
+    """
+    by_key: dict[DeploymentKey, LiveDeploymentConfig] = {}
+    warnings: list[str] = []
+    for deployment in yaml_deployments:
+        if deployment.status != "ACTIVE":
+            continue
+        key = (deployment.strategy_name, deployment.account_id)
+        if key in by_key:
+            warnings.append(
+                f"YAML deployment {key[0]} ({key[1]}): listed twice in the YAML; only the first "
+                "entry is compared against the DB."
+            )
+            continue
+        by_key[key] = deployment
+    return by_key, warnings
 
 
 def diff_db_and_yaml(
@@ -119,24 +215,21 @@ def diff_db_and_yaml(
     """Validate the ACTIVE DB rows and report how they differ from the YAML deployments."""
     errors: list[str] = []
     warnings: list[str] = []
-    yaml_active = {
-        (d.strategy_name, d.account_id): d for d in yaml_deployments if d.status == "ACTIVE"
-    }
+    yaml_active, yaml_warnings = _yaml_active_by_key(yaml_deployments)
+    warnings.extend(yaml_warnings)
     db_by_key: dict[DeploymentKey, DbDeploymentRow] = {}
     matched: list[str] = []
     only_in_db: list[str] = []
 
     for row in db_rows:
-        if row.account_id not in db_account_ids:
-            errors.append(f"DB deployment {row.label}: account_id is not in live_accounts.")
-        if not row.symbols:
-            errors.append(f"DB deployment {row.label}: has no symbols configured.")
-        if not row.timeframe.strip():
-            errors.append(f"DB deployment {row.label}: has no timeframe configured.")
+        errors.extend(_db_row_errors(row, db_account_ids))
         if row.key in db_by_key:
-            warnings.append(
-                f"DB deployment {row.label}: duplicate of id={db_by_key[row.key].id}; "
-                "both are ACTIVE for the same strategy and account."
+            # Not cosmetic drift: the daemon dispatches every ACTIVE match, so this row submits
+            # its own order per signal while the YAML describes a single deployment.
+            errors.append(
+                f"DB deployment {row.label}: duplicate of id={db_by_key[row.key].id}; the daemon "
+                "dispatches every ACTIVE match, so this row trades the same strategy and account "
+                "a second time."
             )
         db_by_key.setdefault(row.key, row)
         yaml_dep = yaml_active.get(row.key)
@@ -148,16 +241,9 @@ def diff_db_and_yaml(
             )
             continue
         matched.append(row.label)
-        yaml_symbols = tuple(sorted(str(s).upper() for s in yaml_dep.symbols))
-        if tuple(sorted(row.symbols)) != yaml_symbols:
+        for difference in _db_row_drift(row, yaml_dep):
             warnings.append(
-                f"DB deployment {row.label}: symbols differ (DB {list(row.symbols)} vs YAML "
-                f"{list(yaml_symbols)}); the daemon trades the DB value."
-            )
-        if row.timeframe != str(yaml_dep.timeframe):
-            warnings.append(
-                f"DB deployment {row.label}: timeframe differs (DB {row.timeframe!r} vs YAML "
-                f"{str(yaml_dep.timeframe)!r}); the daemon trades the DB value."
+                f"DB deployment {row.label}: {difference}; the daemon trades the DB value."
             )
 
     only_in_yaml = [
@@ -197,6 +283,17 @@ def run_db_preflight(
         )
     try:
         rows, account_ids = read_active_db_deployments(path)
+    except sqlite3.OperationalError as exc:
+        # A mode=ro connection cannot run WAL recovery: SQLite has to create or write the -shm
+        # index, so a WAL database that needs recovery (after an unclean stop) - or that merely
+        # lives in a directory this process cannot write - reports "attempt to write a readonly
+        # database" or "unable to open database file" even though the file itself is intact.
+        # Without the cause named, that reads as corruption and sends the operator chasing a
+        # damaged database instead of a checkpoint.
+        return DbPreflightReport(
+            db_path=str(path),
+            errors=[f"Cannot read deployments from {path}: {exc} {_WAL_READ_ONLY_HINT}"],
+        )
     except sqlite3.Error as exc:
         return DbPreflightReport(
             db_path=str(path), errors=[f"Cannot read deployments from {path}: {exc}"]

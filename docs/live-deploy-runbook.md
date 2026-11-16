@@ -34,9 +34,26 @@ uv run python -m live_runner.preflight --config live_deployments.yaml --accounts
 
 The daemon trades the ACTIVE rows of the `live_deployments` table, not the YAML. Add `--check-db`
 (read-only; `--db-path` overrides `DATABASE_URL` / `DATA_DIR/backtests.db`) to validate those rows
-too. The JSON result gains `db_deployments` with `matched`, `only_in_db` (an error: the daemon
-trades something the YAML preflight never saw), `only_in_yaml` and symbol/timeframe differences
-(warnings).
+too. The JSON result gains `db_deployments` with `matched`, `only_in_db`, `only_in_yaml`,
+`active_count`, `errors` and `warnings`. It fails the preflight (`ok: false`, exit 1) for:
+
+- an ACTIVE DB deployment absent from the YAML (the daemon trades something the YAML preflight
+  never saw);
+- an ACTIVE row whose `account_id` is not in `live_accounts`, or whose symbols or timeframe are
+  empty;
+- two ACTIVE rows for the same `(strategy_name, account_id)` — the daemon dispatches every ACTIVE
+  match, so the same strategy would submit a second order per signal;
+- a missing or unreadable database.
+
+Warnings (the preflight still exits 0): a YAML deployment with no ACTIVE DB row (the daemon will
+not trade it), a YAML deployment listed twice, and any field where the DB value and the YAML
+disagree — symbols, timeframe, `signal_source` and `signal_source_id` are normalized the way the
+writers normalize them before they are compared. The DB value is what runs, so a warning means the
+daemon is about to trade something other than what the YAML says.
+
+The read-only open cannot run WAL recovery. Against a WAL database left needing recovery (after an
+unclean stop) in a directory this process cannot write, the check fails with a message that says
+so; a plain open by any writer checkpoints it.
 
 ```bash
 uv run python -m live_runner.preflight --config live_deployments.yaml --accounts-env .accounts.env --check-db

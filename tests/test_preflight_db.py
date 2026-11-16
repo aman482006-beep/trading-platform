@@ -7,6 +7,7 @@ import sqlite3
 from pathlib import Path
 from textwrap import dedent
 
+from live_runner import preflight_db
 from live_runner.preflight import main as preflight_main
 from live_runner.preflight import run_live_preflight
 from live_runner.preflight_db import run_db_preflight
@@ -31,12 +32,28 @@ def _yaml(tmp_path: Path, deployments: str) -> Path:
     return path
 
 
+# Numeric and long enough to pass validate_discord_deployment_signal_config's
+ # placeholder/snowflake sanity check, so a Discord row can be seeded through the real chokepoint.
+_DISCORD_CHANNEL = "123456789012345678"
+
 _YAML_ONE = """
               - strategy_name: equity_momentum
                 account_id: alpaca-paper
                 symbols: [AAPL]
                 timeframe: 1h
 """
+
+
+def _yaml_one(signal_source: str = "internal", signal_source_id: str = "") -> LiveDeploymentConfig:
+    return LiveDeploymentConfig(
+        strategy_name="equity_momentum",
+        account_id="alpaca-paper",
+        symbols=["AAPL"],
+        timeframe="1h",
+        signal_source=signal_source,
+        signal_source_id=signal_source_id,
+        signal_config={"channel_id": _DISCORD_CHANNEL} if signal_source == "discord" else {},
+    )
 
 _ENV = {
     "ALPACA_API_KEY_ACC1": "k",
@@ -54,6 +71,8 @@ def _seed(
     timeframe="1h",
     status="ACTIVE",
     account_id="alpaca-paper",
+    signal_source="internal",
+    signal_source_id="",
 ) -> str:
     database.ensure_live_account(account_id, "alpaca", name=account_id)
     created = database.create_live_deployment(
@@ -63,6 +82,9 @@ def _seed(
             symbols=list(symbols),
             timeframe=timeframe,
             status=status,
+            signal_source=signal_source,
+            signal_source_id=signal_source_id,
+            signal_config={"channel_id": _DISCORD_CHANNEL} if signal_source == "discord" else {},
         )
     )
     return str(created.id)
@@ -156,11 +178,12 @@ def test_null_timeframe_in_a_foreign_db_is_an_error(tmp_path: Path) -> None:
         connection.execute(
             "CREATE TABLE live_deployments "
             "(id VARCHAR PRIMARY KEY, strategy_name VARCHAR, account_id VARCHAR, symbols VARCHAR, "
-            "timeframe VARCHAR, signal_source VARCHAR, status VARCHAR)"
+            "timeframe VARCHAR, signal_source VARCHAR, signal_source_id VARCHAR, status VARCHAR)"
         )
         connection.execute(
             "INSERT INTO live_deployments VALUES "
-            "('abc', 'equity_momentum', 'alpaca-paper', '[\"AAPL\"]', NULL, 'internal', 'ACTIVE')"
+            "('abc', 'equity_momentum', 'alpaca-paper', '[\"AAPL\"]', NULL, 'internal', '', "
+            "'ACTIVE')"
         )
 
     report = run_db_preflight([], db_path=path)
@@ -180,7 +203,7 @@ def test_active_db_deployment_with_unknown_account_is_an_error(isolated_db) -> N
     assert any("ghost-account" in e for e in report.errors)
 
 
-def test_duplicate_active_db_deployments_are_reported(isolated_db) -> None:
+def test_duplicate_active_db_deployments_fail_the_check(isolated_db) -> None:
     """The daemon dispatches every ACTIVE match, so two rows mean two orders per signal."""
     database = isolated_db[0]
     _seed(database)
@@ -188,7 +211,38 @@ def test_duplicate_active_db_deployments_are_reported(isolated_db) -> None:
 
     report = run_db_preflight([], db_path=_db_path(database))
 
-    assert any("duplicate" in w for w in report.warnings)
+    assert any("duplicate" in e for e in report.errors), report.errors
+
+
+def test_signal_source_drift_between_db_and_yaml_is_reported(isolated_db) -> None:
+    """The daemon gates Discord dispatch on the DB value, so the drift has to show up."""
+    database = isolated_db[0]
+    _seed(database, signal_source="discord")
+
+    report = run_db_preflight([_yaml_one()], db_path=_db_path(database))
+
+    assert report.errors == []
+    assert any("signal_source" in w for w in report.warnings), report.warnings
+
+
+def test_matching_signal_source_is_not_reported(isolated_db) -> None:
+    database = isolated_db[0]
+    _seed(database, signal_source="discord", signal_source_id="news-svc")
+
+    report = run_db_preflight([_yaml_one("discord", "news-svc")], db_path=_db_path(database))
+
+    assert report.warnings == [], report.warnings
+
+
+def test_signal_source_id_drift_between_db_and_yaml_is_reported(isolated_db) -> None:
+    """signal_source_id selects the Discord credential a deployment is dispatched with."""
+    database = isolated_db[0]
+    _seed(database, signal_source="discord", signal_source_id="db-svc")
+
+    report = run_db_preflight([_yaml_one("discord", "yaml-svc")], db_path=_db_path(database))
+
+    assert report.errors == []
+    assert any("signal_source_id" in w for w in report.warnings), report.warnings
 
 
 def test_yaml_only_deployment_is_a_warning_and_paused_rows_are_ignored(isolated_db) -> None:
@@ -277,6 +331,44 @@ def test_run_live_preflight_fails_on_db_only_active_deployment(tmp_path: Path, i
     assert result.ok is False
     assert result.db_deployments is not None
     assert any("surprise" in e for e in result.db_deployments["errors"])
+
+
+def test_a_read_only_open_failure_names_the_wal_cause(isolated_db, monkeypatch) -> None:
+    """A WAL database that needs recovery opens read-only as a write error, not as corruption.
+
+    The permission-dependent variant of this (an unwritable data directory) is not asserted
+    here: it only reproduces on a filesystem that honours the mode bits, and a test that
+    silently passes as root would claim coverage it does not have.
+    """
+    database = isolated_db[0]
+    _seed(database)
+
+    def refuse(*args, **kwargs):
+        raise sqlite3.OperationalError("attempt to write a readonly database")
+
+    monkeypatch.setattr(preflight_db, "read_active_db_deployments", refuse)
+
+    report = run_db_preflight([], db_path=_db_path(database))
+
+    assert any("attempt to write a readonly database" in e for e in report.errors), report.errors
+    assert any("WAL" in e for e in report.errors), report.errors
+
+
+def test_run_live_preflight_fails_on_duplicate_active_db_deployment(
+    tmp_path: Path, isolated_db
+) -> None:
+    """Two ACTIVE rows for one deployment are not a warning: the daemon trades both."""
+    database = isolated_db[0]
+    _seed(database)
+    _seed(database)
+
+    result = run_live_preflight(
+        _yaml(tmp_path, _YAML_ONE), env=_ENV, check_db=True, db_path=_db_path(database)
+    )
+
+    assert result.ok is False, "a duplicate ACTIVE row must fail the preflight"
+    assert result.db_deployments is not None
+    assert any("duplicate" in e for e in result.db_deployments["errors"]), result.db_deployments
 
 
 def test_db_check_is_opt_in(tmp_path: Path) -> None:
