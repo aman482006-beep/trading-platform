@@ -92,6 +92,9 @@ def load_platform(path: pathlib.Path, key: str, clock_name: str) -> pd.DataFrame
     )
     pf["entry_server"] = clock.to_server_time(pf["entry_utc"])
     pf["exit_server"] = clock.to_server_time(pf["exit_utc"])
+    unknown = sorted(set(pf["dir"]) - {"LONG", "SHORT"})
+    if unknown:
+        raise SystemExit(f"{path}: unknown trade direction(s) {unknown}; expected LONG or SHORT")
     sign = pf["dir"].map({"LONG": 1.0, "SHORT": -1.0})
     pf["pnl_px"] = (pf["exit"] - pf["entry"]) * sign * pf["qty"] * CONTRACT[key]
     return pf
@@ -102,7 +105,14 @@ def score(key: str, mt5: pd.DataFrame, pf: pd.DataFrame) -> tuple[dict, pd.DataF
         frame["date"] = frame["entry_server"].dt.normalize()
         frame["n"] = frame.groupby(["date", "dir"]).cumcount()
     merged = mt5.merge(
-        pf, on=["date", "dir", "n"], how="outer", suffixes=("_mt5", "_pf"), indicator=True
+        pf,
+        on=["date", "dir", "n"],
+        how="outer",
+        suffixes=("_mt5", "_pf"),
+        indicator=True,
+        # (date, dir, n) is unique on each side by construction (cumcount), so a
+        # many-to-many match would be a bug in the pairing, not in the data.
+        validate="one_to_one",
     )
     both = merged[merged["_merge"] == "both"]
     same_minute = both["entry_server_mt5"].dt.floor("min") == both["entry_server_pf"].dt.floor(
