@@ -53,11 +53,19 @@ pro Bot.
     `docs/live-deploy-runbook.md` ("Live Trailing Stops"). `supertrend_flip` wird live auf keinem
     Broker ausgeführt und dort abgelehnt (Grund und Design-Vorschlag im Runbook).
   - **`supertrend_flip` im Replay (#168):**
-    1. TP1: Teilausstieg von `tp1_exit_percent` (Bruchteil, 0.5 = halbe Position) zu `tp1_price`.
+    1. TP1: Teilausstieg von `tp1_exit_percent` (Bruchteil, 0.5 = halbe Position) zu `tp1_price`
+       — in ganzen Shares: `qty * Bruchteil` abgerundet, wie im Original-Bot
+       (`int(qty * tp1_exit_percent)`, `shared/trailing.tp1_partial_quantity`). Ergibt sich 0
+       (z. B. 1 Share bei 0.5), wird der Teilausstieg übersprungen, genau wie im Original-Bot:
+       kein Verkauf, kein Einstands-Stop, und der restliche Workflow (Aktivierung, Flip) startet
+       nicht. Die Position bleibt voll unter ihrem ursprünglichen Stop; im Trade-Meta steht
+       dann `supertrend_flip.tp1_skipped_time` (und `tp1_time` bleibt leer).
     2. Danach Stop auf Einstand (Entry-Preis), wenn `breakeven_after_tp1`; wirksam ab der Kerze
        nach der TP1-Kerze.
-    3. Aktivierung: erste geschlossene Kerze ab der TP1-Kerze (inklusive), deren Supertrend
-       bereit und grün ist. "Nicht bereit" (Warm-up) zählt weder als grün noch als rot.
+    3. Aktivierung: erste geschlossene Kerze NACH der TP1-Kerze, deren Supertrend bereit und
+       grün ist. Die TP1-Kerze selbst wird nach dem TP1-Fill nicht mehr ausgewertet — nichts, was
+       in oder an der TP1-Kerze nach dem Fill passiert, darf den Trail bewegen oder auslösen.
+       "Nicht bereit" (Warm-up) zählt weder als grün noch als rot.
     4. Ausstieg: erste bereite rote Kerze nach der Aktivierung; der Rest wird zum OPEN der
        folgenden Kerze geschlossen (der Flip ist erst beim Schluss der Flip-Kerze bekannt). Ist die
        Flip-Kerze die letzte Kerze der Daten, wird die Position wie jede andere am Datenende
@@ -68,7 +76,9 @@ pro Bot.
       `supertrend_period`/`supertrend_multiplier` aus `trailing_sl_config`, nur aus geschlossenen
       Kerzen.
     - Ein Trade mit mehreren Exits (`tp1`, dann `supertrend_flip`/`breakeven_stop`/`stop_loss`/
-      `end_of_data`); Gebühren einmal zum mengengewichteten Exit-Preis. Fehlende oder ungültige
+      `end_of_data`); der TP1-Tranche ist auf ganze Shares abgerundet, MFE/MAE werden nach dem
+      Teilausstieg auf den verbleibenden Shares gemessen und die Equity-Kurve bucht die
+      gefloorten Beine. Gebühren einmal zum mengengewichteten Exit-Preis. Fehlende oder ungültige
       Parameter brechen den Lauf ab (keine erfundenen Defaults). Nur Long-Einstiege.
   - Mit dem Default `none` läuft RamJet bewusst nur mit dem initialen ATR-Stop.
 - **Last-Run:** Über Health-Check-Job validierbar

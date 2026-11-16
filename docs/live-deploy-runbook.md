@@ -51,6 +51,25 @@ orphaned. The only state that is not derivable from the broker is "activated"; i
 persisted on the entry signal row (`live_signals.metadata`). This changes order submission,
 recovery and fill reconciliation, which today assume one broker order per signal.
 
+**Replay semantics to mirror live (decided 2026-11-16, `#176`)**
+
+Two rules the replay implements today; a live implementation must copy them exactly, or paper
+results stop predicting live behaviour:
+
+- *TP1 tranche in whole shares, floored.* The tranche is
+  `int(entry_quantity * tp1_exit_percent)` — the original bot's arithmetic
+  (`shared/trailing.py: tp1_partial_quantity`) — and the remainder is the entry quantity minus
+  that tranche. A tranche of zero whole shares (1 share at a 0.5 fraction) is skipped, not
+  rounded up: no sell, no breakeven stop, and the Supertrend workflow never arms, so the whole
+  position keeps its original stop. The trade's `supertrend_flip` metadata records it as
+  `tp1_skipped_time` so a backtest never hides it.
+- *The trail starts on the bar after the TP1 bar.* The TP1 bar after the TP1 fill is dead for
+  the workflow: its close is not read (a green close there does not activate the trail, a red
+  close there cannot flip it) and its range is not checked against the stop moved on it, so the
+  breakeven stop only takes effect from the next bar. Nothing that happens at or inside the
+  TP1 bar after the TP1 fill may move or trigger the trailing stop — live that means the
+  amendment waits for the first bar that closes after the TP1 fill.
+
 **Where an unsupported mode is rejected**
 
 - Deployment validation: `LiveDeploymentConfig` rejects a `trailing_mode` override no live broker
