@@ -578,3 +578,114 @@ def test_without_installed_reactor_clears_every_platform_reactor_module():
     )
     assert result.returncode == 0, result.stderr
     assert "ok" in result.stdout
+
+
+_WINDOWS_LOOP_POLICY = """
+        import asyncio
+        import sys
+        if sys.platform == "win32":
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+"""
+
+
+def test_import_error_with_a_pre_installed_reactor_becomes_ctrader_unavailable():
+    """An ImportError inside the sweep must propagate, not be swallowed by `finally`.
+
+    A `return` in `finally` discarded the exception, so `_load_ctrader_protocol`
+    fell through to `_Protobuf = Protobuf` and raised NameError instead of
+    `CTraderUnavailableError`.
+    """
+    result = _run_discovery_subprocess(
+        _WINDOWS_LOOP_POLICY
+        + """
+        import sys
+        import live_runner.account_discovery as d
+        from twisted.internet import asyncioreactor
+
+        asyncioreactor.install(asyncio.new_event_loop())
+        # A None entry makes `from ctrader_open_api import Protobuf` raise ImportError.
+        sys.modules["ctrader_open_api"] = None
+        try:
+            d._load_ctrader_protocol()
+        except d.CTraderUnavailableError:
+            print("ok")
+        """
+    )
+    assert result.returncode == 0, result.stderr
+    assert "ok" in result.stdout
+
+
+def test_without_installed_reactor_does_not_swallow_exceptions():
+    result = _run_discovery_subprocess(
+        """
+        import live_runner.account_discovery as d
+
+        for had_reactor in (True, False):
+            if had_reactor:
+                from twisted.internet import asyncioreactor
+                import asyncio
+                asyncioreactor.install(asyncio.new_event_loop())
+            try:
+                with d._without_installed_reactor():
+                    raise KeyboardInterrupt
+            except KeyboardInterrupt:
+                continue
+            raise SystemExit("exception swallowed, had_reactor=" + str(had_reactor))
+        print("ok")
+        """
+    )
+    assert result.returncode == 0, result.stderr
+    assert "ok" in result.stdout
+
+
+def test_ctrader_client_after_discovery_binds_to_the_installed_asyncio_reactor():
+    """`ctrader_open_api.client` captures the reactor at import; it must be re-imported."""
+    result = _run_discovery_subprocess(
+        _WINDOWS_LOOP_POLICY
+        + """
+        import live_runner.account_discovery as d
+        d._load_ctrader_protocol()
+
+        from twisted.internet import asyncioreactor
+        loop = asyncio.new_event_loop()
+        asyncioreactor.install(loop)
+
+        import ctrader_open_api.client as client
+        assert client.reactor.__class__.__module__ == "twisted.internet.asyncioreactor", (
+            client.reactor
+        )
+        from ctrader_open_api import Client, EndPoints, TcpProtocol
+        built = Client(EndPoints.PROTOBUF_DEMO_HOST, EndPoints.PROTOBUF_PORT, TcpProtocol)
+        assert built._runningReactor is client.reactor
+        assert built._runningReactor.__class__.__module__ == "twisted.internet.asyncioreactor"
+        print("ok")
+        """
+    )
+    assert result.returncode == 0, result.stderr
+    assert "ok" in result.stdout
+
+
+def test_adapter_client_after_discovery_uses_the_adapter_installed_reactor():
+    """The adapter's own `_load_openapi_types` path after discovery gets a live reactor."""
+    result = _run_discovery_subprocess(
+        _WINDOWS_LOOP_POLICY
+        + """
+        import live_runner.account_discovery as d
+        from live_runner.ctrader_adapter import CTraderLiveAdapter
+        d._load_ctrader_protocol()
+
+        loop = asyncio.new_event_loop()
+        adapter = CTraderLiveAdapter.__new__(CTraderLiveAdapter)
+        adapter._client_class = None
+        adapter._loop = loop
+        adapter._load_openapi_types()
+
+        reactor_module = adapter._client_class.__module__
+        import sys
+        client_module = sys.modules[reactor_module]
+        assert client_module.reactor.__class__.__module__ == "twisted.internet.asyncioreactor"
+        print("ok")
+        """
+    )
+    assert result.returncode == 0, result.stderr
+    assert "ok" in result.stdout

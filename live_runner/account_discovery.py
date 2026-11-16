@@ -63,6 +63,8 @@ _PROTO_OA_CTID_TRADER_ACCOUNT_RES: Any = None
 _PLATFORM_REACTOR_MODULE_PREFIX = "twisted.internet."
 _PLATFORM_REACTOR_MODULE_SUFFIX = "reactor"
 _KEPT_REACTOR_MODULES = frozenset({"twisted.internet.asyncioreactor"})
+# ctrader_open_api modules that capture ``twisted.internet.reactor`` at import time.
+_REACTOR_BOUND_CTRADER_MODULES = ("ctrader_open_api", "ctrader_open_api.client")
 
 
 def _is_platform_reactor_module(name: str) -> bool:
@@ -92,14 +94,29 @@ def _without_installed_reactor():
     try:
         yield
     finally:
-        if had_reactor:
-            return
-        for name in sorted(sys.modules):
-            if name not in before and _is_platform_reactor_module(name):
-                del sys.modules[name]
-        twisted_internet = sys.modules.get("twisted.internet")
-        if twisted_internet is not None and hasattr(twisted_internet, "reactor"):
-            delattr(twisted_internet, "reactor")
+        # No early ``return`` here: a ``return`` in ``finally`` discards the in-flight
+        # exception (ImportError, KeyboardInterrupt) raised inside the ``with`` body.
+        if not had_reactor:
+            _sweep_installed_reactor(before)
+
+
+def _sweep_installed_reactor(before: frozenset[str]) -> None:
+    """Undo the reactor installation a just-finished import caused."""
+    for name in sorted(sys.modules):
+        if name not in before and _is_platform_reactor_module(name):
+            del sys.modules[name]
+    twisted_internet = sys.modules.get("twisted.internet")
+    if twisted_internet is not None and hasattr(twisted_internet, "reactor"):
+        delattr(twisted_internet, "reactor")
+    # ``ctrader_open_api.client`` does ``from twisted.internet import reactor`` at module
+    # level and keeps that reactor as ``Client._runningReactor``. Left cached it stays bound
+    # to the reactor swept above, so a Client built after the adapter installs the asyncio
+    # reactor would run on a dead reactor. Dropping the package and ``client`` makes the
+    # next import re-execute them. The protobuf message modules are kept on purpose:
+    # re-executing them would register their descriptors in the pool a second time.
+    for name in _REACTOR_BOUND_CTRADER_MODULES:
+        if name not in before:
+            sys.modules.pop(name, None)
 
 
 def _load_ctrader_protocol() -> None:
