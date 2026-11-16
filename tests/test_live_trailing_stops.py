@@ -758,7 +758,9 @@ def test_alpaca_amends_the_held_stop_leg_and_keeps_the_take_profit() -> None:
 
     amended = asyncio.run(adapter.amend_protective_stop(stop, 96.5))
 
-    assert amended == ProtectiveStop(order_id="sl-leg+", symbol="AAPL", side="sell", stop_price=96.5)
+    assert amended == ProtectiveStop(
+        order_id="sl-leg+", symbol="AAPL", side="sell", stop_price=96.5
+    )
     assert client.cancelled == []
     assert [leg.id for leg in client.parent.legs] == ["tp-leg", "sl-leg+"]
     (again,) = asyncio.run(adapter.list_protective_stops())
