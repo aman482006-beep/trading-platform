@@ -1730,10 +1730,12 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         # cancel settles, so that status on an id this sweep cancelled without error
         # is treated as an accepted request, not a dropped cancel. It is NOT proof
         # the order can no longer fill: a pending_cancel order may still execute in
-        # a cancel/fill race. The STOPPED path tolerates that because the flatten
-        # and the orphan sweep that follow re-read the book and act on whatever is
-        # still there. Only ids this sweep cancelled count; an order that was never
-        # ours to cancel and sits in ``pending_cancel`` is not vouched for.
+        # a cancel/fill race. Those ids are returned in ``pending_cancel`` and the
+        # daemon refuses to stamp a STOPPED deployment enforced while any remain
+        # (fail closed); it retries until the re-read shows them cancelled or filled,
+        # and the flatten handles a fill. Only ids this sweep cancelled count; an
+        # order that was never ours to cancel and sits in ``pending_cancel`` is not
+        # vouched for.
         still_working = {
             _control_order_id(_order_attr(order, "id"))
             for order in remaining
@@ -1745,10 +1747,22 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         }
         still_working.discard(None)
         failed.extend(sorted(still_working))
+        pending_cancel = sorted(
+            {
+                order_id
+                for order in remaining
+                if (order_id := _control_order_id(_order_attr(order, "id")))
+                is not None
+                and order_id in cancel_accepted
+                and order_id not in protected
+                and _order_status(order) == "pending_cancel"
+            }
+        )
         return ControlOutcome(
             completed=completed,
             unidentified=tuple(unidentified),
             failed=tuple(failed),
+            pending_cancel=tuple(pending_cancel),
         )
 
     @staticmethod

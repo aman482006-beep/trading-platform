@@ -141,6 +141,17 @@ def test_cancel_open_orders_accepts_pending_cancel_as_success() -> None:
     assert outcome.failed == ()
     assert outcome.completed == 1
     assert outcome.complete is True
+    # ...but the order may still fill in a cancel/fill race, so it is carried out.
+    assert outcome.pending_cancel == ("entry-1",)
+
+
+def test_cancel_open_orders_reports_no_pending_cancel_when_cancels_settle() -> None:
+    client = _FakeTradingClient(orders=[_FakeOrder("entry-1", "AAPL", "buy")])
+
+    outcome = asyncio.run(_adapter(client).cancel_open_orders())
+
+    assert outcome.complete is True
+    assert outcome.pending_cancel == ()
 
 
 def test_cancel_open_orders_accepts_enum_valued_pending_cancel() -> None:

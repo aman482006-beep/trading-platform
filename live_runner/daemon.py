@@ -90,6 +90,12 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_ACCOUNTS_ENV = PROJECT_ROOT / ".accounts.env"
 BALANCE_POLL_INTERVAL_SECONDS = 60
 DEPLOYMENT_POLL_INTERVAL_SECONDS = 10
+# A broker-side ``pending_cancel`` order normally settles within seconds. A STOPPED
+# deployment stays unstamped while one is listed (it could still fill); after this many
+# consecutive enforcement passes (~1 minute at the poll interval) the WARNING becomes an
+# ERROR so a stuck cancel reaches an operator.
+PENDING_CANCEL_ESCALATION_PASSES = 6
+_PENDING_CANCEL_PASSES: dict[str, int] = {}
 SERVICE_SYNC_INTERVAL_SECONDS = 60
 _DISCORD_AUTH_BLOCKED_ACCOUNTS: set[str] = set()
 _DISCORD_AUTH_BLOCKED_REASONS: dict[str, str] = {}
@@ -3361,6 +3367,13 @@ async def _enforce_stopped_deployments(
     order - or a cancel call that failed outright - still lets the flatten run,
     because leaving positions open is worse than leaving an order resting. It
     does gate the stamp.
+
+    The stamp is also withheld while the cancel sweep reports ids still in the
+    broker's ``pending_cancel`` state (``ControlOutcome.pending_cancel``): such an
+    order can still fill in a cancel/fill race, so the pass logs a WARNING naming
+    them and retries, escalating to ERROR after
+    ``PENDING_CANCEL_ESCALATION_PASSES`` consecutive passes. A fill is flattened
+    by the next pass before the stamp. cTrader never reports any, so it is unchanged.
     """
     stopped = [
         deployment
@@ -3376,6 +3389,8 @@ async def _enforce_stopped_deployments(
         if deployment_id not in stopped_ids
     }
     already_enforced.difference_update(left_stopped)
+    for deployment_id in left_stopped:
+        _PENDING_CANCEL_PASSES.pop(deployment_id, None)
     # The persisted stamp is authoritative, not this process's ledger: a deployment
     # that was resumed and stopped again between two ticks was never observed
     # leaving STOPPED, so the ledger still lists it while its stamp (cleared by the
@@ -3627,6 +3642,30 @@ async def _enforce_stopped_deployments(
                 },
             )
             continue
+        if cancelled.pending_cancel:
+            passes = _PENDING_CANCEL_PASSES.get(deployment_id, 0) + 1
+            _PENDING_CANCEL_PASSES[deployment_id] = passes
+            log = (
+                logger.error
+                if passes >= PENDING_CANCEL_ESCALATION_PASSES
+                else logger.warning
+            )
+            log(
+                "Not recording STOPPED enforcement: order(s) %s still pending_cancel "
+                "and may yet fill (pass %d). Retrying next tick",
+                sorted(cancelled.pending_cancel),
+                passes,
+                extra={
+                    "data": {
+                        "deployment_id": deployment_id,
+                        "account_id": deployment.account_id,
+                        "pending_cancel": sorted(cancelled.pending_cancel),
+                        "passes": passes,
+                    }
+                },
+            )
+            continue
+        _PENDING_CANCEL_PASSES.pop(deployment_id, None)
         if not orphan_sweep_unsupported and (
             orphaned is None or not orphaned.complete
         ):
