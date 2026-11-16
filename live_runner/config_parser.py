@@ -16,18 +16,9 @@ logger = get_logger("live-runner")
 
 _UNEXPANDED_ENV_PATTERN = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}")
 # One reference: ``${NAME}`` or ``$NAME``. Group 1 or group 2 holds the name.
+# ``[A-Za-z0-9_]`` rather than ``\w``: ``\w`` also matches Unicode letters, which
+# are not valid environment variable names here.
 _ENV_REFERENCE_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
-
-
-def env_reference_names(text: str) -> frozenset[str]:
-    """Names of every ``${NAME}``/``$NAME`` reference in raw config *text*.
-
-    Scans the text with the same pattern expansion uses, so it names exactly the
-    keys an expansion of that text would look up.
-    """
-    return frozenset(
-        match.group(1) or match.group(2) for match in _ENV_REFERENCE_PATTERN.finditer(text)
-    )
 
 
 def _expand_env_value(value: str, env: Mapping[str, str]) -> str:

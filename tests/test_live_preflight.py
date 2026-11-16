@@ -538,6 +538,45 @@ def test_live_preflight_unreadable_accounts_env_reports_failure_not_crash(
     assert any("Missing Alpaca credentials" in e for e in result.accounts[0].errors)
 
 
+def test_live_preflight_unreadable_accounts_env_warns_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The accounts env file is read once per preflight, so its read warning is logged once."""
+    import live_runner.credential_env as credential_env
+
+    config_path = _write_config(
+        tmp_path / "live_deployments.yaml",
+        """
+        accounts:
+          - id: alpaca-paper
+            broker: alpaca
+
+        deployments:
+          - strategy_name: equity_momentum
+            account_id: alpaca-paper
+            symbols: [AAPL]
+            timeframe: 1h
+        """,
+    )
+    accounts_env = tmp_path / ".accounts.env"
+    accounts_env.write_text("ALPACA_API_KEY=file-key\n", encoding="utf-8")
+    warnings: list[str] = []
+
+    class _Recorder:
+        def warning(self, message: str, **_kwargs: object) -> None:
+            warnings.append(message)
+
+    def _deny(_path: object) -> dict[str, str]:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(credential_env, "dotenv_values", _deny)
+    monkeypatch.setattr(credential_env, "logger", _Recorder())
+
+    run_live_preflight(config_path, accounts_env_path=accounts_env)
+
+    assert warnings == ["Could not read accounts env file; continuing with process env only"]
+
+
 _SECRET_REF_VALUE = "file-secret-value-0123456789"
 
 
@@ -730,15 +769,11 @@ def test_config_error_redaction_threshold_is_exactly_three_characters() -> None:
     assert message == "resolved to '${THREE}' and 'Zq'"
 
 
-def test_redaction_values_cover_referenced_keys_and_the_accounts_file_only(
-    tmp_path: Path,
-) -> None:
+def test_redaction_values_cover_referenced_keys_and_the_accounts_file_only() -> None:
     """Redaction covers the file values and the expansion values the config
     references - never every process-env key, which would mangle messages."""
     from live_runner.preflight import _redaction_values
 
-    config_path = tmp_path / "live_deployments.yaml"
-    config_path.write_text('broker_login: "${REFERENCED_KEY}"\n', encoding="utf-8")
     expansion_env = {
         "FILE_KEY": "filevalue1",
         "REFERENCED_KEY": "refvalue1",
@@ -746,12 +781,300 @@ def test_redaction_values_cover_referenced_keys_and_the_accounts_file_only(
     }
 
     values = _redaction_values(
-        config_path,
         env_values={"FILE_KEY": "filevalue1"},
         expansion_env=expansion_env,
+        referenced={"REFERENCED_KEY"},
     )
 
     assert values == {"FILE_KEY": "filevalue1", "REFERENCED_KEY": "refvalue1"}
+
+
+def test_redaction_values_without_a_read_config_redact_every_expansion_value() -> None:
+    """When the config text is unknown (it could not be read), every expansion
+    value counts as referenced: the message cannot be checked any other way."""
+    from live_runner.preflight import _redaction_values
+
+    values = _redaction_values(
+        env_values={"FILE_KEY": "filevalue1"},
+        expansion_env={"FILE_KEY": "filevalue1", "PROC_KEY": "procvalue1"},
+        referenced=None,
+    )
+
+    assert values == {"FILE_KEY": "filevalue1", "PROC_KEY": "procvalue1"}
+
+
+def test_config_error_message_non_value_error_is_redacted_and_typed() -> None:
+    """A TypeError/KeyError from parsing is not a ValueError, but its text must
+    be redacted like one and must still name its type."""
+    from live_runner.preflight import _config_error_message
+
+    type_error = _config_error_message(
+        TypeError("login 'abcdef' rejected"), redact={"SHORT": "abcdef"}
+    )
+    key_error = _config_error_message(KeyError("abcdef"), redact={"SHORT": "abcdef"})
+
+    assert type_error == "TypeError: login '${SHORT}' rejected"
+    assert key_error == "KeyError: '${SHORT}'"
+
+
+def test_config_error_message_yaml_error_reports_problem_and_position_only() -> None:
+    """A YAML syntax error carries a source snippet; that snippet can hold a
+    literal secret, so only the problem and its position are reported."""
+    import yaml
+
+    from live_runner.preflight import _config_error_message
+
+    with pytest.raises(yaml.YAMLError) as caught:
+        yaml.safe_load("accounts: [ literalsecret-abc\n  x: y ]\n")
+
+    message = _config_error_message(caught.value, redact={})
+
+    assert message.startswith("ParserError: expected ',' or ']'")
+    assert "line 2, column 4" in message
+    assert "literalsecret-abc" not in message
+    assert "accounts: [" not in message
+
+
+def test_config_error_message_validation_error_without_title_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ``title`` attribute is not relied on: without it the error type names the message."""
+    import live_runner.preflight as preflight
+
+    class _TitlelessValidationError(ValueError):
+        def errors(self) -> list[dict[str, object]]:
+            return [{"loc": ("broker",), "msg": "bad broker"}]
+
+    monkeypatch.setattr(preflight, "ValidationError", _TitlelessValidationError)
+
+    message = preflight._config_error_message(_TitlelessValidationError("x"), redact={})
+
+    assert message == "_TitlelessValidationError (1 validation error): broker: bad broker"
+
+
+def test_live_preflight_validation_error_message_names_model_field_and_count(
+    tmp_path: Path,
+) -> None:
+    """A real pydantic failure is reported as ``Title (N validation error): loc: msg``."""
+    config_path = _write_config(
+        tmp_path / "live_deployments.yaml",
+        """
+        accounts:
+          - id: bad
+            broker: kraken
+
+        deployments:
+          - strategy_name: fx_breakout
+            account_id: bad
+            symbols: [EURUSD]
+            timeframe: 15m
+        """,
+    )
+
+    result = run_live_preflight(
+        config_path, accounts_env_path=tmp_path / "missing.accounts.env"
+    )
+
+    assert result.ok is False
+    assert len(result.deployment_errors) == 1
+    assert result.deployment_errors[0].startswith(
+        "LiveAccountConfig (1 validation error): broker: "
+    )
+
+
+_NON_VALUE_ERROR_CONFIG = """
+accounts:
+  - id: ctrader-demo
+    broker: ctrader
+    broker_login: "${PREFLIGHT_TEST_SECRET_REF}"
+
+deployments:
+  - strategy_name: fx_breakout
+    account_id: ctrader-demo
+    symbols: [EURUSD]
+    timeframe: 15m
+"""
+
+
+@pytest.mark.parametrize("error_type", [TypeError, KeyError])
+def test_live_preflight_non_value_error_during_parse_never_echoes_expanded_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error_type: type[Exception]
+) -> None:
+    """A TypeError/KeyError raised while parsing an expanded config must be
+    redacted like a ValueError: it is printed in deployment_errors and logged."""
+    import live_runner.config_parser as config_parser
+    import live_runner.preflight as preflight
+
+    monkeypatch.delenv("PREFLIGHT_TEST_SECRET_REF", raising=False)
+    config_path = _write_config(tmp_path / "live_deployments.yaml", _NON_VALUE_ERROR_CONFIG)
+    accounts_env = _secret_ref_accounts_env(tmp_path)
+    logged: list[str] = []
+
+    class _Recorder:
+        def warning(self, message: str, **kwargs: object) -> None:
+            logged.append(f"{message} {kwargs}")
+
+    def _reject(accounts: list[object], *_args: object, **_kwargs: object) -> None:
+        raise error_type(f"login {accounts[0].broker_login} is not routable")  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(config_parser, "validate_live_account_routes", _reject)
+    monkeypatch.setattr(preflight, "logger", _Recorder())
+
+    result = run_live_preflight(config_path, accounts_env_path=accounts_env)
+
+    assert result.ok is False
+    assert len(result.deployment_errors) == 1
+    assert result.deployment_errors[0].startswith(f"{error_type.__name__}: ")
+    assert not any(_SECRET_REF_VALUE in err for err in result.deployment_errors)
+    assert "${PREFLIGHT_TEST_SECRET_REF}" in result.deployment_errors[0]
+    assert logged and not any(_SECRET_REF_VALUE in line for line in logged)
+
+
+def test_live_preflight_yaml_syntax_error_never_echoes_a_source_line(
+    tmp_path: Path,
+) -> None:
+    """The runbook promises a parse error never shows an expanded value. A YAML
+    syntax error is raised before expansion, but its snippet echoes the raw line
+    the operator wrote, so the snippet is dropped."""
+    config_path = tmp_path / "live_deployments.yaml"
+    config_path.write_text("accounts: [ literalsecret-abc\n  x: y ]\n", encoding="utf-8")
+
+    result = run_live_preflight(config_path, accounts_env_path=tmp_path / "missing.env")
+
+    assert result.ok is False
+    assert len(result.deployment_errors) == 1
+    assert result.deployment_errors[0].startswith("ParserError: ")
+    assert "literalsecret-abc" not in result.deployment_errors[0]
+
+
+def test_live_preflight_bare_dollar_reference_expands_and_is_redacted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``$NAME`` (no braces) is a reference too: it expands from the accounts
+    file and its value is redacted from config errors like ``${NAME}``."""
+    monkeypatch.delenv("PREFLIGHT_TEST_SECRET_REF", raising=False)
+    config_path = _write_config(
+        tmp_path / "live_deployments.yaml",
+        """
+        accounts:
+          - id: ctrader-demo
+            broker: ctrader
+            ctid: $PREFLIGHT_TEST_SECRET_REF
+
+        deployments:
+          - strategy_name: fx_breakout
+            account_id: ctrader-demo
+            symbols: [EURUSD]
+            timeframe: 15m
+        """,
+    )
+    accounts_env = _secret_ref_accounts_env(tmp_path)
+
+    result = run_live_preflight(config_path, accounts_env_path=accounts_env)
+
+    assert result.ok is False
+    assert not any(_SECRET_REF_VALUE in err for err in result.deployment_errors)
+    # The reference was expanded (its value was found and rewritten to the name).
+    assert any("${PREFLIGHT_TEST_SECRET_REF}" in err for err in result.deployment_errors)
+
+
+def test_bare_dollar_reference_expands_to_its_value() -> None:
+    from live_runner.config_parser import expand_env_mapping
+
+    assert expand_env_mapping({"symbols": ["$SYM", "${SYM}x"]}, {"SYM": "AAPL"}) == {
+        "symbols": ["AAPL", "AAPLx"]
+    }
+
+
+def test_live_preflight_crash_path_redacts_expanded_values_in_json(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unhandled exception after a successful expansion reaches main()'s
+    crash document; it must not print the expanded value."""
+    import json
+
+    import live_runner.preflight as preflight
+    from shared import logging as shared_logging
+
+    monkeypatch.delenv("PREFLIGHT_TEST_SECRET_REF", raising=False)
+    config_path = _write_config(
+        tmp_path / "live_deployments.yaml",
+        """
+        accounts:
+          - id: alpaca-paper
+            broker: alpaca
+
+        deployments:
+          - strategy_name: equity_momentum
+            account_id: alpaca-paper
+            symbols: [AAPL]
+            timeframe: 1h
+            signal_source: discord
+            signal_config:
+              channel_id: "${PREFLIGHT_TEST_SECRET_REF}"
+        """,
+    )
+    accounts_env = _secret_ref_accounts_env(tmp_path)
+
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError(f"deployment check saw {_SECRET_REF_VALUE}")
+
+    monkeypatch.setattr(preflight, "_validate_deployments", _boom)
+    monkeypatch.setattr(shared_logging, "_loggers", {})
+    monkeypatch.setattr(shared_logging, "_console_stream_name", "stdout")
+    monkeypatch.setattr(shared_logging, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(preflight, "logger", shared_logging.get_logger("preflight-crash-redact"))
+
+    rc = preflight.main(
+        ["--config", str(config_path), "--accounts-env", str(accounts_env)]
+    )
+
+    captured = capsys.readouterr()
+    assert _SECRET_REF_VALUE not in captured.out
+    document = json.loads(captured.out)
+    assert rc == 1
+    assert document["deployment_errors"] == [
+        "RuntimeError: deployment check saw ${PREFLIGHT_TEST_SECRET_REF}"
+    ]
+
+
+def test_live_preflight_unreadable_config_crash_redacts_all_expansion_values(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without a readable config the references are unknown, so the crash
+    document redacts every expansion value rather than risk printing one."""
+    import json
+
+    import live_runner.preflight as preflight
+    from shared import logging as shared_logging
+
+    monkeypatch.delenv("PREFLIGHT_TEST_SECRET_REF", raising=False)
+    accounts_env = _secret_ref_accounts_env(tmp_path)
+    config_path = tmp_path / "live_deployments.yaml"
+    config_path.write_text("accounts: []\n", encoding="utf-8")
+
+    def _unreadable(*_args: object, **_kwargs: object) -> None:
+        raise OSError(f"cannot read config while holding {_SECRET_REF_VALUE}")
+
+    monkeypatch.setattr(preflight, "parse_live_deployments_config", _unreadable)
+    monkeypatch.setattr(shared_logging, "_loggers", {})
+    monkeypatch.setattr(shared_logging, "_console_stream_name", "stdout")
+    monkeypatch.setattr(shared_logging, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(preflight, "logger", shared_logging.get_logger("preflight-unreadable"))
+
+    rc = preflight.main(["--config", str(config_path), "--accounts-env", str(accounts_env)])
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert _SECRET_REF_VALUE not in captured.out
+    document = json.loads(captured.out)
+    assert document["deployment_errors"] == [
+        "OSError: cannot read config while holding ${PREFLIGHT_TEST_SECRET_REF}"
+    ]
 
 
 # ─── stdout is exactly one JSON document (#184 finding 8) ───────────────────────
@@ -836,5 +1159,11 @@ def test_preflight_cli_emits_json_document_even_when_config_cannot_load(
     assert len(document["deployment_errors"]) == 1
     expected_type = "FileNotFoundError" if case == "missing_config" else "ParserError"
     assert document["deployment_errors"][0].startswith(f"{expected_type}: ")
-    # The traceback goes to stderr, not stdout.
-    assert "Traceback" in captured.err
+    # A missing config is an unhandled crash: its traceback goes to stderr, not
+    # stdout. A YAML syntax error is a reported config error, logged as a warning
+    # with no traceback.
+    if case == "missing_config":
+        assert "Traceback" in captured.err
+    else:
+        assert "Traceback" not in captured.err
+        assert "Live deployment config invalid" in captured.err

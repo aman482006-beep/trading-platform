@@ -46,14 +46,19 @@ process environment is reported as missing rather than borrowed; aligning that
 with the daemon's env-filled credential resolution is an open decision, not a
 bug.
 
-Both failure modes report instead of crashing: an accounts env file that exists
-but cannot be read logs a warning and fails the preflight with missing
-credentials, and a config parse error reports the message type and the offending
-field, never an expanded value - that value can be a credential, and
-`deployment_errors` is printed as JSON. Redaction covers the values of every
-accounts env file key and every process-env key the config references through
-`${VAR}`, so a secret that only lives in the process environment is reported as
-`${VAR}` too. Process-env keys the config never names are not redacted.
+An accounts env file that exists but cannot be read logs a warning and fails the
+preflight with missing credentials. A config that fails to parse or validate is
+reported, not crashed on: `deployment_errors` names the error type and the
+offending field, and never an expanded value - that value can be a credential,
+and `deployment_errors` is printed as JSON. This holds for every exception raised
+while parsing, not only validation errors. A YAML syntax error reports its
+problem and its line and column, never the source line, which can hold a literal
+secret. Redaction covers the values of every accounts env file key and every
+process-env key the config references through `${VAR}` or `$VAR`, so a secret
+that only lives in the process environment is reported as `${VAR}` too. Process-env
+keys the config never names are not redacted. A missing or unreadable config file
+is the one case that still crashes: the JSON document names the path, and the
+traceback goes to stderr.
 
 ## Paper Broker Smoke
 
