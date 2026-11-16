@@ -802,11 +802,16 @@ def run_optimization(
         and math.isfinite(float(row["validation_score"]))
     ]
     if not selectable_rows:
+        reasons = "; ".join(
+            f"trial {row['number']}: {row.get('unselectable_reason') or 'non-finite validation score'}"
+            for row in validation_rows
+        )
         raise RuntimeError(
             "No completed optimization trial produced a selectable validation "
-            "result; every trial either never traded, failed on validation, or "
-            "had a non-finite validation score. Widen parameter_ranges or relax "
-            "position-sizing constraints before retrying."
+            "result; every trial either never traded, was ruined, had an "
+            "undefined target metric, failed on validation, or had a "
+            "non-finite validation score. Widen parameter_ranges or relax "
+            f"position-sizing constraints before retrying. Reasons: {reasons}"
         )
     # The winner is fixed HERE, on validation only. From this point the
     # selection is immutable: the test evaluation below reads it and cannot
@@ -1220,6 +1225,19 @@ def _trial_selection_score(
     return score, raw_metric
 
 
+def _validation_unselectable_reason(
+    result: BacktestResult, stats: Mapping[str, Any], metric_key: str
+) -> str | None:
+    """Why a validation result cannot be selected, or None when it can."""
+    if not result.trades:
+        return "validation: no trades"
+    if stats.get("ruined") is True:
+        return "validation: ruined"
+    if resolve_defined_stat(dict(stats), metric_key, None) is None:
+        return f"validation: target metric {metric_key!r} is undefined"
+    return None
+
+
 def _evaluate_trials_on_validation(
     *,
     trials: Sequence[Any],
@@ -1264,7 +1282,12 @@ def _evaluate_trials_on_validation(
             "validation_metric_value": None,
             "validation_stats": {},
             "validation_moments": None,
+            "unselectable_reason": None,
         }
+        if penalty_applied:
+            row["unselectable_reason"] = (
+                "train: no trades or unrankable result (penalty trial)"
+            )
         try:
             result = _run_period_backtest(
                 strategy_slug=strategy_slug,
@@ -1280,12 +1303,29 @@ def _evaluate_trials_on_validation(
             score, raw_metric = _trial_selection_score(stats, config)
             moments = daily_returns_moments(result.equity_curve)
         except (ValueError, RuntimeError, KeyError) as exc:
-            trial.set_user_attr(
-                VALIDATION_FAILURE_ATTR, f"{type(exc).__name__}: {exc}"
-            )
+            reason = f"validation run failed: {type(exc).__name__}: {exc}"
+            trial.set_user_attr(VALIDATION_FAILURE_ATTR, reason)
+            row["unselectable_reason"] = reason
+            logger.info("Trial %s unselectable: %s", trial.number, reason)
             rows.append(row)
             continue
 
+        # A trial that did nothing, was liquidated, or has no defined target
+        # metric out of sample must never win on validation, mirroring the
+        # train-side guard in the objective (#132, 16-D1). The metric may even
+        # carry a 0.0 placeholder, which `resolve_defined_stat` rejects.
+        validation_reason = _validation_unselectable_reason(
+            result, stats, _metric_key(config.target_metric, stats)
+        )
+        if validation_reason is not None:
+            trial.set_user_attr(VALIDATION_FAILURE_ATTR, validation_reason)
+            logger.info(
+                "Trial %s unselectable on validation: %s",
+                trial.number,
+                validation_reason,
+            )
+            if row["unselectable_reason"] is None:
+                row["unselectable_reason"] = validation_reason
         trial.set_user_attr(VALIDATION_STATS_ATTR, _json_safe(stats))
         trial.set_user_attr(VALIDATION_MOMENTS_ATTR, _json_safe(moments))
         trial.set_user_attr(VALIDATION_SCORE_ATTR, float(score))
@@ -1295,7 +1335,7 @@ def _evaluate_trials_on_validation(
                 # A no-trade trial stays unselectable even if it happens to
                 # trade on validation: the penalty marks a parameter region the
                 # study must not hand back as its answer.
-                "selectable": not penalty_applied,
+                "selectable": not penalty_applied and validation_reason is None,
                 "validation_score": float(score),
                 "validation_metric_value": float(raw_metric),
                 "validation_stats": stats,
@@ -1463,6 +1503,7 @@ def _selection_payload(
     """The fixed selection: winner, ranked top set and the tie-break rule."""
     ranked = list(selection["ranked"])
     winner = selection["winner"]
+    ranked_numbers = {int(row["number"]) for row in ranked}
     return {
         "winner_trial_number": (
             int(winner["trial"].number) if winner is not None else None
@@ -1474,6 +1515,15 @@ def _selection_payload(
         "top_set_size": len(selection["top_set"]),
         "n_selectable_trials": len(ranked),
         "n_unselectable_trials": max(len(validation_rows) - len(ranked), 0),
+        "unselectable_trials": [
+            {
+                "trial_number": int(row["number"]),
+                "reason": row.get("unselectable_reason")
+                or "non-finite validation score",
+            }
+            for row in validation_rows
+            if int(row["number"]) not in ranked_numbers
+        ],
         "tie_break": (
             "higher validation score first; equal scores by lower trial number"
         ),

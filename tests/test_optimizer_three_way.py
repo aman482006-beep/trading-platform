@@ -73,6 +73,7 @@ def _trial_result(
     metric: float,
     trade_count: int = 1,
     with_equity: bool = True,
+    stat_overrides: dict[str, object] | None = None,
 ) -> BacktestResult:
     trades = []
     if trade_count > 0:
@@ -108,6 +109,7 @@ def _trial_result(
         "total_return": metric / 100.0,
         "max_drawdown_pct": -0.1 if trade_count else 0.0,
     }
+    stats.update(stat_overrides or {})
     return BacktestResult(
         meta=BacktestMeta(
             id="trial-demo",
@@ -151,6 +153,7 @@ def _patch_environment(
     metrics: dict[str, dict[int, float]],
     trade_counts: dict[tuple[str, int], int] | None = None,
     with_equity: bool = True,
+    stat_overrides: dict[tuple[str, int], dict[str, object]] | None = None,
 ) -> dict[str, object]:
     """Fake backtest environment; returns the recorded runs and the split."""
     backtests_dir = tmp_path / "backtests"
@@ -217,6 +220,7 @@ def _patch_environment(
             metric=metrics[segment][window],
             trade_count=trade_count,
             with_equity=with_equity,
+            stat_overrides=(stat_overrides or {}).get((segment, window)),
         )
 
     monkeypatch.setattr(optimizer_module, "_run_vectorbt_backtest", fake_run_backtest)
@@ -483,6 +487,108 @@ def test_no_trade_trial_is_not_selectable_even_with_the_best_validation(
 
     assert payload["best_params"] == {"window": 2}
     assert payload["three_way"]["selection"]["n_unselectable_trials"] == 1
+
+
+def _losing_validation_metrics() -> dict[str, dict[int, float]]:
+    # Window 1 is the honest trial: it trades and loses on validation.
+    # Window 2 looks better on every placeholder / degenerate reading.
+    return {
+        "train": {1: 1.0, 2: 1.0},
+        "validation": {1: -2.0, 2: 0.0},
+        "test": {1: -2.0, 2: 5.0},
+    }
+
+
+def test_trial_without_validation_trades_never_wins(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config = _config(n_trials=2)
+    _patch_environment(
+        monkeypatch,
+        tmp_path,
+        config=config,
+        metrics=_losing_validation_metrics(),
+        # Window 2 trades on train but does nothing out of sample; its 0.0
+        # Sharpe would otherwise beat the honest -2.0 of window 1.
+        trade_counts={("validation", 2): 0},
+    )
+
+    payload = optimizer_module.run_optimization(config)
+
+    assert payload["best_params"] == {"window": 1}
+    selection = payload["three_way"]["selection"]
+    assert selection["n_unselectable_trials"] == 1
+    assert [r["reason"] for r in selection["unselectable_trials"]] == [
+        "validation: no trades"
+    ]
+
+
+def test_trial_ruined_only_on_validation_never_wins(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config = _config(n_trials=2, target_metric="total_return")
+    metrics = {
+        "train": {1: 1.0, 2: 1.0},
+        "validation": {1: -50.0, 2: 90.0},
+        "test": {1: -50.0, 2: 90.0},
+    }
+    _patch_environment(
+        monkeypatch,
+        tmp_path,
+        config=config,
+        metrics=metrics,
+        # total_return stays finite at ruin, so only the ruined flag excludes it.
+        stat_overrides={("validation", 2): {"ruined": True}},
+    )
+
+    payload = optimizer_module.run_optimization(config)
+
+    assert payload["best_params"] == {"window": 1}
+    reasons = [r["reason"] for r in payload["three_way"]["selection"]["unselectable_trials"]]
+    assert reasons == ["validation: ruined"]
+
+
+def test_undefined_validation_metric_with_placeholder_never_wins(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config = _config(n_trials=2)
+    _patch_environment(
+        monkeypatch,
+        tmp_path,
+        config=config,
+        metrics=_losing_validation_metrics(),
+        # The producer names the metric undefined but still publishes 0.0.
+        stat_overrides={
+            ("validation", 2): {"undefined_metrics": ["sharpe_ratio"]}
+        },
+    )
+
+    payload = optimizer_module.run_optimization(config)
+
+    assert payload["best_params"] == {"window": 1}
+    reasons = [r["reason"] for r in payload["three_way"]["selection"]["unselectable_trials"]]
+    assert len(reasons) == 1 and "undefined" in reasons[0]
+
+
+def test_all_trials_unselectable_on_validation_fails_loudly_with_reasons(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config = _config(n_trials=2)
+    _patch_environment(
+        monkeypatch,
+        tmp_path,
+        config=config,
+        metrics=_losing_validation_metrics(),
+        trade_counts={("validation", 1): 0},
+        stat_overrides={("validation", 2): {"ruined": True}},
+    )
+
+    with pytest.raises(RuntimeError, match="selectable validation result") as excinfo:
+        optimizer_module.run_optimization(config)
+
+    message = str(excinfo.value)
+    assert "validation: no trades" in message
+    assert "validation: ruined" in message
 
 
 def _fail_test_backtest_for_window(
