@@ -602,6 +602,27 @@ class TestIssueC1FallbackGuards:
         assert result == pytest.approx(98.0)
         assert signal.stop_loss == pytest.approx(98.0)
 
+    @pytest.mark.parametrize("percent", [float("nan"), float("inf"), 0.0, 1.0, None])
+    def test_percent_trailing_mode_rejects_non_finite_or_out_of_range_percent(
+        self, percent
+    ) -> None:
+        """A NaN percent passed the old range check and left the stop untrailed."""
+        signal = self._signal(trailing_sl_config={"mode": "percent", "percent": percent})
+        signal.stop_loss = 98.0
+        engine = self._engine()
+        with pytest.raises(ValueError, match="percent"):
+            engine.apply_trailing_stop(signal, market_price=101.0)
+        assert signal.stop_loss == pytest.approx(98.0)
+
+    @pytest.mark.parametrize("malformed", [{}, "", [], "percent"])
+    def test_malformed_trailing_sl_config_rejected(self, malformed) -> None:
+        """Survivor: a falsy/malformed config must not fall back to 'no trailing'."""
+        signal = self._signal(trailing_sl_config=malformed)
+        signal.stop_loss = 98.0
+        engine = self._engine()
+        with pytest.raises(ValueError, match="trailing_sl_config"):
+            engine.apply_trailing_stop(signal, market_price=101.0)
+
     def test_percent_trailing_mode_still_trails(self) -> None:
         signal = self._signal(trailing_sl_config={"mode": "percent", "percent": 0.02})
         signal.stop_loss = 98.0

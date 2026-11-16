@@ -16,6 +16,7 @@ Follow-ups extend the support sets in one place:
 """
 from __future__ import annotations
 
+import math
 from typing import Any
 
 #: Metadata key a signal processor uses to request trailing-stop behaviour.
@@ -117,11 +118,39 @@ def validate_trailing_sl_config(
             f"trailing_sl_config in {context} must declare a 'mode' "
             f"({', '.join(sorted(KNOWN_TRAILING_MODES))})."
         )
-    return validate_trailing_mode(
+    mode = validate_trailing_mode(
         trailing_cfg.get("mode"),
         supported=supported,
         context=context,
     )
+    if mode == TRAILING_MODE_PERCENT:
+        # Checked here, not only in the engine: the replay gate must refuse a
+        # bad percent before any bar is traded, not fail later mid-run.
+        validate_trailing_percent(trailing_cfg, context=context)
+    return mode
+
+
+def validate_trailing_percent(trailing_cfg: dict[str, Any], *, context: str) -> float:
+    """Return the ``percent`` of a ``percent``-mode config, or raise ``ValueError``.
+
+    Requires a finite number strictly between 0 and 1. NaN and infinities are
+    rejected explicitly: every comparison with NaN is False, so a NaN percent
+    would otherwise make the trailing candidate NaN and the stop never move.
+    """
+    raw = trailing_cfg.get("percent")
+    try:
+        percent = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"trailing_sl_config.percent in {context} must be a number between 0 "
+            f"and 1 (exclusive), got {raw!r}."
+        ) from exc
+    if not math.isfinite(percent) or not (0.0 < percent < 1.0):
+        raise ValueError(
+            f"trailing_sl_config.percent in {context} must be a finite number "
+            f"between 0 and 1 (exclusive), got {raw!r}."
+        )
+    return percent
 
 
 def validate_live_deployment_trailing_override(

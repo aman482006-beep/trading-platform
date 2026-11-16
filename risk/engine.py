@@ -9,6 +9,7 @@ from risk.models import RiskDecision, SizedOrder, TradeSignal
 from shared.trailing import (
     RISK_ENGINE_SUPPORTED_TRAILING_MODES,
     TRAILING_MODE_NONE,
+    validate_trailing_percent,
     validate_trailing_sl_config,
 )
 
@@ -421,10 +422,10 @@ class RiskEngine:
             # No trailing requested, or explicit "initial stop only".
             return signal.stop_loss
 
-        trailing_cfg = signal.metadata["trailing_sl_config"]
-        percent = float(trailing_cfg.get("percent") or 0.0)
-        if percent <= 0 or percent >= 1:
-            raise ValueError("trailing_sl_config.percent must be between 0 and 1")
+        percent = validate_trailing_percent(
+            signal.metadata["trailing_sl_config"],
+            context=f"risk engine trailing for {signal.symbol}",
+        )
 
         action = signal.action
         current_stop = signal.stop_loss

@@ -85,6 +85,29 @@ def test_malformed_sl_config_is_rejected(config) -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "percent",
+    [None, "abc", 0.0, 1.0, -0.02, 1.5, float("nan"), float("inf"), float("-inf")],
+)
+def test_percent_mode_requires_a_finite_percent_in_open_unit_interval(percent) -> None:
+    """Review finding: NaN passed every comparison and silently untrailed the stop."""
+    with pytest.raises(ValueError, match="percent"):
+        validate_trailing_sl_config(
+            {"mode": "percent", "percent": percent},
+            supported=REPLAY_SUPPORTED_TRAILING_MODES,
+            context="test",
+        )
+
+
+def test_percent_mode_without_percent_key_is_rejected() -> None:
+    with pytest.raises(ValueError, match="percent"):
+        validate_trailing_sl_config(
+            {"mode": "percent"},
+            supported=REPLAY_SUPPORTED_TRAILING_MODES,
+            context="test",
+        )
+
+
 def test_sl_config_returns_the_supported_mode() -> None:
     mode = validate_trailing_sl_config(
         {"mode": "percent", "percent": 0.02},
