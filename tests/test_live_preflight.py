@@ -614,3 +614,41 @@ def test_live_preflight_config_error_rewrites_file_values_to_their_ref(
     assert result.ok is False
     assert not any(_SECRET_REF_VALUE in err for err in result.deployment_errors)
     assert any("PREFLIGHT_TEST_SECRET_REF" in err for err in result.deployment_errors)
+
+
+def test_live_preflight_credentials_are_not_filled_from_process_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Credentials resolve from the accounts env file only, process env or not.
+
+    Deliberate, and different from both the ${VAR} expansion view above and the
+    daemon (which resolves credentials through the env-filled
+    ``load_accounts_env_values``): in preflight a key the file does not define
+    is "not configured", so a credential that exists only in the process
+    environment fails the preflight closed instead of borrowing it. Aligning
+    preflight credentials with the daemon is a separate decision; this pins
+    today's contract so it cannot drift silently.
+    """
+    monkeypatch.setenv("ALPACA_API_KEY", "process-key")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "process-secret")
+    config_path = _write_config(
+        tmp_path / "live_deployments.yaml",
+        """
+        accounts:
+          - id: alpaca-paper
+            broker: alpaca
+
+        deployments:
+          - strategy_name: equity_momentum
+            account_id: alpaca-paper
+            symbols: [AAPL]
+            timeframe: 1h
+        """,
+    )
+
+    result = run_live_preflight(
+        config_path, accounts_env_path=tmp_path / "missing.accounts.env"
+    )
+
+    assert result.ok is False
+    assert any("Missing Alpaca credentials" in e for e in result.accounts[0].errors)
