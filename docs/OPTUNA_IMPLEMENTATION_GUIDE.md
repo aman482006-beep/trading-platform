@@ -733,9 +733,12 @@ No fold reaches into the embargo gap before test or into test itself.
 
 ### Risk-Parity Covariance Mode
 
-The risk-parity covariance optimization mode has no trial search and uses train
-and test only (two segments, one embargo gap). It does not use the three-way split
-or overfitting verdict.
+The risk-parity covariance optimization mode has no trial search. Covariance is
+fitted on the train segment and the selected universe is reported on the test
+holdout. Its windows are cut from the same three-way split, so the validation
+segment is never read and both embargo gaps are skipped. It does not produce an
+overfitting verdict. Because the default `train_split_pct` moved from 0.7 to 0.6,
+its default test holdout is 0.2 of the range (it was 0.3 under the two-way split).
 
 ### Migration
 

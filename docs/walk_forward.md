@@ -144,7 +144,11 @@ Walk-forward folds (if configured) cover **only the range before the test holdou
 
 ## Risk-Parity Covariance Mode
 
-The risk-parity covariance optimization mode has no trial search and uses train and test only (two segments, one embargo gap). It does not use the three-way split or overfitting verdict.
+The risk-parity covariance optimization mode has no trial search. Covariance is fitted on the train segment and the selected universe is reported on the test holdout.
+
+Its windows are cut from the same three-way split as the other modes, so it reads only train and test. The validation segment is never read, and both embargo gaps (before validation and before test) are skipped. It does not produce an overfitting verdict.
+
+Because the default `train_split_pct` is now 0.6 (it was 0.7), this mode's test holdout is also smaller by default: 0.2 of the range instead of the 0.3 of the old two-way split. Set `train_split_pct`, `validation_split_pct` and `test_split_pct` explicitly to choose a different holdout.
 
 ## Viewer Display
 
