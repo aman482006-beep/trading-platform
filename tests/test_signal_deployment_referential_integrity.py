@@ -180,6 +180,10 @@ def test_the_smoke_helper_initialises_the_database_before_querying(isolated_db_n
     assert account is not None
     assert account.broker == "ctrader"
     assert account.ctid == "44695443"
+    assert account.name == "cTrader demo 44695443 (registered by live_smoke)", (
+        "the smoke-registered row must carry its marker, or it reads as a plain account id and "
+        "the operator cannot tell which tool wrote it"
+    )
     with database.get_session() as session:
         assert session.get(database.LiveAccountModel, "44695443").is_demo is True
 
@@ -751,6 +755,68 @@ def test_the_smoke_helper_does_not_modify_an_existing_account_row(isolated_db_sa
         session.commit()
 
     _ensure_ctrader_smoke_deployment(account_id="44695443", symbol="EURUSD")
+
+    with database.get_session() as session:
+        row = session.get(database.LiveAccountModel, "44695443")
+    assert row.name == "Fusion Live"
+    assert row.is_demo is False
+
+
+def test_the_create_only_registration_leaves_an_existing_row_alone(isolated_db_sandbox) -> None:
+    """Registering an account is create-only: an existing row is returned as it was.
+
+    ``ensure_live_account`` is an upsert, so calling it after a separate existence check left a
+    window in which a row discovery inserted in between was renamed and re-flagged by the smoke.
+    """
+    database, _engine, _data_dir = isolated_db_sandbox
+    with database.get_session() as session:
+        session.add(
+            database.LiveAccountModel(
+                id="44695443", broker="ctrader", name="Fusion Live", is_demo=False
+            )
+        )
+        session.commit()
+
+    registered = database.register_live_account_if_absent(
+        "44695443", "ctrader", name="cTrader demo 44695443", ctid="44695443", is_demo=True
+    )
+
+    assert registered is False
+    with database.get_session() as session:
+        row = session.get(database.LiveAccountModel, "44695443")
+    assert row.name == "Fusion Live"
+    assert row.is_demo is False
+
+
+def test_the_create_only_registration_survives_a_row_appearing_mid_registration(
+    isolated_db_sandbox, monkeypatch
+) -> None:
+    """Fault injection: discovery inserts the row after the check, before the write.
+
+    The insert must fail rather than overwrite the row discovery wrote, and the failure must
+    surface so the smoke stops before any order.
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    database, _engine, _data_dir = isolated_db_sandbox
+    original_create = database._create_live_account_record
+
+    def discovery_wins_the_race(session, account_id, broker, **kwargs):
+        with database.get_session() as other:
+            other.add(
+                database.LiveAccountModel(
+                    id=account_id, broker=broker, name="Fusion Live", is_demo=False
+                )
+            )
+            other.commit()
+        return original_create(session, account_id, broker, **kwargs)
+
+    monkeypatch.setattr(database, "_create_live_account_record", discovery_wins_the_race)
+
+    with pytest.raises(IntegrityError):
+        database.register_live_account_if_absent(
+            "44695443", "ctrader", name="cTrader demo 44695443", ctid="44695443", is_demo=True
+        )
 
     with database.get_session() as session:
         row = session.get(database.LiveAccountModel, "44695443")
