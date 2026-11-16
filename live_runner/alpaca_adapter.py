@@ -7,7 +7,7 @@ import os
 import re
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
 from typing import Any
 from uuid import UUID
 
@@ -33,6 +33,7 @@ from live_runner.base_adapter import (
 )
 from live_runner.credential_env import parse_bool_env, resolve_env_value
 from live_runner.exit_signals import ExitBelowStepError, round_exit_qty_down
+from live_runner.symbol_class import canonical_crypto_symbol, classify_symbol
 from shared.alpaca_symbols import classify_alpaca_symbol, crypto_pair_key
 from shared.database import (
     apply_live_execution_commissions,
@@ -64,6 +65,87 @@ _ALPACA_ACC_RE = re.compile(r"^ALPACA_API_KEY_ACC(?P<index>\d+)$")
 
 _SL_METADATA_KEYS = ("stop_loss", "sl_price", "stop_price", "resolved_stop_loss")
 _TP_METADATA_KEYS = ("take_profit", "tp_price")
+#: Alpaca rejects sub-penny prices: two decimals at or above $1, four below
+#: ("sub-penny increment does not fulfill minimum pricing criteria", HTTP 422).
+_ALPACA_TICK_AT_OR_ABOVE_ONE = Decimal("0.01")
+_ALPACA_TICK_BELOW_ONE = Decimal("0.0001")
+
+_EXTENDED_HOURS_BRACKET_MESSAGE = (
+    "Extended-hours entry with mandatory SL/TP is not supported: "
+    "the broker rejects bracket orders with extended_hours enabled "
+    "(signal_id={signal_id}, symbol={symbol})."
+)
+
+
+def _round_bracket_price_toward_entry(price: float, *, entry_price: float) -> float:
+    """Round a bracket leg price onto Alpaca's tick, toward the entry.
+
+    Toward the entry, because sizing divided the risk budget by the unrounded
+    stop distance: a stop rounded away from the entry would lose more than the
+    budget. The take profit uses the same direction so it is never placed
+    beyond the level the signal asked for.
+    """
+    value = Decimal(repr(float(price)))
+    tick = _ALPACA_TICK_AT_OR_ABOVE_ONE if value >= 1 else _ALPACA_TICK_BELOW_ONE
+    rounding = ROUND_CEILING if float(price) < float(entry_price) else ROUND_FLOOR
+    return float(value.quantize(tick, rounding=rounding))
+
+
+def _round_bracket_levels_in_place(
+    metadata: dict[str, Any], *, entry_price: float, signal: LiveSignal
+) -> None:
+    """Rewrite every SL/TP alias in *metadata* onto Alpaca's tick, toward the entry.
+
+    A level on the wrong side of the entry is refused here, before persistence,
+    mirroring the cTrader adapter's ``stop_outward``/``take_outward`` guard: a
+    buy's take profit below the entry is an instantly marketable sell limit that
+    would flatten the position at once, and sizing only checks the stop side.
+    """
+    if signal.action not in {"buy", "sell"}:
+        raise ValueError(
+            f"Unsupported action {signal.action!r} for a bracket entry "
+            f"(signal_id={signal.id})."
+        )
+    buy = signal.action == "buy"
+    for canonical_key, keys in (
+        ("stop_loss", _SL_METADATA_KEYS),
+        ("take_profit", _TP_METADATA_KEYS),
+    ):
+        level = _resolve_optional_float(metadata, keys)
+        if level is None or not math.isfinite(level) or level <= 0:
+            # Missing/invalid levels are refused by _resolve_broker_sl_tp.
+            continue
+        is_stop = canonical_key == "stop_loss"
+        # Distance from the entry in the direction the leg must lie: below the
+        # entry for a buy's stop and a sell's take profit, above otherwise.
+        outward = (entry_price - level) if (buy == is_stop) else (level - entry_price)
+        if outward <= 0:
+            raise ValueError(
+                f"{canonical_key} {level!r} for a {signal.action} of {signal.symbol} is "
+                f"on the wrong side of the entry {entry_price!r}; refusing to submit "
+                f"(signal_id={signal.id})."
+            )
+        rounded = _round_bracket_price_toward_entry(level, entry_price=entry_price)
+        if (rounded - entry_price) * (level - entry_price) <= 0:
+            raise ValueError(
+                f"{canonical_key} {level!r} for {signal.symbol} is within one tick "
+                f"of the entry {entry_price!r}; refusing to submit "
+                f"(signal_id={signal.id})."
+            )
+        for key in keys:
+            if key in metadata:
+                metadata[key] = rounded
+        metadata[canonical_key] = rounded
+
+
+def _floor_to_whole_shares(qty: float) -> float:
+    """Alpaca accepts fractional quantities only for simple orders.
+
+    A bracket/OTO entry with a fractional qty is rejected ("fractional orders
+    must have order_class=simple", HTTP 422). Floor, never round up: rounding
+    up would exceed the risk-sized quantity.
+    """
+    return float(math.floor(float(qty) + 1e-9))
 
 
 def _normalize_broker_order_id(value: Any) -> str | None:
@@ -608,6 +690,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         self._trading_client: Any | None = None
         self._trading_stream: Any | None = None
         self._historical_data_client: Any | None = None
+        self._crypto_data_client: Any | None = None
         # #78: subscribe exactly once per stream instance. Re-subscribing
         # the same (or a reconnected) stream duplicates callbacks. The
         # subscribed stream object itself is tracked (not its id(): CPython
@@ -922,6 +1005,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         self._subscribed_stream = None
         self._trading_client = None
         self._historical_data_client = None
+        self._crypto_data_client = None
         self._connected = False
         if stream is None:
             return
@@ -1054,6 +1138,62 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 )
         return float(stop_loss), float(take_profit)
 
+    def _normalize_bracket_entry(self, signal: LiveSignal, qty: float) -> tuple[LiveSignal, float]:
+        """Bring an entry onto the grid Alpaca accepts for bracket/OTO orders.
+
+        Runs before the signal row is persisted (B-8), so a refusal here never
+        leaves a persisted signal without a broker order. The persisted
+        metadata carries exactly the qty and SL/TP that are submitted.
+        Exit-only orders are simple orders and pass through unchanged.
+        """
+        metadata = dict(signal.metadata or {})
+        if str(metadata.get("risk_sizing_mode") or "") == EXIT_ONLY_RISK_SIZING_MODE:
+            return signal, qty
+        if classify_alpaca_symbol(signal.symbol) == "crypto":
+            raise ValueError(
+                f"Alpaca does not support bracket/OTO orders for crypto ({signal.symbol}); "
+                f"refusing to submit before persistence (signal_id={signal.id})."
+            )
+        if metadata.get("extended_hours"):
+            raise ValueError(
+                _EXTENDED_HOURS_BRACKET_MESSAGE.format(
+                    signal_id=signal.id, symbol=signal.symbol
+                )
+            )
+        whole_qty = _floor_to_whole_shares(qty)
+        if whole_qty < 1:
+            raise ValueError(
+                f"Risk-sized qty {qty!r} for {signal.symbol} is below one whole share; "
+                "Alpaca bracket orders require whole shares, and rounding up would "
+                f"exceed the risk budget (signal_id={signal.id})."
+            )
+        if whole_qty != qty:
+            logger.info(
+                "Floored Alpaca bracket entry qty to whole shares",
+                extra={
+                    "data": {
+                        "signal_id": str(signal.id),
+                        "symbol": signal.symbol,
+                        "risk_sized_qty": qty,
+                        "submitted_qty": whole_qty,
+                    }
+                },
+            )
+        metadata["qty"] = whole_qty
+        metadata["explicit_qty"] = whole_qty
+        entry_price = float(signal.theoretical_price)
+        if not math.isfinite(entry_price) or entry_price <= 0:
+            raise ValueError(
+                f"Invalid reference price for {signal.symbol}: "
+                f"{signal.theoretical_price!r}; refusing to submit."
+            )
+        _round_bracket_levels_in_place(metadata, entry_price=entry_price, signal=signal)
+        normalized = signal.model_copy(update={"metadata": metadata})
+        # Missing/NaN/inf/non-positive levels are refused here, not after
+        # persistence, so a refusal never leaves a signal row without an order.
+        self._resolve_broker_sl_tp(normalized)
+        return normalized, whole_qty
+
     def _build_order_request(
         self,
         signal: LiveSignal,
@@ -1086,9 +1226,9 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             # sizing assumed: the caller must choose bounded-hours bracket or
             # naked extended-hours — and naked entries are not allowed.
             raise ValueError(
-                "Extended-hours entry with mandatory SL/TP is not supported: "
-                "the broker rejects bracket orders with extended_hours enabled "
-                f"(signal_id={signal.id}, symbol={signal.symbol})."
+                _EXTENDED_HOURS_BRACKET_MESSAGE.format(
+                    signal_id=signal.id, symbol=signal.symbol
+                )
             )
         # C1: explicit unbounded policy rides as OTO (entry + stop leg,
         # no take-profit leg) instead of an invented bracket.
@@ -1266,6 +1406,8 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 self._load_alpaca_order_types()
             )
 
+            signal, qty = self._normalize_bracket_entry(signal, qty)
+
             canonical_signal_id, created = await asyncio.to_thread(
                 save_live_signal, signal
             )
@@ -1331,6 +1473,10 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         normalized_symbol = str(symbol or "").strip().upper()
         if not normalized_symbol:
             raise ValueError("symbol is required for Alpaca market data")
+        # Raises UnclassifiableSymbolError (a ValueError) rather than guessing the feed.
+        is_crypto = classify_symbol(normalized_symbol) == "crypto"
+        if is_crypto:
+            normalized_symbol = canonical_crypto_symbol(normalized_symbol)
         resolved_timeframe, _normalized = _alpaca_timeframe(timeframe)
         bounded_limit = max(1, min(int(limit), 1000))
         if not self._connected or self._historical_data_client is None:
@@ -1338,7 +1484,28 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 "Alpaca adapter must be connected before requesting market data"
             )
 
+        def _fetch_crypto(slack_multiplier: float) -> pd.DataFrame:
+            from alpaca.data.historical import CryptoHistoricalDataClient
+            from alpaca.data.requests import CryptoBarsRequest
+
+            if self._crypto_data_client is None:
+                self._crypto_data_client = CryptoHistoricalDataClient(
+                    self.api_key, self.secret_key
+                )
+            request = CryptoBarsRequest(
+                symbol_or_symbols=[normalized_symbol],
+                timeframe=resolved_timeframe,
+                start=_alpaca_market_data_start(
+                    timeframe, bounded_limit, slack_multiplier=slack_multiplier
+                ),
+                limit=1000,
+                sort=Sort.DESC,
+            )
+            return self._crypto_data_client.get_crypto_bars(request).df
+
         def _fetch(slack_multiplier: float) -> pd.DataFrame:
+            if is_crypto:
+                return _fetch_crypto(slack_multiplier)
             request = StockBarsRequest(
                 symbol_or_symbols=[normalized_symbol],
                 timeframe=resolved_timeframe,

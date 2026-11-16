@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures.thread
+import errno
 import json
 import logging
 import math
 import os
 import re
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -15,7 +17,7 @@ import time
 import traceback
 import uuid
 import weakref
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
@@ -23,7 +25,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Literal
+from typing import Any, Awaitable, BinaryIO, Callable, Literal, NamedTuple
 
 import numpy as np
 import pandas as pd
@@ -39,7 +41,7 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, ValidationError
 from pydantic import Field as PydanticField
 from sentry_sdk.integrations.fastapi import FastApiIntegration
@@ -1547,8 +1549,11 @@ class BacktestsDuplicatesResponse(SQLModel):
 
 
 class BacktestsDeduplicateResponse(SQLModel):
+    dry_run: bool = False
     deleted_ids: list[str]
     kept_ids: list[str]
+    candidate_ids: list[str] = PydanticField(default_factory=list)
+    skipped_ids: list[str] = PydanticField(default_factory=list)
     groups_affected: int
     items: list[dict[str, Any]] = PydanticField(default_factory=list)
 
@@ -1560,8 +1565,11 @@ class PortfoliosDuplicatesResponse(SQLModel):
 
 
 class PortfoliosDeduplicateResponse(SQLModel):
+    dry_run: bool = False
     deleted_ids: list[str]
     kept_ids: list[str]
+    candidate_ids: list[str] = PydanticField(default_factory=list)
+    skipped_ids: list[str] = PydanticField(default_factory=list)
     groups_affected: int
     items: list[dict[str, Any]] = PydanticField(default_factory=list)
 
@@ -1572,6 +1580,51 @@ class BacktestsBulkDeleteRequest(SQLModel):
 
 class PortfoliosBulkDeleteRequest(SQLModel):
     ids: list[str]
+
+
+class BacktestsRemoveEmptyRequest(SQLModel):
+    """Two-phase bulk delete of backtests with zero trades.
+
+    Phase 1 (default, ``dry_run=True``) ignores ``ids`` and returns the exact
+    candidate list without deleting anything. Phase 2 (``dry_run=False``)
+    requires the ``ids`` returned by phase 1; every id is re-checked against
+    the zero-trades criterion before its deletion.
+    """
+
+    dry_run: bool = True
+    ids: list[str] = PydanticField(default_factory=list)
+
+
+class PortfoliosRemoveEmptyRequest(SQLModel):
+    """Two-phase bulk delete of portfolios without components.
+
+    Same contract as :class:`BacktestsRemoveEmptyRequest`.
+    """
+
+    dry_run: bool = True
+    ids: list[str] = PydanticField(default_factory=list)
+
+
+class BacktestsDeduplicateRequest(SQLModel):
+    """Two-phase bulk delete of duplicate backtests.
+
+    Same contract as :class:`BacktestsRemoveEmptyRequest`; the deletion
+    criterion is "member of a duplicate group that is not the kept (newest)
+    entry".
+    """
+
+    dry_run: bool = True
+    ids: list[str] = PydanticField(default_factory=list)
+
+
+class PortfoliosDeduplicateRequest(SQLModel):
+    """Two-phase bulk delete of duplicate portfolios.
+
+    Same contract as :class:`BacktestsDeduplicateRequest`.
+    """
+
+    dry_run: bool = True
+    ids: list[str] = PydanticField(default_factory=list)
 
 
 _SAFE_ASSET_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -3181,6 +3234,190 @@ def _delete_portfolio_with_artifacts(portfolio_id: str) -> dict[str, Any]:
     if result.get("status") in {"deleted", "cleanup_pending"}:
         _remove_portfolio_meta_cache(normalized_id)
     return result
+
+
+def _bulk_delete_skipped_item(item_id: str, reason: str) -> dict[str, Any]:
+    """Per-item entry for a confirmed id that was not deleted.
+
+    Used by the phase-2 (confirm) handlers of the two-phase bulk-delete
+    endpoints when an id no longer meets the deletion criterion.
+    """
+    return {"id": item_id, "status": "skipped", "reason": reason}
+
+
+def _bulk_delete_failed_item(item_id: str, exc: Exception) -> dict[str, Any]:
+    """Per-item entry for an unexpected error while handling one id."""
+    return {
+        "id": item_id,
+        "status": "failed",
+        "database": "not_attempted",
+        "artifact": "not_attempted",
+        "error": redact_text(str(exc))[:300],
+    }
+
+
+def _empty_backtest_candidates() -> list[dict[str, Any]]:
+    """Backtests with zero trades, with display info for the confirm dialog."""
+    candidates: list[dict[str, Any]] = []
+    for item in _snapshot_backtest_meta_cache():
+        backtest_id = str(item.get("id") or "").strip()
+        if not backtest_id:
+            continue
+        trade_count = max(int(_safe_float(item.get("trade_count"), 0.0)), 0)
+        if trade_count != 0:
+            continue
+        candidates.append(
+            {
+                "id": backtest_id,
+                "display_name": str(item.get("display_name") or ""),
+                "strategy_name": str(item.get("strategy_name") or ""),
+                "symbols": [
+                    str(symbol)
+                    for symbol in (item.get("symbols") or [])
+                    if str(symbol).strip()
+                ],
+                "timeframe": str(item.get("timeframe") or ""),
+                "trade_count": trade_count,
+                "created_at": str(item.get("created_at") or ""),
+            }
+        )
+    return candidates
+
+
+def _empty_backtest_skip_reason(backtest_id: str) -> str:
+    """Re-check the zero-trades criterion; "" when deletion may proceed.
+
+    Reads the database row fresh instead of the metadata cache so a backtest
+    that gained trades (or was deleted) between the dry run and the confirm
+    call is skipped, not deleted.
+    """
+    try:
+        row = load_backtest_metadata_row(backtest_id)
+    except Exception:
+        return "recheck_failed"
+    if row is None:
+        return "not_found"
+    trade_count = max(int(_safe_float(row.get("trade_count"), 0.0)), 0)
+    if trade_count != 0:
+        return "no_longer_empty"
+    return ""
+
+
+def _empty_portfolio_candidates() -> list[dict[str, Any]]:
+    """Portfolios without components, with display info for the confirm dialog."""
+    candidates: list[dict[str, Any]] = []
+    for portfolio in _snapshot_portfolio_payloads():
+        portfolio_id = str(portfolio.get("id") or "").strip()
+        components = portfolio.get("components")
+        has_components = isinstance(components, list) and len(components) > 0
+        if not portfolio_id or has_components:
+            continue
+        candidates.append(
+            {
+                "id": portfolio_id,
+                "name": str(portfolio.get("name") or ""),
+                "component_count": 0,
+                "created_at": str(portfolio.get("created_at") or ""),
+            }
+        )
+    return candidates
+
+
+def _empty_portfolio_skip_reason(portfolio_id: str) -> str:
+    """Re-check the no-components criterion; "" when deletion may proceed.
+
+    Snapshot reads are fresh (files and database records), so a portfolio that
+    gained components (or was deleted) between the phases is skipped.
+    """
+    try:
+        payloads = _snapshot_portfolio_payloads()
+    except Exception:
+        return "recheck_failed"
+    by_id = {str(payload.get("id") or ""): payload for payload in payloads}
+    payload = by_id.get(portfolio_id)
+    if payload is None:
+        return "not_found"
+    components = payload.get("components")
+    if isinstance(components, list) and len(components) > 0:
+        return "no_longer_empty"
+    return ""
+
+
+def _duplicate_backtest_members() -> list[dict[str, Any]]:
+    """Flatten duplicate backtest groups into per-member entries.
+
+    Every member of a group with at least two entries carries the group's
+    display info, the id of the kept (newest) entry, and whether it is that
+    kept entry itself. Ordered newest group first, like
+    :func:`_group_duplicate_backtests`.
+    """
+    groups, _ = _group_duplicate_backtests()
+    meta_by_id = {
+        str(item.get("id") or ""): item for item in _snapshot_backtest_meta_cache()
+    }
+    members: list[dict[str, Any]] = []
+    for group in groups:
+        backtests = group.get("backtests", [])
+        if len(backtests) < 2:
+            continue
+        kept_id = str(backtests[0].get("id") or "")
+        for entry in backtests:
+            entry_id = str(entry.get("id") or "")
+            if not entry_id:
+                continue
+            meta = meta_by_id.get(entry_id, {})
+            members.append(
+                {
+                    "id": entry_id,
+                    "display_name": str(meta.get("display_name") or ""),
+                    "strategy_name": str(group.get("strategy_name") or ""),
+                    "symbols": [
+                        str(symbol)
+                        for symbol in (group.get("symbols") or [])
+                        if str(symbol).strip()
+                    ],
+                    "timeframe": str(group.get("timeframe") or ""),
+                    "trade_count": max(
+                        int(_safe_float(meta.get("trade_count"), 0.0)), 0
+                    ),
+                    "created_at": str(entry.get("created_at") or ""),
+                    "fingerprint": str(group.get("fingerprint") or ""),
+                    "kept_id": kept_id,
+                    "is_kept": entry_id == kept_id,
+                }
+            )
+    return members
+
+
+def _duplicate_portfolio_members() -> list[dict[str, Any]]:
+    """Flatten duplicate portfolio groups into per-member entries.
+
+    Same shape as :func:`_duplicate_backtest_members` with portfolio display
+    info (name, component count) instead of backtest info.
+    """
+    groups, _ = _group_duplicate_portfolios()
+    members: list[dict[str, Any]] = []
+    for group in groups:
+        portfolios = group.get("portfolios", [])
+        if len(portfolios) < 2:
+            continue
+        kept_id = str(portfolios[0].get("id") or "")
+        for entry in portfolios:
+            entry_id = str(entry.get("id") or "")
+            if not entry_id:
+                continue
+            members.append(
+                {
+                    "id": entry_id,
+                    "name": str(entry.get("name") or ""),
+                    "component_count": max(int(_safe_float(group.get("component_count"), 0.0)), 0),
+                    "created_at": str(entry.get("created_at") or ""),
+                    "fingerprint": str(group.get("fingerprint") or ""),
+                    "kept_id": kept_id,
+                    "is_kept": entry_id == kept_id,
+                }
+            )
+    return members
 
 
 def _current_backtest_store_mtime_ns() -> int:
@@ -8698,7 +8935,7 @@ async def approve_strategy(relative_file: str) -> dict[str, Any]:
     }
 
 
-@app.get("/api/strategies/{name:path}", response_model=dict[str, Any])
+@app.get("/api/strategies/{name:path}")
 async def get_strategy(name: str) -> dict[str, Any]:
     entry = _safe_strategy_entry(name)
     if entry is None:
@@ -8738,11 +8975,140 @@ async def rename_strategy(name: str, payload: NameUpdateRequest) -> dict[str, An
         raise HTTPException(status_code=500, detail=_internal_error_detail(exc, "strategy rename")) from exc
 
 
+def _contained_in_results_dir(path: Path) -> bool:
+    """Whether ``path`` is a file directly inside the resolved results directory.
+
+    The directory itself is refused: it is contained, and handing it out would
+    send a caller (or a response) at a directory instead of a file.
+    """
+    base = MATRIX_RESULTS_DIR.resolve()
+    return path != base and path.is_relative_to(base)
+
+
 def _matrix_result_path(filename: str) -> Path:
+    """Return the resolved path of a matrix result file inside MATRIX_RESULTS_DIR.
+
+    Separator and drive forms are refused up front so the same input is rejected
+    on Linux, Windows and macOS alike. The candidate is then resolved (following
+    symlinks) and must stay inside the resolved results directory (#155).
+    """
     normalized = str(filename or "").strip()
-    if not normalized or ".." in normalized or normalized.startswith("/"):
+    if (
+        not normalized
+        or ".." in normalized
+        or normalized.startswith("/")
+        or "\\" in normalized
+        or ":" in normalized
+    ):
         raise HTTPException(status_code=400, detail="Invalid matrix filename")
-    return MATRIX_RESULTS_DIR / normalized
+    resolved = (MATRIX_RESULTS_DIR / normalized).resolve()
+    if not _contained_in_results_dir(resolved):
+        raise HTTPException(status_code=400, detail="Invalid matrix filename")
+    return resolved
+
+
+class _CheckedMatrixResult(NamedTuple):
+    """A matrix result file opened from the path that containment approved."""
+
+    path: Path
+    handle: BinaryIO
+    size: int
+
+
+def _checked_matrix_result(filename: str, *, not_found_detail: str) -> _CheckedMatrixResult:
+    """Open the matrix result file :func:`_matrix_result_path` just approved.
+
+    Checking a path and opening it are two separate walks, so containment alone
+    is a check-time promise: anything renamed inside the results directory in
+    between the two would have been followed. The descriptor opened here is the
+    one the response streams, so the file that is served is the file that was
+    checked, and four things are refused instead of followed (#155):
+
+    * ``O_NOFOLLOW``, where the platform provides it, makes the kernel refuse a
+      final component that has become a symlink since the check;
+    * the path is resolved *again* after the open and required to be contained,
+      which covers a swapped directory component -- the same escape one level
+      up, and one the kernel cannot see at the final component;
+    * a regular file is required, so a name that resolves to a directory, or to
+      a file that is gone, answers the caller instead of failing inside the
+      response;
+    * ``O_NONBLOCK`` keeps the open itself from blocking, so a FIFO or device
+      planted under the name answers instead of stalling the request -- and with
+      it the event loop every other request shares.
+
+    ``O_NOFOLLOW`` is read through ``getattr`` because it is not in every
+    platform's ``os`` module; where it is missing, the containment re-check is
+    what closes that window. A rename that is undone before that re-check cannot
+    be seen from here at all; excluding it needs the components opened one at a
+    time relative to a directory descriptor (``dir_fd``), which is not available
+    on every platform this runs on.
+    """
+    path = _matrix_result_path(filename)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    nonblock = getattr(os, "O_NONBLOCK", 0)
+    # Windows opens in text mode unless O_BINARY is passed: reads would turn
+    # CRLF into LF and stop at 0x1A, so the body would not match Content-Length.
+    binary = getattr(os, "O_BINARY", 0)
+    try:
+        descriptor = os.open(path, os.O_RDONLY | binary | nofollow | nonblock)
+    except OSError as exc:
+        if exc.errno == getattr(errno, "ELOOP", None):
+            # A symlink stands where the check found a regular file.
+            raise HTTPException(status_code=400, detail="Invalid matrix filename") from exc
+        raise HTTPException(status_code=404, detail=not_found_detail) from exc
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise HTTPException(status_code=404, detail=not_found_detail)
+        if not _contained_in_results_dir(Path(os.path.realpath(path))):
+            raise HTTPException(status_code=400, detail="Invalid matrix filename")
+    except HTTPException:
+        os.close(descriptor)
+        raise
+    except OSError as exc:
+        os.close(descriptor)
+        raise HTTPException(status_code=404, detail=not_found_detail) from exc
+    return _CheckedMatrixResult(path, os.fdopen(descriptor, "rb"), info.st_size)
+
+
+class _MatrixCsvResponse(StreamingResponse):
+    """Stream a matrix CSV from the descriptor that containment checked.
+
+    ``FileResponse`` opens its path when the response is sent, so the bytes it
+    serves come from a second, unchecked walk -- the window
+    ``_checked_matrix_result`` exists to close. Streaming the open descriptor
+    instead keeps the route declared as a CSV download.
+    """
+
+    media_type = "text/csv"
+
+
+def _stream_matrix_result(handle: BinaryIO, chunk_size: int = 64 * 1024) -> Iterator[bytes]:
+    """Yield the open descriptor's bytes in the order it reads them.
+
+    A generator, so the reads run where ``StreamingResponse`` runs its content
+    -- in a thread pool -- rather than on the event loop.
+    """
+    try:
+        while True:
+            chunk = handle.read(chunk_size)
+            if not chunk:
+                return
+            yield chunk
+    finally:
+        handle.close()
+
+
+def _matrix_result_response(filename: str, *, not_found_detail: str) -> _MatrixCsvResponse:
+    """Serve a matrix result file, or say why there is nothing to serve."""
+    checked = _checked_matrix_result(filename, not_found_detail=not_found_detail)
+    return _MatrixCsvResponse(
+        _stream_matrix_result(checked.handle),
+        headers={
+            "content-disposition": f'attachment; filename="{checked.path.name}"',
+            "content-length": str(checked.size),
+        },
+    )
 
 
 def _stale_grid_findings(
@@ -8834,6 +9200,9 @@ def _matrix_summary_payload() -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=_internal_error_detail(exc, "matrix summary")) from exc
     runs = [row for row in payload.get("runs", []) if isinstance(row, dict)]
     _refuse_stale_grid_rows(runs, source="matrix summary")
+    # A path, not an open file: these are informational strings describing where
+    # the results would be, so a run that produced no CSV yet still answers. The
+    # routes that serve them go through _checked_matrix_result.
     payload["matrix_csv"] = str(_matrix_result_path("matrix_matrix.csv"))
     payload["daily_equity_csv"] = str(_matrix_result_path("matrix_daily_equity.csv"))
     return payload
@@ -8911,20 +9280,16 @@ async def get_backtest_matrix_summary() -> dict[str, Any]:
     return _matrix_summary_payload()
 
 
-@app.get("/api/backtests/matrix/matrix.csv", response_class=FileResponse)
-async def get_backtest_matrix_csv() -> FileResponse:
-    path = _matrix_result_path("matrix_matrix.csv")
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="Matrix CSV not found")
-    return FileResponse(path, media_type="text/csv", filename=path.name)
+@app.get("/api/backtests/matrix/matrix.csv", response_class=_MatrixCsvResponse)
+async def get_backtest_matrix_csv() -> _MatrixCsvResponse:
+    return _matrix_result_response("matrix_matrix.csv", not_found_detail="Matrix CSV not found")
 
 
-@app.get("/api/backtests/matrix/daily-equity.csv", response_class=FileResponse)
-async def get_backtest_matrix_daily_equity_csv() -> FileResponse:
-    path = _matrix_result_path("matrix_daily_equity.csv")
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="Matrix daily equity CSV not found")
-    return FileResponse(path, media_type="text/csv", filename=path.name)
+@app.get("/api/backtests/matrix/daily-equity.csv", response_class=_MatrixCsvResponse)
+async def get_backtest_matrix_daily_equity_csv() -> _MatrixCsvResponse:
+    return _matrix_result_response(
+        "matrix_daily_equity.csv", not_found_detail="Matrix daily equity CSV not found"
+    )
 
 
 @app.get("/api/grid/{strategy_id:path}")
@@ -9071,58 +9436,179 @@ async def list_backtest_duplicates() -> BacktestsDuplicatesResponse:
 
 
 @app.post("/api/backtests/deduplicate")
-async def deduplicate_backtests() -> BacktestsDeduplicateResponse:
-    groups, _ = _group_duplicate_backtests()
-    deleted_ids: list[str] = []
+async def deduplicate_backtests(
+    payload: BacktestsDeduplicateRequest | None = None,
+) -> BacktestsDeduplicateResponse:
+    """Two-phase bulk delete of duplicate backtests (dry-run + confirm).
+
+    Phase 1 (default, ``dry_run=True``): returns ``candidate_ids`` — exactly
+    the ids that would be deleted (every duplicate-group member except the
+    kept newest entry) — plus per-candidate display info in ``items``. Nothing
+    is deleted.
+
+    Phase 2 (``dry_run=False``): requires ``ids``, the candidate id list from
+    phase 1. Only submitted ids are deleted, and each id is re-checked against
+    the criterion first: a member that is no longer in a duplicate group, is
+    now the kept newest entry, or no longer exists is reported per item with
+    status ``skipped`` and a ``reason`` and is not deleted. A phase-2 call
+    without ``ids`` deletes nothing and returns HTTP 400.
+
+    Deletion is journaled per item, so a failure in the middle leaves earlier
+    items deleted; ``items`` reports every item (``deleted`` / ``skipped`` /
+    ``failed``) and retrying with the same id list is safe (an id that is no
+    longer a duplicate comes back as ``no_longer_duplicate``). Nothing outside
+    the submitted list is ever touched.
+    """
+    request = payload or BacktestsDeduplicateRequest()
+    members = _duplicate_backtest_members()
     kept_ids: list[str] = []
+    seen_kept: set[str] = set()
+    for member in members:
+        member_id = str(member["id"])
+        if member["is_kept"] and member_id not in seen_kept:
+            seen_kept.add(member_id)
+            kept_ids.append(member_id)
+    candidates = [member for member in members if not member["is_kept"]]
+    candidate_ids = [str(member["id"]) for member in candidates]
+
+    if request.dry_run:
+        return BacktestsDeduplicateResponse(
+            dry_run=True,
+            deleted_ids=[],
+            kept_ids=kept_ids,
+            candidate_ids=candidate_ids,
+            skipped_ids=[],
+            groups_affected=len(
+                {str(member.get("fingerprint") or "") for member in candidates}
+            ),
+            items=[{**member, "status": "candidate"} for member in candidates],
+        )
+
+    if not request.ids:
+        raise HTTPException(
+            status_code=400,
+            detail="dry_run=false requires the id list returned by the dry run",
+        )
+
+    member_by_id = {str(member["id"]): member for member in members}
+    deleted_ids: list[str] = []
+    skipped_ids: list[str] = []
+    affected_fingerprints: set[str] = set()
     items: list[dict[str, Any]] = []
-    affected = 0
-
-    for group in groups:
-        backtests = group.get("backtests", [])
-        if len(backtests) < 2:
+    seen: set[str] = set()
+    for raw_id in request.ids:
+        backtest_id = str(raw_id or "").strip()
+        if not backtest_id or backtest_id in seen:
             continue
-        keep_id = str(backtests[0].get("id") or "")
-        if keep_id:
-            kept_ids.append(keep_id)
-
-        removed_in_group = False
-        for entry in backtests[1:]:
-            backtest_id = str(entry.get("id") or "")
-            if not backtest_id:
-                continue
+        seen.add(backtest_id)
+        member = member_by_id.get(backtest_id)
+        if member is None:
+            items.append(_bulk_delete_skipped_item(backtest_id, "no_longer_duplicate"))
+            skipped_ids.append(backtest_id)
+            continue
+        if member.get("is_kept"):
+            items.append(_bulk_delete_skipped_item(backtest_id, "now_kept_entry"))
+            skipped_ids.append(backtest_id)
+            continue
+        try:
             result = _delete_backtest_with_artifacts(backtest_id)
-            items.append(result)
-            if result.get("status") == "deleted":
-                deleted_ids.append(backtest_id)
-                removed_in_group = True
-        if removed_in_group:
-            affected += 1
+        except Exception as exc:
+            logger.exception(
+                "Backtest bulk delete failed",
+                extra={"data": {"backtest": _log_safe(backtest_id), "error": str(exc)}},
+            )
+            result = _bulk_delete_failed_item(backtest_id, exc)
+        items.append(result)
+        if result.get("status") == "deleted":
+            deleted_ids.append(backtest_id)
+            affected_fingerprints.add(str(member.get("fingerprint") or ""))
 
     return BacktestsDeduplicateResponse(
+        dry_run=False,
         deleted_ids=deleted_ids,
         kept_ids=kept_ids,
-        groups_affected=affected,
+        candidate_ids=[],
+        skipped_ids=skipped_ids,
+        groups_affected=len(affected_fingerprints),
         items=items,
     )
 
 
 @app.post("/api/backtests/remove-empty")
-async def remove_empty_backtests() -> dict[str, Any]:
-    removed = 0
+async def remove_empty_backtests(
+    payload: BacktestsRemoveEmptyRequest | None = None,
+) -> dict[str, Any]:
+    """Two-phase bulk delete of backtests with zero trades (dry-run + confirm).
+
+    Phase 1 (default, ``dry_run=True``): returns ``candidates`` (id, name,
+    strategy, symbols, timeframe, trade count) and ``candidate_ids`` — exactly
+    the backtests that would be deleted. Nothing is deleted.
+
+    Phase 2 (``dry_run=False``): requires ``ids``, the candidate id list from
+    phase 1. Only submitted ids are deleted, and each id is re-checked against
+    the zero-trades criterion first (fresh database read, not the cache): a
+    backtest that gained trades or no longer exists is reported per item with
+    status ``skipped`` and a ``reason`` and is not deleted. A phase-2 call
+    without ``ids`` deletes nothing and returns HTTP 400.
+
+    Deletion is journaled per item, so a failure in the middle leaves earlier
+    items deleted; ``items`` reports every item (``deleted`` / ``skipped`` /
+    ``failed`` / ``cleanup_pending``) and retrying with the same id list is
+    safe. Nothing outside the submitted list is ever touched.
+    """
+    request = payload or BacktestsRemoveEmptyRequest()
+    if request.dry_run:
+        candidates = _empty_backtest_candidates()
+        return {
+            "dry_run": True,
+            "candidates": candidates,
+            "candidate_ids": [str(candidate["id"]) for candidate in candidates],
+        }
+
+    if not request.ids:
+        raise HTTPException(
+            status_code=400,
+            detail="dry_run=false requires the id list returned by the dry run",
+        )
+
+    deleted = 0
+    skipped = 0
+    failed = 0
+    removed_ids: list[str] = []
     items: list[dict[str, Any]] = []
-    for item in _snapshot_backtest_meta_cache():
-        backtest_id = str(item.get("id") or "").strip()
-        if not backtest_id:
+    seen: set[str] = set()
+    for raw_id in request.ids:
+        backtest_id = str(raw_id or "").strip()
+        if not backtest_id or backtest_id in seen:
             continue
-        trade_count = max(int(_safe_float(item.get("trade_count"), 0.0)), 0)
-        if trade_count != 0:
+        seen.add(backtest_id)
+        skip_reason = _empty_backtest_skip_reason(backtest_id)
+        if skip_reason:
+            items.append(_bulk_delete_skipped_item(backtest_id, skip_reason))
+            skipped += 1
             continue
-        result = _delete_backtest_with_artifacts(backtest_id)
+        try:
+            result = _delete_backtest_with_artifacts(backtest_id)
+        except Exception as exc:
+            logger.exception(
+                "Backtest bulk delete failed",
+                extra={"data": {"backtest": _log_safe(backtest_id), "error": str(exc)}},
+            )
+            result = _bulk_delete_failed_item(backtest_id, exc)
         items.append(result)
         if result.get("status") == "deleted":
-            removed += 1
-    return {"removed": removed, "items": items}
+            deleted += 1
+            removed_ids.append(backtest_id)
+        elif result.get("status") in {"failed", "cleanup_pending"}:
+            failed += 1
+    return {
+        "dry_run": False,
+        "deleted": deleted,
+        "skipped": skipped,
+        "failed": failed,
+        "removed_ids": removed_ids,
+        "items": items,
+    }
 
 
 @app.post("/api/backtests/delete-bulk")
@@ -11591,61 +12077,178 @@ async def list_portfolio_duplicates() -> PortfoliosDuplicatesResponse:
 
 
 @app.post("/api/portfolios/deduplicate")
-async def deduplicate_portfolios() -> PortfoliosDeduplicateResponse:
-    groups, _ = _group_duplicate_portfolios()
-    deleted_ids: list[str] = []
+async def deduplicate_portfolios(
+    payload: PortfoliosDeduplicateRequest | None = None,
+) -> PortfoliosDeduplicateResponse:
+    """Two-phase bulk delete of duplicate portfolios (dry-run + confirm).
+
+    Phase 1 (default, ``dry_run=True``): returns ``candidate_ids`` — exactly
+    the ids that would be deleted (every duplicate-group member except the
+    kept newest entry) — plus per-candidate display info in ``items``. Nothing
+    is deleted.
+
+    Phase 2 (``dry_run=False``): requires ``ids``, the candidate id list from
+    phase 1. Only submitted ids are deleted, and each id is re-checked against
+    the criterion first: a portfolio that is no longer in a duplicate group,
+    is now the kept newest entry, or no longer exists is reported per item
+    with status ``skipped`` and a ``reason`` and is not deleted. A phase-2
+    call without ``ids`` deletes nothing and returns HTTP 400.
+
+    Deletion is journaled per item, so a failure in the middle leaves earlier
+    items deleted; ``items`` reports every item (``deleted`` / ``skipped`` /
+    ``failed``) and retrying with the same id list is safe (an id that is no
+    longer a duplicate comes back as ``no_longer_duplicate``). Nothing outside
+    the submitted list is ever touched.
+    """
+    request = payload or PortfoliosDeduplicateRequest()
+    members = _duplicate_portfolio_members()
     kept_ids: list[str] = []
+    seen_kept: set[str] = set()
+    for member in members:
+        member_id = str(member["id"])
+        if member["is_kept"] and member_id not in seen_kept:
+            seen_kept.add(member_id)
+            kept_ids.append(member_id)
+    candidates = [member for member in members if not member["is_kept"]]
+    candidate_ids = [str(member["id"]) for member in candidates]
+
+    if request.dry_run:
+        return PortfoliosDeduplicateResponse(
+            dry_run=True,
+            deleted_ids=[],
+            kept_ids=kept_ids,
+            candidate_ids=candidate_ids,
+            skipped_ids=[],
+            groups_affected=len(
+                {str(member.get("fingerprint") or "") for member in candidates}
+            ),
+            items=[{**member, "status": "candidate"} for member in candidates],
+        )
+
+    if not request.ids:
+        raise HTTPException(
+            status_code=400,
+            detail="dry_run=false requires the id list returned by the dry run",
+        )
+
+    member_by_id = {str(member["id"]): member for member in members}
+    deleted_ids: list[str] = []
+    skipped_ids: list[str] = []
+    affected_fingerprints: set[str] = set()
     items: list[dict[str, Any]] = []
-    affected = 0
-
-    for group in groups:
-        portfolios = group.get("portfolios", [])
-        if len(portfolios) < 2:
+    seen: set[str] = set()
+    for raw_id in request.ids:
+        portfolio_id = str(raw_id or "").strip()
+        if not portfolio_id or portfolio_id in seen:
             continue
-        keep_id = str(portfolios[0].get("id") or "")
-        if keep_id:
-            kept_ids.append(keep_id)
-
-        removed_in_group = False
-        for entry in portfolios[1:]:
-            portfolio_id = str(entry.get("id") or "")
-            if not portfolio_id:
-                continue
+        seen.add(portfolio_id)
+        member = member_by_id.get(portfolio_id)
+        if member is None:
+            items.append(_bulk_delete_skipped_item(portfolio_id, "no_longer_duplicate"))
+            skipped_ids.append(portfolio_id)
+            continue
+        if member.get("is_kept"):
+            items.append(_bulk_delete_skipped_item(portfolio_id, "now_kept_entry"))
+            skipped_ids.append(portfolio_id)
+            continue
+        try:
             result = _delete_portfolio_with_artifacts(portfolio_id)
-            items.append(result)
-            if result.get("status") == "deleted":
-                deleted_ids.append(portfolio_id)
-                removed_in_group = True
-        if removed_in_group:
-            affected += 1
+        except Exception as exc:
+            logger.exception(
+                "Portfolio bulk delete failed",
+                extra={"data": {"portfolio": _log_safe(portfolio_id), "error": str(exc)}},
+            )
+            result = _bulk_delete_failed_item(portfolio_id, exc)
+        items.append(result)
+        if result.get("status") == "deleted":
+            deleted_ids.append(portfolio_id)
+            affected_fingerprints.add(str(member.get("fingerprint") or ""))
 
     return PortfoliosDeduplicateResponse(
+        dry_run=False,
         deleted_ids=deleted_ids,
         kept_ids=kept_ids,
-        groups_affected=affected,
+        candidate_ids=[],
+        skipped_ids=skipped_ids,
+        groups_affected=len(affected_fingerprints),
         items=items,
     )
 
 
 @app.post("/api/portfolios/remove-empty")
-async def remove_empty_portfolios() -> dict[str, Any]:
-    portfolios = _snapshot_portfolio_payloads()
+async def remove_empty_portfolios(
+    payload: PortfoliosRemoveEmptyRequest | None = None,
+) -> dict[str, Any]:
+    """Two-phase bulk delete of portfolios without components (dry-run + confirm).
+
+    Phase 1 (default, ``dry_run=True``): returns ``candidates`` (id, name,
+    component count) and ``candidate_ids`` — exactly the portfolios that
+    would be deleted. Nothing is deleted.
+
+    Phase 2 (``dry_run=False``): requires ``ids``, the candidate id list from
+    phase 1. Only submitted ids are deleted, and each id is re-checked against
+    the no-components criterion first: a portfolio that gained components or
+    no longer exists is reported per item with status ``skipped`` and a
+    ``reason`` and is not deleted. A phase-2 call without ``ids`` deletes
+    nothing and returns HTTP 400.
+
+    Deletion is journaled per item, so a failure in the middle leaves earlier
+    items deleted; ``items`` reports every item (``deleted`` / ``skipped`` /
+    ``failed`` / ``cleanup_pending``) and retrying with the same id list is
+    safe. Nothing outside the submitted list is ever touched.
+    """
+    request = payload or PortfoliosRemoveEmptyRequest()
+    if request.dry_run:
+        candidates = _empty_portfolio_candidates()
+        return {
+            "dry_run": True,
+            "candidates": candidates,
+            "candidate_ids": [str(candidate["id"]) for candidate in candidates],
+        }
+
+    if not request.ids:
+        raise HTTPException(
+            status_code=400,
+            detail="dry_run=false requires the id list returned by the dry run",
+        )
+
+    deleted = 0
+    skipped = 0
+    failed = 0
     removed_ids: list[str] = []
     items: list[dict[str, Any]] = []
-    for portfolio in portfolios:
-        portfolio_id = str(portfolio.get("id") or "").strip()
-        components = portfolio.get("components")
-        has_components = isinstance(components, list) and len(components) > 0
-        if not portfolio_id or has_components:
+    seen: set[str] = set()
+    for raw_id in request.ids:
+        portfolio_id = str(raw_id or "").strip()
+        if not portfolio_id or portfolio_id in seen:
             continue
-        result = _delete_portfolio_with_artifacts(portfolio_id)
+        seen.add(portfolio_id)
+        skip_reason = _empty_portfolio_skip_reason(portfolio_id)
+        if skip_reason:
+            items.append(_bulk_delete_skipped_item(portfolio_id, skip_reason))
+            skipped += 1
+            continue
+        try:
+            result = _delete_portfolio_with_artifacts(portfolio_id)
+        except Exception as exc:
+            logger.exception(
+                "Portfolio bulk delete failed",
+                extra={"data": {"portfolio": _log_safe(portfolio_id), "error": str(exc)}},
+            )
+            result = _bulk_delete_failed_item(portfolio_id, exc)
         items.append(result)
         if result.get("status") == "deleted":
+            deleted += 1
             removed_ids.append(portfolio_id)
+        elif result.get("status") in {"failed", "cleanup_pending"}:
+            failed += 1
 
     remaining = len(_snapshot_portfolio_payloads())
     return {
-        "removed": len(removed_ids),
+        "dry_run": False,
+        "deleted": deleted,
+        "skipped": skipped,
+        "failed": failed,
         "remaining": remaining,
         "removed_ids": removed_ids,
         "items": items,
@@ -13664,7 +14267,7 @@ async def data_category_details(category_name: str) -> dict[str, Any]:
     return await asyncio.to_thread(_data_category_payload, category_name)
 
 
-@app.post("/api/data/cache/invalidate", response_model=dict[str, Any])
+@app.post("/api/data/cache/invalidate")
 async def invalidate_data_cache(
     reason: str = Query(default="manual"),
     include_validation: bool | None = Query(default=None),
