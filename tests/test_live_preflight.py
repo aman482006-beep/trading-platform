@@ -1138,15 +1138,47 @@ def test_live_preflight_crash_traceback_redacts_expanded_values_everywhere(
     assert len(crash_records) == 1
     assert crash_records[0]["level"] == "ERROR"
     assert "Traceback" in crash_records[0]["message"]
-    assert "RuntimeError: deployment check saw ${PREFLIGHT_TEST_SECRET_REF}" in (
-        crash_records[0]["message"]
-    )
+    expected_line = "RuntimeError: deployment check saw ${PREFLIGHT_TEST_SECRET_REF}"
+    assert expected_line in crash_records[0]["message"]
     assert _SECRET_REF_VALUE not in json.dumps(log_records)
 
     document = json.loads(captured.out)
     assert document["deployment_errors"] == [
         "RuntimeError: deployment check saw ${PREFLIGHT_TEST_SECRET_REF}"
     ]
+
+
+def test_live_preflight_crash_without_redaction_set_prints_no_traceback(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the accounts env file cannot be resolved, no redaction set exists, so a
+    crash must print neither its traceback nor its message, only the type."""
+    import json
+
+    import live_runner.preflight as preflight
+    from shared import logging as shared_logging
+
+    config_path = _write_config(tmp_path / "live_deployments.yaml", "accounts: []\n")
+
+    def _unresolvable(*_args: object, **_kwargs: object) -> None:
+        raise OSError(f"cannot resolve accounts env holding {_SECRET_REF_VALUE}")
+
+    monkeypatch.setattr(preflight, "_accounts_env_views", _unresolvable)
+    monkeypatch.setattr(shared_logging, "_loggers", {})
+    monkeypatch.setattr(shared_logging, "_console_stream_name", "stdout")
+    monkeypatch.setattr(shared_logging, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(preflight, "logger", shared_logging.get_logger("preflight-no-redact"))
+
+    rc = preflight.main(["--config", str(config_path), "--accounts-env", str(tmp_path / "x.env")])
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert _SECRET_REF_VALUE not in captured.out
+    assert _SECRET_REF_VALUE not in captured.err
+    assert "Traceback" not in captured.err
+    assert json.loads(captured.out)["deployment_errors"] == ["OSError"]
 
 
 def test_live_preflight_ctrader_invalid_demo_value_is_redacted(tmp_path: Path) -> None:
@@ -1195,8 +1227,10 @@ def test_redact_values_matches_a_value_in_its_repr_escaped_form() -> None:
     message = f"Invalid value: {value!r}. Raw: {value}"
 
     reference = "${TOKEN}"
+    # repr picks the quote character; redaction keeps it and swaps only the value.
+    quote = repr(value)[0]
     assert _redact_values(message, {"TOKEN": value}) == (
-        f"Invalid value: {reference!r}. Raw: {reference}"
+        f"Invalid value: {quote}{reference}{quote}. Raw: {reference}"
     )
 
 
