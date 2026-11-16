@@ -18,6 +18,7 @@ and never becomes a new short on a deployment that allows shorting.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -1052,9 +1053,11 @@ def test_a_second_exit_waits_for_the_first_to_finish(monkeypatch, caplog) -> Non
         _run_submit(adapter, deployment, _exit_trade_signal(fraction=0.5))
 
     assert adapter.submitted == []
-    warnings = _records_at(caplog, logging.WARNING, "previous exit")
-    assert warnings, [record.getMessage() for record in caplog.records]
-    assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
+    # The refused exit leaves a position open: ERROR (#142 review), not WARNING.
+    errors = _records_at(caplog, logging.ERROR, "previous exit")
+    assert errors, [record.getMessage() for record in caplog.records]
+    assert "this deployment" in errors[0].data["reason"]
+    assert not _records_at(caplog, logging.WARNING, "previous exit")
 
 
 def test_an_exit_still_working_under_its_client_order_id_blocks_too(monkeypatch) -> None:
@@ -1125,7 +1128,7 @@ def test_an_unverifiable_previous_exit_blocks(monkeypatch, caplog) -> None:
         _run_submit(adapter, deployment, _sell_trade_signal())
 
     assert adapter.submitted == []
-    assert _records_at(caplog, logging.WARNING, "previous exit")
+    assert _records_at(caplog, logging.ERROR, "previous exit")
 
 
 def test_no_unfilled_previous_exit_never_asks_the_broker(monkeypatch) -> None:
@@ -1376,11 +1379,12 @@ _OTHER_DEPLOYMENT_EXIT = {
 }
 
 
-def test_an_exit_of_another_deployment_on_the_account_blocks_this_exit(
+def test_an_exit_of_another_deployment_on_the_account_does_not_drop_this_exit(
     monkeypatch, caplog
 ) -> None:
-    """Two deployments share one netted account: while the other's exit is still
-    working, this one must not be sized against a position without its fills."""
+    """Two deployments share one netted account and both hold AAPL: the first's
+    exit is still working (market closed) when this one's is processed. This
+    one is sized against what remains (broker 15 - 5 reserved), not dropped."""
     deployment = _deployment(allow_short=False)
     _patch_ledger(
         monkeypatch, deployment, 10.0, others={_OTHER: 5.0},
@@ -1391,25 +1395,134 @@ def test_an_exit_of_another_deployment_on_the_account_blocks_this_exit(
     with caplog.at_level(logging.INFO):
         _run_submit(adapter, deployment, _exit_trade_signal())
 
-    assert adapter.submitted == []
-    refusals = _records_at(caplog, logging.WARNING, "previous exit")
-    assert refusals, [record.getMessage() for record in caplog.records]
-    reason = refusals[0].data["reason"]
-    assert "ord-other" in reason
-    assert _OTHER in reason
-    assert deployment.account_id in reason
+    assert [qty for _signal, qty in adapter.submitted] == [pytest.approx(10.0)]
     assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
 
 
 def test_the_other_deployments_exit_is_found_by_its_client_order_id_too(monkeypatch) -> None:
     deployment = _deployment(allow_short=False)
     row = {**_OTHER_DEPLOYMENT_EXIT, "broker_order_id": ""}
-    _patch_ledger(monkeypatch, deployment, 10.0, other_unfilled_exits=[row])
-    adapter = _WorkingOrdersAdapter([{"symbol": "AAPL", "qty": 15.0}], {"sig-other"})
+    _patch_ledger(
+        monkeypatch, deployment, 10.0, others={_OTHER: 5.0}, other_unfilled_exits=[row]
+    )
+    # Broker 12 and 5 reserved: only found via the client order id, the cap is 7.
+    adapter = _WorkingOrdersAdapter([{"symbol": "AAPL", "qty": 12.0}], {"sig-other"})
 
     _run_submit(adapter, deployment, _exit_trade_signal())
 
+    assert [qty for _signal, qty in adapter.submitted] == [pytest.approx(7.0)]
+
+
+def test_only_the_unfilled_part_of_the_other_exit_is_reserved(monkeypatch) -> None:
+    deployment = _deployment(allow_short=False)
+    row = {**_OTHER_DEPLOYMENT_EXIT, "requested_qty": 5.0, "filled_qty": 3.0}
+    _patch_ledger(
+        monkeypatch, deployment, 10.0, others={_OTHER: 2.0}, other_unfilled_exits=[row]
+    )
+    adapter = _WorkingOrdersAdapter([{"symbol": "AAPL", "qty": 12.0}], {"ord-other"})
+
+    _run_submit(adapter, deployment, _exit_trade_signal())
+
+    assert [qty for _signal, qty in adapter.submitted] == [pytest.approx(10.0)]
+
+
+def test_a_capped_exit_behind_another_working_exit_raises_the_ledger_alert(
+    monkeypatch, caplog
+) -> None:
+    """Broker 12 - 5 reserved = 7 < own 10 (the ledgers add up to 15): the exit
+    goes out capped at 7 and an operator is told."""
+    deployment = _deployment(allow_short=False)
+    _patch_ledger(
+        monkeypatch, deployment, 10.0, others={_OTHER: 2.0},
+        other_unfilled_exits=[_OTHER_DEPLOYMENT_EXIT],
+    )
+    adapter = _WorkingOrdersAdapter([{"symbol": "AAPL", "qty": 12.0}], {"ord-other"})
+
+    with caplog.at_level(logging.INFO):
+        _run_submit(adapter, deployment, _exit_trade_signal())
+
+    assert [qty for _signal, qty in adapter.submitted] == [pytest.approx(7.0)]
+    alerts = [
+        record
+        for record in caplog.records
+        if record.levelno == logging.ERROR
+        and getattr(record, "data", {}).get("alert") == "exit_ledger_mismatch"
+    ]
+    assert alerts, [record.getMessage() for record in caplog.records]
+
+
+def test_nothing_left_after_the_other_working_exits_is_an_error_and_sends_nothing(
+    monkeypatch, caplog
+) -> None:
+    deployment = _deployment(allow_short=False)
+    _patch_ledger(
+        monkeypatch, deployment, 10.0, others={_OTHER: 5.0},
+        other_unfilled_exits=[{**_OTHER_DEPLOYMENT_EXIT, "requested_qty": 15.0}],
+    )
+    adapter = _WorkingOrdersAdapter([{"symbol": "AAPL", "qty": 15.0}], {"ord-other"})
+
+    with caplog.at_level(logging.INFO):
+        _run_submit(adapter, deployment, _exit_trade_signal())
+
     assert adapter.submitted == []
+    errors = _records_at(caplog, logging.ERROR, "previous exit")
+    assert errors, [record.getMessage() for record in caplog.records]
+    assert "ord-other" in errors[0].data["reason"]
+    assert _OTHER in errors[0].data["reason"]
+    assert not _records_at(caplog, logging.WARNING, "previous exit")
+
+
+def test_a_working_exit_of_the_other_deployments_opposite_side_reserves_nothing(
+    monkeypatch,
+) -> None:
+    deployment = _deployment(allow_short=False)
+    _patch_ledger(
+        monkeypatch, deployment, 10.0, others={_OTHER: 0.0},
+        other_unfilled_exits=[{**_OTHER_DEPLOYMENT_EXIT, "action": "buy"}],
+    )
+    adapter = _WorkingOrdersAdapter([{"symbol": "AAPL", "qty": 10.0}], {"ord-other"})
+
+    _run_submit(adapter, deployment, _exit_trade_signal())
+
+    assert [qty for _signal, qty in adapter.submitted] == [pytest.approx(10.0)]
+
+
+def test_one_message_fans_out_to_two_deployments_and_both_exit(monkeypatch) -> None:
+    """A then B on one account. A's market exit is submitted and stays working
+    (no fills yet); B must still submit exactly its own quantity."""
+    import live_runner.daemon as daemon
+
+    first, second = _deployment(allow_short=False), _deployment(allow_short=False)
+    _patch_ledger(monkeypatch, first, 6.0, others={str(second.id): 4.0})
+    submitted_by_first: list[dict] = []
+
+    def _account_unfilled(account_id, symbol, *, exclude_deployment_id=None):
+        # A's exit, persisted at submission, is the only row; B sees it as other.
+        if exclude_deployment_id == str(second.id):
+            return []
+        return [
+            {"signal_id": "sig-a", "deployment_id": str(first.id),
+             "broker_order_id": "ord-a", "requested_qty": 6.0, "filled_qty": 0.0,
+             "action": "sell"}
+        ] if submitted_by_first else []
+
+    monkeypatch.setattr(daemon, "list_account_unfilled_exit_orders", _account_unfilled)
+
+    class _Fan(_WorkingOrdersAdapter):
+        async def submit_order(self, signal, *, qty=None):
+            if not self.submitted:
+                submitted_by_first.append({})
+            return await super().submit_order(signal, qty=qty)
+
+    adapter = _Fan([{"symbol": "AAPL", "qty": 10.0}], {"ord-a"})
+
+    _run_submit(adapter, first, _exit_trade_signal())
+    _run_submit(adapter, second, _exit_trade_signal())
+
+    assert [qty for _signal, qty in adapter.submitted] == [
+        pytest.approx(6.0),
+        pytest.approx(4.0),
+    ]
 
 
 def test_once_the_other_deployments_exit_is_done_this_exit_is_capped_to_the_fresh_broker_qty(
@@ -1549,6 +1662,7 @@ def test_account_unfilled_exits_span_deployments_of_the_account_only(isolated_db
     assert by_id[siblings]["deployment_id"] == sibling
     assert by_id[siblings]["broker_order_id"] == "o2"
     assert by_id[siblings]["filled_qty"] == pytest.approx(1.0)
+    assert by_id[siblings]["action"] == "sell"
 
     others = database.list_account_unfilled_exit_orders(
         "shared-acc", "AAPL", exclude_deployment_id=mine
@@ -1623,3 +1737,31 @@ def test_the_submitted_log_records_the_order_actually_sent(monkeypatch, caplog) 
     assert len(submitted) == 1
     assert submitted[0].data["action"] == "buy"
     assert submitted[0].data["exit"] is True
+
+
+@pytest.mark.parametrize("exit_signal", [True, False], ids=["exit", "entry"])
+def test_a_stale_exit_is_logged_at_warning_an_entry_at_info(caplog, exit_signal) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    import live_runner.daemon as daemon
+
+    signal = _exit_trade_signal() if exit_signal else _sell_trade_signal()
+    stale_at = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+    signal = dataclasses.replace(
+        signal,
+        action="sell" if exit_signal else "buy",
+        metadata={**signal.metadata, "received_at": stale_at},
+    )
+
+    with caplog.at_level(logging.INFO):
+        prepared = asyncio.run(
+            daemon._prepare_discord_signal_for_submission(
+                "acc", _deployment(allow_short=False), signal,
+                signal_timeframe="1h", wait_enabled=False,
+            )
+        )
+
+    assert prepared is None
+    level = logging.WARNING if exit_signal else logging.INFO
+    assert _records_at(caplog, level, "stale discord signal")
+    assert not _records_at(caplog, logging.INFO if exit_signal else logging.WARNING, "stale")

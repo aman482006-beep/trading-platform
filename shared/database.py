@@ -3104,7 +3104,8 @@ def list_live_deployment_unfilled_exit_orders(
     listed here as well (#121).
 
     Each row: ``signal_id``, ``deployment_id``, ``broker_order_id`` (may be
-    empty), ``requested_qty`` (``None`` when unreadable) and ``filled_qty``.
+    empty), ``requested_qty`` (``None`` when unreadable), ``filled_qty`` and
+    ``action`` (``buy``/``sell``, the side the order closes).
     """
     normalized_deployment_id = str(deployment_id or "").strip()
     normalized_symbol = str(symbol or "").strip().upper()
@@ -3157,6 +3158,7 @@ def _list_unfilled_exit_orders(
                 LiveSignalModel.deployment_id,
                 LiveSignalModel.broker_order_id,
                 LiveSignalModel.metadata_json,
+                LiveSignalModel.action,
             )
             .where(func.upper(LiveSignalModel.symbol) == normalized_symbol)
         )
@@ -3187,7 +3189,7 @@ def _list_unfilled_exit_orders(
         signals = session.exec(signal_query).all()
         fills = dict(session.exec(fill_query).all())
     pending: list[dict[str, Any]] = []
-    for signal_id, signal_deployment_id, broker_order_id, metadata in signals:
+    for signal_id, signal_deployment_id, broker_order_id, metadata, action in signals:
         metadata = metadata if isinstance(metadata, dict) else {}
         if str(metadata.get("risk_sizing_mode") or "") != EXIT_ONLY_RISK_SIZING_MODE:
             continue
@@ -3208,6 +3210,7 @@ def _list_unfilled_exit_orders(
                 "broker_order_id": str(broker_order_id or ""),
                 "requested_qty": requested_qty,
                 "filled_qty": filled_qty,
+                "action": str(action or "").strip().lower(),
             }
         )
     return pending

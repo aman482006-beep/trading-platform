@@ -945,20 +945,42 @@ def _log_exit_below_step(
     )
 
 
+def _describe_exit_rows(
+    rows: Iterable[Mapping[str, Any]], deployment: LiveDeploymentConfig
+) -> str:
+    return ", ".join(
+        f"signal {row.get('signal_id')} / order {row.get('broker_order_id') or '?'}"
+        + (
+            ""
+            if str(row.get("deployment_id") or deployment.id) == str(deployment.id)
+            else f" of deployment {row.get('deployment_id')}"
+        )
+        for row in rows
+    )
+
+
 async def _ensure_no_exit_in_flight(
     adapter: BaseLiveAdapter, deployment: LiveDeploymentConfig, symbol: str
-) -> None:
-    """Refuse while an earlier exit on this account and symbol may be working.
+) -> list[dict[str, Any]]:
+    """Refuse while an earlier exit of THIS deployment may still be working.
 
-    Deployments on one account share a netted broker position, so an exit of any
-    of them (not only this deployment's) changes what another may close: an exit
-    sized while another's is still working would be capped against a position
-    that does not yet reflect it. Earlier exits whose persisted fills cover what
-    they asked for are done. Any other one is checked against the broker's
-    working orders, by broker order id or by client order id (the signal id; the
-    broker id can be missing when the response was lost). An adapter that cannot
-    list its working orders cannot prove the earlier exit is over, so that
-    refuses too. Raises :class:`ExitInFlightError`.
+    Returns the still-working exits of OTHER deployments on the account (empty
+    when none), which the caller subtracts from the broker position it sizes
+    against.
+
+    Deployments on one account share a netted broker position. This
+    deployment's own earlier exit blocks a new one: sizing off a ledger without
+    its fills would close the same units twice. Another deployment's working
+    exit must not drop this exit (a message fans out to every deployment, and
+    with the market closed the first exit is always still working when the
+    second is processed); its unfilled quantity is reserved instead.
+
+    Earlier exits whose persisted fills cover what they asked for are done. Any
+    other one is checked against the broker's working orders, by broker order id
+    or by client order id (the signal id; the broker id can be missing when the
+    response was lost). An adapter that cannot list its working orders cannot
+    prove an earlier exit is over, so that refuses too. Raises
+    :class:`ExitInFlightError`.
     """
     own = await asyncio.to_thread(
         list_live_deployment_unfilled_exit_orders, str(deployment.id), symbol
@@ -968,7 +990,7 @@ async def _ensure_no_exit_in_flight(
     )
     pending = [*own, *others]
     if not pending:
-        return
+        return []
     working_order_ids = getattr(adapter, "working_order_ids", None)
     if not callable(working_order_ids):
         raise ExitInFlightError(
@@ -990,22 +1012,43 @@ async def _ensure_no_exit_in_flight(
         if (row.get("broker_order_id") and str(row["broker_order_id"]) in working)
         or str(row.get("signal_id") or "") in working
     ]
-    if blocking:
-        described = ", ".join(
-            f"signal {row.get('signal_id')} / order {row.get('broker_order_id') or '?'}"
-            + (
-                ""
-                if str(row.get("deployment_id") or deployment.id) == str(deployment.id)
-                else f" of deployment {row.get('deployment_id')}"
-            )
-            for row in blocking
-        )
+    own_blocking = [
+        row
+        for row in blocking
+        if str(row.get("deployment_id") or deployment.id) == str(deployment.id)
+    ]
+    if own_blocking:
         raise ExitInFlightError(
-            f"Refusing exit for {symbol}: a previous exit of this deployment or of "
-            f"another deployment on account {deployment.account_id} is still "
-            f"working at the broker ({described}); the ledger and the broker "
-            "position do not include its fills yet."
+            f"Refusing exit for {symbol}: a previous exit of this deployment is "
+            f"still working at the broker ({_describe_exit_rows(own_blocking, deployment)}); "
+            "the ledger and the broker position do not include its fills yet."
         )
+    return [row for row in blocking if row not in own_blocking]
+
+
+def _reserved_by_other_exits(
+    rows: Iterable[Mapping[str, Any]], *, close_action: str, symbol: str, deployment_id: str
+) -> float:
+    """Unfilled quantity of other deployments' working exits that close the same side.
+
+    An exit row without a readable requested quantity cannot be sized: it raises,
+    so the caller refuses rather than guessing how much is already spoken for.
+    """
+    reserved = 0.0
+    for row in rows:
+        action = str(row.get("action") or "").strip().lower()
+        if action and action != close_action:
+            continue
+        requested = row.get("requested_qty")
+        if requested is None or not math.isfinite(float(requested)):
+            raise ExitInFlightError(
+                f"Refusing exit for {symbol}: the working exit of deployment "
+                f"{row.get('deployment_id')} (signal {row.get('signal_id')}) has no "
+                "readable quantity, so what remains of the position for deployment "
+                f"{deployment_id} cannot be told."
+            )
+        reserved += max(float(requested) - float(row.get("filled_qty") or 0.0), 0.0)
+    return reserved
 
 
 def _list_other_deployments_unfilled_exits(
@@ -1108,24 +1151,64 @@ async def prepare_exit_intent_order(
         raise ValueError("Exit signal requires a broker adapter with get_positions support")
     # One exit at a time per deployment and symbol: a second exit sized while
     # the first is still working would size off a ledger without its fills.
-    await _ensure_no_exit_in_flight(adapter, deployment, signal.symbol)
+    other_working = await _ensure_no_exit_in_flight(adapter, deployment, signal.symbol)
     positions = list(await get_positions())
     ledgers = await asyncio.to_thread(
         get_account_net_filled_qty_by_deployment, deployment.account_id, signal.symbol
     )
     ledger_qty = float(ledgers.get(str(deployment.id), 0.0))
+    broker_qty = broker_position_qty(positions, signal.symbol)
+    # Other deployments' exits still working at the broker are not in the broker
+    # position yet but will leave it: their unfilled quantity is spoken for and
+    # this exit may only close what remains (floored at 0).
+    reserved = 0.0
+    sized_positions = positions
+    effective_cap = abs(broker_qty)
+    if other_working and broker_qty != 0.0:
+        reserved = _reserved_by_other_exits(
+            other_working,
+            close_action="sell" if broker_qty > 0 else "buy",
+            symbol=signal.symbol,
+            deployment_id=str(deployment.id),
+        )
+        effective_cap = max(abs(broker_qty) - reserved, 0.0)
+        if reserved > 0.0 and effective_cap > 0.0:
+            sized_positions = [
+                {**position, "qty": math.copysign(effective_cap, broker_qty)}
+                if str(position.get("symbol") or "").strip().upper() == signal.symbol.upper()
+                and float(position.get("qty") or 0.0) != 0.0
+                else position
+                for position in positions
+            ]
+    # Resolved against the real position first, so "nothing of this deployment's
+    # to close" and ambiguous closes are reported as such.
     close_action, target_qty = resolve_exit_order(
         symbol=signal.symbol,
         ledger_qty=ledger_qty,
         broker_positions=positions,
         instruction=instruction,
     )
+    if reserved > 0.0 and effective_cap <= 0.0:
+        raise ExitInFlightError(
+            f"Refusing exit for {signal.symbol}: the whole broker position "
+            f"({broker_qty:g}) is already spoken for by exits of other deployments "
+            f"on account {deployment.account_id} that are still working "
+            f"({_describe_exit_rows(other_working, deployment)}); nothing is left "
+            "for this deployment to close, so its position stays open."
+        )
+    if sized_positions is not positions:
+        close_action, target_qty = resolve_exit_order(
+            symbol=signal.symbol,
+            ledger_qty=ledger_qty,
+            broker_positions=sized_positions,
+            instruction=instruction,
+        )
     # An exit closes only the own ledger quantity, capped at the broker position
-    # (#121 decision 2). When the ledgers do not explain the broker position, or
-    # the own quantity exceeds it, the capped exit is still submitted, but an
-    # operator must hear about it: a close the ledgers never saw (a stop or
-    # target leg, a flatten, a manual close) happened.
-    broker_qty = broker_position_qty(positions, signal.symbol)
+    # (#121 decision 2), here reduced by what other working exits will take.
+    # When the ledgers do not explain the broker position, or the own quantity
+    # exceeds the cap, the capped exit is still submitted, but an operator must
+    # hear about it: a close the ledgers never saw (a stop or target leg, a
+    # flatten, a manual close) happened.
     tolerance = _position_qty_tolerance(adapter, signal.symbol)
     try:
         ensure_ledgers_match_broker(
@@ -1139,14 +1222,20 @@ async def prepare_exit_intent_order(
             deployment, signal.symbol, exc, own_qty=ledger_qty, exit_qty=target_qty
         )
     else:
-        if abs(ledger_qty) > abs(broker_qty) + tolerance:
+        if abs(ledger_qty) > effective_cap + tolerance:
             # Offsetting ledgers of other deployments hide the overhang from
-            # the total, but the own quantity still exceeds what the broker holds.
+            # the total, or other working exits leave less than this
+            # deployment's share; either way the own quantity exceeds the cap.
             _alert_ledger_mismatch(
                 deployment,
                 signal.symbol,
                 LedgerMismatchError(
-                    "own ledger quantity exceeds the broker position",
+                    "own ledger quantity exceeds the broker position"
+                    + (
+                        f" less {reserved:g} reserved by other deployments' working exits"
+                        if reserved
+                        else ""
+                    ),
                     ledgers=ledgers,
                     broker_qty=broker_qty,
                     tolerance=tolerance,
@@ -1819,7 +1908,9 @@ async def _prepare_discord_signal_for_submission(
     # information — discard anything older than one deployment-timeframe
     # candle instead.
     if not signal_is_fresh(trade_signal, signal_timeframe):
-        logger.info(
+        # A dropped exit leaves a position open: a warning, not routine info.
+        log_stale = logger.warning if is_exit_intent(trade_signal.metadata) else logger.info
+        log_stale(
             "Skipping stale discord signal: older than one timeframe candle",
             extra={
                 "data": {
@@ -1915,7 +2006,8 @@ async def _prepare_discord_signal_for_submission(
         )
         return None
     if not signal_is_fresh(normalized_signal, signal_timeframe):
-        logger.info(
+        log_aged = logger.warning if is_exit_intent(normalized_signal.metadata) else logger.info
+        log_aged(
             "Skipping discord signal: aged out during candle-close wait",
             extra={
                 "data": {
@@ -2019,12 +2111,14 @@ async def _prepare_claim_and_submit_signal(
         _log_exit_below_step(account_id, deployment, live_signal.symbol, exc)
         return
     except ExitInFlightError as exc:
-        # Not an error: the earlier exit is doing the work. The signal is not
-        # queued; a later exit signal is sized once the earlier one is over.
-        logger.warning(
-            "Exit signal refused: a previous exit of this deployment or of "
-            "another deployment on this account is still working or cannot be "
-            "shown to be finished",
+        # An error, not a skipped signal: nothing was sent and this deployment's
+        # position stays open (a later exit signal is sized once the earlier
+        # exit is over, but this one is not queued). An operator has to look.
+        logger.error(
+            "Exit signal refused: a previous exit of this deployment is still "
+            "working, the other deployments' working exits leave nothing to "
+            "close, or no earlier exit can be shown to be finished; nothing was "
+            "sent to the broker and the position stays open",
             extra={
                 "data": {
                     "account_id": account_id,

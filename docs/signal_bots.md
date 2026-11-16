@@ -215,18 +215,29 @@ Bedingung nennt, erzeugt eine neue Entry-Order.
   Re-Check vor dem Absenden). Auf einem `PAUSED`-Deployment wird „Exit AAPL"
   verworfen (INFO-Log), die Position bleibt offen. Das Gate ist in #121
   unverändert; Exits trotz `PAUSED` anzunehmen ist offen (#126).
-- **Ein Exit nach dem anderen (pro Account und Symbol):** Solange ein früherer
-  Exit **irgendeines Deployments desselben Accounts** für dasselbe Symbol beim
-  Broker noch arbeitet (nicht voll gefüllt und in den offenen Orders des
-  Brokers, per Broker- oder Client-Order-ID), wird ein neuer Exit abgelehnt
-  (`WARNING`, nicht gequeued): Deployments eines Accounts teilen sich die
-  genettete Broker-Position, ein zweiter Exit würde sonst gegen eine Position
-  ohne den ersten gedeckelt. Innerhalb des Prozesses laufen Exits derselben
-  Account/Symbol-Kombination zudem strikt nacheinander (Lock von der
-  Größenbestimmung bis zur gespeicherten Order); die Broker-Position wird erst
-  danach gelesen. Kann der Adapter seine
-  offenen Orders nicht auflisten, gilt das als „nicht bewiesen beendet“ → ebenfalls
-  abgelehnt.
+- **Ein Exit nach dem anderen (pro Account und Symbol):** Ein früherer Exit
+  **desselben Deployments** für dasselbe Symbol, der beim Broker noch arbeitet
+  (nicht voll gefüllt und in den offenen Orders des Brokers, per Broker- oder
+  Client-Order-ID), blockiert einen neuen Exit: abgelehnt, `ERROR`, nicht
+  gequeued (sonst würde gegen ein Ledger ohne dessen Fills gesized). Ein noch
+  arbeitender Exit **eines anderen Deployments** desselben Accounts lehnt
+  dagegen **nicht** ab (eine Nachricht geht an alle Deployments; bei
+  geschlossenem Markt arbeitet der erste Exit immer noch, wenn der zweite dran
+  ist): seine noch ungefüllte Menge (`requested_qty − filled_qty`, gleiche
+  Schließ-Seite) wird reserviert, der Exit wird gegen
+  `|Broker-Position| − Σ Reserviert` (mindestens 0) gedeckelt, also
+  `min(eigene Menge, Broker − reserviert)`. Liegt die Obergrenze unter der
+  eigenen Menge, geht der gedeckelte Exit raus und der Ledger-Alert (`ERROR`)
+  feuert. Bleibt nichts übrig, wird nichts gesendet und mit `ERROR` geloggt
+  (die Position bleibt offen), mit den blockierenden Orders im Log. Jede
+  Ablehnung eines Exits, der eine Position offen lässt, loggt auf `ERROR`.
+  Innerhalb des Prozesses laufen Exits derselben Account/Symbol-Kombination
+  zudem strikt nacheinander (Lock von der Größenbestimmung bis zur
+  gespeicherten Order); die Broker-Position wird erst danach gelesen. Kann der
+  Adapter seine offenen Orders nicht auflisten, gilt das als „nicht bewiesen
+  beendet“ → ebenfalls abgelehnt (`ERROR`). Alpaca liest die offenen Orders mit
+  `nested=True` und `limit=500`; eine volle Seite gilt als unvollständig und
+  schlägt fehl.
 - **Jeder Exit schließt nur die eigene Menge:** Ein einfaches `SELL …` oder ein
   Momentum-Reversal (RocketFuel long-only) auf einem Deployment ohne Shorts ist
   ein Voll-Exit und wird nach derselben Regel gesized (Anteil 1, Seite aus der
@@ -240,7 +251,8 @@ Bedingung nennt, erzeugt eine neue Entry-Order.
   ein Fehler ist, lässt die Position offen und wird auf `ERROR` geloggt
   (`Exit signal refused …` bzw. `… unknown outcome`, mit `"exit": true`). Ein
   abgelehnter Entry bleibt `WARNING`; „nichts zu schließen“ ist `INFO` bzw.
-  `WARNING` (siehe oben), ein noch laufender früherer Exit `WARNING`.
+  `WARNING` (siehe oben), ein noch laufender früherer Exit desselben Deployments (oder nichts übrig
+  neben anderen laufenden Exits) `ERROR`; ein als veraltet verworfener Exit `WARNING`.
 - Fallback-Ticker-Extraktion (erstes GROSSBUCHSTABEN-Wort) ist entfernt; ein Signal
   ohne strukturiertes Tickersymbol (`**$TICKER**`, `Ticker:`, `buy signal AAPL`,
   `$TICKER`, `TICKER $price`) wird verworfen.

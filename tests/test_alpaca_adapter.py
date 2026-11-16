@@ -65,7 +65,10 @@ class _FakeTradingClient:
         self.submit_error = submit_error
 
     def get_orders(self, filter=None):  # noqa: A002 - mirrors alpaca-py
-        return list(self.orders)
+        # alpaca-py's server-side default page size is 50.
+        limit = getattr(filter, "limit", None) or 50
+        self.last_order_filter = filter
+        return list(self.orders)[:limit]
 
     def get_all_positions(self):
         return list(self.positions)
@@ -647,6 +650,31 @@ def test_alpaca_exit_qty_floor_absorbs_float_noise_but_never_rounds_up() -> None
     over = asyncio.run(adapter._require_exit_position(_exit_signal(0.1999999996), 0.1999999996))
     assert over == pytest.approx(0.199999999, abs=1e-15)
     assert over <= 0.1999999996
+
+
+def test_working_order_ids_sees_an_exit_beyond_the_default_page_of_50_orders() -> None:
+    orders = [_FakeOrder(f"o-{index}", "MSFT", "buy") for index in range(120)]
+    orders.append(
+        SimpleNamespace(
+            id="exit-1", client_order_id="sig-exit", symbol="AAPL", side="sell", legs=[]
+        )
+    )
+    client = _FakeTradingClient(orders=orders)
+
+    ids = asyncio.run(_adapter(client).working_order_ids())
+
+    assert {"exit-1", "sig-exit"} <= set(ids)
+    assert client.last_order_filter.nested is True
+    assert client.last_order_filter.limit == 500
+
+
+def test_working_order_ids_fails_when_the_order_page_is_full() -> None:
+    client = _FakeTradingClient(
+        orders=[_FakeOrder(f"o-{index}", "MSFT", "buy") for index in range(500)]
+    )
+
+    with pytest.raises(RuntimeError, match="page limit"):
+        asyncio.run(_adapter(client).working_order_ids())
 
 
 def test_working_order_ids_fails_closed_without_an_order_listing() -> None:

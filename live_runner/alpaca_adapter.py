@@ -1611,8 +1611,25 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             raise RuntimeError("Alpaca trading client is unavailable after connect.")
         return client
 
-    async def _list_open_orders(self, client: Any) -> list[Any]:
-        """Every working order, or a hard failure - never a silent empty list."""
+    #: Alpaca's maximum page size for the orders listing (its default is 50).
+    _OPEN_ORDERS_LIMIT = 500
+
+    async def _list_open_orders(self, client: Any, *, nested: bool = False) -> list[Any]:
+        """Every working order, or a hard failure - never a silent empty list.
+
+        Asks for the maximum page (the default of 50 would silently drop orders on
+        a busy account) and fails when the page comes back full, since orders may
+        then be missing. ``nested`` returns bracket legs under their parent.
+        """
+        orders = await self._list_open_orders_page(client, nested=nested)
+        if len(orders) >= self._OPEN_ORDERS_LIMIT:
+            raise RuntimeError(
+                f"Alpaca returned {len(orders)} open orders, the page limit; "
+                "refusing to treat the list as complete"
+            )
+        return orders
+
+    async def _list_open_orders_page(self, client: Any, *, nested: bool) -> list[Any]:
         get_orders = getattr(client, "get_orders", None)
         if not callable(get_orders):
             raise RuntimeError(
@@ -1622,7 +1639,11 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             from alpaca.trading.enums import QueryOrderStatus
             from alpaca.trading.requests import GetOrdersRequest
 
-            request = GetOrdersRequest(status=QueryOrderStatus.OPEN)
+            request = GetOrdersRequest(
+                status=QueryOrderStatus.OPEN,
+                limit=self._OPEN_ORDERS_LIMIT,
+                nested=nested,
+            )
             result = await asyncio.to_thread(get_orders, filter=request)
         except ModuleNotFoundError:
             result = await asyncio.to_thread(get_orders)
@@ -1654,7 +1675,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         """
         client = await self._require_trading_client()
         ids: set[str] = set()
-        for order in await self._list_open_orders(client):
+        for order in await self._list_open_orders(client, nested=True):
             for item in (order, *_order_legs(order)):
                 for name in ("id", "client_order_id"):
                     order_id = _control_order_id(_order_attr(item, name))
