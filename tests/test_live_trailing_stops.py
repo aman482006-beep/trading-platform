@@ -681,6 +681,104 @@ def test_alpaca_lists_only_reducing_side_plain_stops() -> None:
     ]
 
 
+class _HeldLegClient(_ReplacingClient):
+    """Alpaca's real bracket shape, recorded on a paper account (2026-11-16).
+
+    Once the entry fills, the take-profit leg is ``new`` and listed by
+    ``status=open`` as a top-level order, while the stop leg stays ``held`` and is
+    NOT part of any ``status=open`` listing (nested or flat). It is only reachable
+    through the filled parent in a ``status=all`` listing, nested under ``legs``.
+    A held leg can still be replaced; the replacement is a new order id.
+    """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.all_requests: list[object] = []
+        self.parent = _FakeOrder(
+            "parent",
+            "AAPL",
+            "buy",
+            order_type="market",
+            order_class="bracket",
+            status="filled",
+            legs=[
+                _FakeOrder("tp-leg", "AAPL", "sell", order_type="limit", status="new"),
+                _FakeOrder(
+                    "sl-leg", "AAPL", "sell", order_type="stop", status="held", stop_price=95.0
+                ),
+            ],
+        )
+        self.orders = [self.parent.legs[0]]  # what status=open shows
+
+    def get_orders(self, filter=None):  # noqa: A002 - mirrors alpaca-py
+        status = str(getattr(getattr(filter, "status", None), "value", "open")).lower()
+        if status == "open":
+            return list(self.orders)
+        self.all_requests.append(filter)
+        return [self.parent]
+
+    def replace_order_by_id(self, order_id, order_data=None):
+        leg = next((item for item in self.parent.legs if item.id == order_id), None)
+        if leg is None:
+            raise RuntimeError(f"order {order_id} not found")
+        self.replace_calls.append((str(order_id), float(order_data.stop_price)))
+        replacement = _FakeOrder(
+            id=f"{order_id}+",
+            symbol=leg.symbol,
+            side=leg.side,
+            order_type=leg.order_type,
+            status="held",
+            stop_price=float(order_data.stop_price),
+        )
+        self.parent.legs[self.parent.legs.index(leg)] = replacement
+        return replacement
+
+
+def test_alpaca_finds_the_held_stop_leg_of_a_filled_bracket() -> None:
+    """The stop leg of a filled bracket is `held` and absent from `status=open`.
+
+    Observed on Alpaca paper: without reading it from the filled parent, the
+    trail would report "no stop" for every real bracket position.
+    """
+    client = _HeldLegClient(positions=[_FakePosition("AAPL", 10)])
+    adapter = _adapter(client)
+
+    stops = asyncio.run(adapter.list_protective_stops())
+
+    assert stops == [ProtectiveStop(order_id="sl-leg", symbol="AAPL", side="sell", stop_price=95.0)]
+    (request,) = client.all_requests
+    assert request.nested is True
+    assert [str(symbol) for symbol in request.symbols] == ["AAPL"]
+
+
+def test_alpaca_amends_the_held_stop_leg_and_keeps_the_take_profit() -> None:
+    client = _HeldLegClient(positions=[_FakePosition("AAPL", 10)])
+    adapter = _adapter(client)
+    (stop,) = asyncio.run(adapter.list_protective_stops())
+
+    amended = asyncio.run(adapter.amend_protective_stop(stop, 96.5))
+
+    assert amended == ProtectiveStop(order_id="sl-leg+", symbol="AAPL", side="sell", stop_price=96.5)
+    assert client.cancelled == []
+    assert [leg.id for leg in client.parent.legs] == ["tp-leg", "sl-leg+"]
+    (again,) = asyncio.run(adapter.list_protective_stops())
+    assert again.order_id == "sl-leg+" and again.stop_price == 96.5
+
+
+def test_alpaca_ignores_dead_legs_of_a_filled_bracket() -> None:
+    client = _HeldLegClient(positions=[_FakePosition("AAPL", 10)])
+    client.parent.legs[1].status = "canceled"
+
+    assert asyncio.run(_adapter(client).list_protective_stops()) == []
+
+
+def test_alpaca_does_not_list_a_held_stop_without_a_position() -> None:
+    client = _HeldLegClient(positions=[])
+
+    assert asyncio.run(_adapter(client).list_protective_stops()) == []
+    assert client.all_requests == []
+
+
 def test_alpaca_rounds_stops_away_from_the_market() -> None:
     adapter = _adapter(_ReplacingClient())
     sell = ProtectiveStop(order_id="1", symbol="AAPL", side="sell", stop_price=1.0)

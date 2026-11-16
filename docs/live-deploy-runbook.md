@@ -83,9 +83,23 @@ not declare the `supports_stop_amendment` capability. Unknown brokers get `none`
   failure on every pass and nothing is amended.
 - Real-money accounts are never amended: the loop only receives connected demo/paper adapters,
   the same hard block that applies to orders.
-- The Alpaca replace of a bracket stop leg is covered by tests against the fake trading client
-  only. Confirm it once on a paper account (open a `percent` deployment, watch for
-  `Trailed live stop` in the daemon log) before relying on it.
+**Verified on Alpaca paper (2026-11-16)**
+
+Probe on a paper account (endpoint host checked as `paper-api.alpaca.markets`): 1 share of `F`
+as a market bracket entry (stop 3 % below, take profit 5 % above), then listings, a replace and a
+clean-up.
+
+- Right after the entry fills: parent `filled`; take-profit leg `new`; stop leg `held`.
+- `status=open` (nested or flat) lists the take-profit leg only. **The `held` stop leg is not in
+  any open listing.** `AlpacaLiveAdapter.list_protective_stops` therefore also reads filled
+  parents of symbols with an open position from a `status=all`, `nested=true` listing and takes
+  their `held` stop legs (fixed in this PR; before it a real bracket position reported "no stop").
+- `PATCH /v2/orders/{id}` on the `held` stop leg is accepted: the response is a new order id,
+  `held`, with the new `stop_price`; the parent's `legs` then show the new stop and the unchanged
+  take-profit leg. Through the adapter the stop moved 11.35 -> 11.52 with the take profit intact.
+- Not covered by this PR: `close_all_positions` on a bracket with a `held` stop leg returned
+  `orders-still-working ... NO-STOP-RESTORED` (the sweep lists open orders only); the leg was
+  cancelled by Alpaca's OCO handling and the position was closable afterwards. Tracked separately.
 
 ## Provisioning and Rotation
 

@@ -65,6 +65,9 @@ _ALPACA_ACC_RE = re.compile(r"^ALPACA_API_KEY_ACC(?P<index>\d+)$")
 
 _SL_METADATA_KEYS = ("stop_loss", "sl_price", "stop_price", "resolved_stop_loss")
 _TP_METADATA_KEYS = ("take_profit", "tp_price")
+#: Newest orders requested per lookup of held bracket stop legs (Alpaca's maximum is 500).
+_ALPACA_HELD_LEG_LOOKUP_LIMIT = 500
+
 #: Alpaca rejects sub-penny prices: two decimals at or above $1, four below
 #: ("sub-penny increment does not fulfill minimum pricing criteria", HTTP 422).
 _ALPACA_TICK_AT_OR_ABOVE_ONE = Decimal("0.01")
@@ -2186,9 +2189,15 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         if not reducing_sides:
             return []
         orders = await self._list_open_orders(client)
+        orders.extend(await self._list_filled_parents_with_held_legs(client, set(reducing_sides)))
         stops: dict[str, ProtectiveStop] = {}
         for order in orders:
             for candidate in (order, *_order_legs(order)):
+                if candidate is not order and _order_status(order) == "filled":
+                    # Only a filled parent's still-held stop leg is wanted from the
+                    # `status=all` listing; a dead leg is not a protection.
+                    if _order_status(candidate) != "held":
+                        continue
                 symbol = _order_symbol(candidate) or _order_symbol(order)
                 side = _order_side(candidate)
                 if not symbol or reducing_sides.get(symbol) != side:
@@ -2203,6 +2212,43 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     order_id=order_id, symbol=symbol, side=side, stop_price=stop_price
                 )
         return list(stops.values())
+
+    async def _list_filled_parents_with_held_legs(
+        self, client: Any, symbols: set[str]
+    ) -> list[Any]:
+        """Filled bracket parents whose stop leg is still ``held``.
+
+        Observed on Alpaca paper (2026-11-16): once a bracket entry fills, the stop leg
+        stays ``held`` and is absent from every ``status=open`` listing, nested or flat.
+        It is only reachable as a leg of the filled parent in a ``status=all`` listing,
+        and it can be replaced like any working stop. Only parents of symbols with an
+        open position are requested. A failure to list is not swallowed: a missing stop
+        would be reported as "no stop" for a position that does have one.
+        """
+        get_orders = getattr(client, "get_orders", None)
+        if not symbols or not callable(get_orders):
+            return []
+        from alpaca.trading.enums import QueryOrderStatus
+        from alpaca.trading.requests import GetOrdersRequest
+
+        request = GetOrdersRequest(
+            status=QueryOrderStatus.ALL,
+            symbols=sorted(symbols),
+            nested=True,
+            limit=_ALPACA_HELD_LEG_LOOKUP_LIMIT,
+        )
+        result = await asyncio.to_thread(get_orders, filter=request)
+        if not isinstance(result, (list, tuple)):
+            raise RuntimeError(
+                f"Alpaca order list has an unrecognised shape ({type(result).__name__}); "
+                "refusing to report a clean sweep"
+            )
+        return [
+            order
+            for order in result
+            if _order_status(order) == "filled"
+            and any(_order_status(leg) == "held" for leg in _order_legs(order))
+        ]
 
     def round_stop_price(self, stop: ProtectiveStop, price: float) -> float:
         value = float(price)
