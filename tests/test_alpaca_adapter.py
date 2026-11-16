@@ -615,6 +615,40 @@ def test_working_order_ids_lists_broker_and_client_order_ids() -> None:
     assert {"o-1", "sig-1", "o-2"} <= set(ids)
 
 
+def test_alpaca_working_order_ids_include_nested_legs() -> None:
+    """An exit working only under a bracket leg's id must still be seen."""
+    legs = [
+        SimpleNamespace(id="leg-1", client_order_id="leg-sig-1", legs=[]),
+        SimpleNamespace(id="leg-2", client_order_id="leg-sig-2", legs=[]),
+    ]
+    client = _FakeTradingClient(
+        orders=[
+            SimpleNamespace(
+                id="parent-1",
+                client_order_id="parent-sig",
+                symbol="AAPL",
+                side="buy",
+                legs=legs,
+            )
+        ]
+    )
+
+    ids = asyncio.run(_adapter(client).working_order_ids())
+
+    assert {"parent-1", "parent-sig", "leg-1", "leg-sig-1", "leg-2", "leg-sig-2"} <= set(ids)
+
+
+def test_alpaca_exit_qty_floor_absorbs_float_noise_but_never_rounds_up() -> None:
+    adapter = _adapter(_FakeTradingClient(positions=[_FakePosition("AAPL", 3.0)]))
+
+    noisy = 2.9999999999999996
+    qty = asyncio.run(adapter._require_exit_position(_exit_signal(noisy), noisy))
+    assert qty == 3.0
+    over = asyncio.run(adapter._require_exit_position(_exit_signal(0.1999999996), 0.1999999996))
+    assert over == pytest.approx(0.199999999, abs=1e-15)
+    assert over <= 0.1999999996
+
+
 def test_working_order_ids_fails_closed_without_an_order_listing() -> None:
     client = SimpleNamespace()
 

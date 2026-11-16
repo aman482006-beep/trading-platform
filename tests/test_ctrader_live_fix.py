@@ -1359,6 +1359,29 @@ def test_ctrader_exit_volume_ignores_float_noise_of_a_whole_volume() -> None:
     ) == 3000
 
 
+@pytest.mark.parametrize(
+    ("volume_per_qty", "units"),
+    [(3.0, 3), (7.0, 13), (100000.0, 7), (10000000.0, 21), (1000.0, 1001)],
+)
+def test_ctrader_exit_volume_exact_for_whole_step_products(
+    volume_per_qty: float, units: int
+) -> None:
+    """A whole number of volume units must never close one unit short because
+    ``qty * volume_per_qty`` lands an ulp below the integer (e.g. 3 * (1/3))."""
+    adapter = _volume_adapter(volume_per_qty=volume_per_qty, min_volume=1, step_volume=1)
+    qty = units / volume_per_qty
+
+    assert adapter._resolve_order_volume(_volume_signal(qty, exit_only=True)) == units
+
+
+def test_ctrader_full_close_of_whole_lots_is_exact_and_never_rounds_up() -> None:
+    adapter = _volume_adapter(volume_per_qty=100000.0, min_volume=1000, step_volume=1000)
+
+    assert adapter._resolve_order_volume(_volume_signal(0.3, exit_only=True)) == 30000
+    # Just below a step boundary by more than noise stays floored.
+    assert adapter._resolve_order_volume(_volume_signal(0.2999, exit_only=True)) == 29000
+
+
 def test_ctrader_exit_volume_that_rounds_to_nothing_is_refused_as_below_step() -> None:
     from live_runner.exit_signals import ExitBelowStepError
 
