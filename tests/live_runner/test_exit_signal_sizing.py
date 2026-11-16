@@ -1558,3 +1558,27 @@ def test_ledgers_refuse_a_filled_signal_with_an_unknown_action(isolated_db) -> N
         database.get_live_deployment_net_filled_qty(deployment_id, "AAPL")
     with pytest.raises(ValueError, match="no known position sign"):
         database.get_account_net_filled_qty_by_deployment("acc-unknown", "AAPL")
+
+
+# ─── Review (#142): the own-ledger-exceeds-broker alert, named directly ──────
+
+
+def test_own_ledger_exceeds_broker_alerts_even_when_the_ledger_total_matches(
+    monkeypatch, caplog
+) -> None:
+    """Own ledger +10 and another deployment's -4 add up to the broker's 6, so
+    the total reconciles, yet this deployment's 10 is more than the broker holds:
+    the exit is capped at 6 and an alert says the own ledger exceeds the broker."""
+    deployment = _deployment(allow_short=False)
+    _patch_ledger(monkeypatch, deployment, 10.0, others={_OTHER: -4.0})
+    adapter = _Adapter([{"symbol": "AAPL", "qty": 6.0}])
+
+    with caplog.at_level(logging.INFO):
+        _run_submit(adapter, deployment, _sell_trade_signal())
+
+    assert [qty for _, qty in adapter.submitted] == [6.0]
+    alerts = _alerts(caplog)
+    assert len(alerts) == 1, [record.getMessage() for record in caplog.records]
+    assert alerts[0].data["own_ledger_qty"] == pytest.approx(10.0)
+    assert alerts[0].data["broker_qty"] == pytest.approx(6.0)
+    assert "own ledger quantity exceeds the broker position" in alerts[0].data["reason"]

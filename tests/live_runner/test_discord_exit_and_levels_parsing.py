@@ -213,6 +213,10 @@ PARSER_TABLE: list[tuple[str, dict | None]] = [
     ("Exit long SO @ 100", None),
     ("Exit long on ON @ 50", None),
     ("Closing long ON at $50", None),
+    # Sideless, with an entry in the same message: still an exit directive, so
+    # the entry parser never sees it (it would open BUY AAPL).
+    ("Exit SO, buy AAPL @ 100", None),
+    ("Close A and buy AAPL @ 100", None),
     # Marked, the same ticker is unambiguous and the exit parses.
     ("Exit long $ON @ 50", {
         "intent": _EXIT, "symbol": "ON", "entry": 50.0, "fraction": 1.0, "side": "long",
