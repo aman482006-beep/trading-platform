@@ -509,7 +509,6 @@ def test_live_preflight_unreadable_accounts_env_reports_failure_not_crash(
     because the YAML parse now reads the same file.
     """
     import live_runner.credential_env as credential_env
-    import live_runner.preflight as preflight
 
     config_path = _write_config(
         tmp_path / "live_deployments.yaml",
@@ -531,7 +530,6 @@ def test_live_preflight_unreadable_accounts_env_reports_failure_not_crash(
     def _deny(_path: object) -> dict[str, str]:
         raise PermissionError(13, "Permission denied")
 
-    monkeypatch.setattr(preflight, "dotenv_values", _deny, raising=False)
     monkeypatch.setattr(credential_env, "dotenv_values", _deny)
 
     result = run_live_preflight(config_path, accounts_env_path=accounts_env)
@@ -556,24 +554,25 @@ def test_live_preflight_config_error_never_echoes_expanded_values(
 ) -> None:
     """A validation failure must not print an expanded value into the result.
 
-    ${VAR} refs now expand before validation, so pydantic's default text would
-    echo the offending input - and, for missing fields, the whole input mapping
-    - into ``deployment_errors``, which ``main()`` prints as JSON. The operator
-    still gets the field and the expectation, just never the value.
+    ${VAR} refs expand before validation, so an offending input can carry a
+    credential into ``deployment_errors``, which ``main()`` prints as JSON. The
+    cTrader routing check is a path that really echoes the resolved value (it
+    names it in its message), so the operator must get the reference instead.
     """
     monkeypatch.delenv("PREFLIGHT_TEST_SECRET_REF", raising=False)
     config_path = _write_config(
         tmp_path / "live_deployments.yaml",
         """
         accounts:
-          - id: alpaca-paper
-            broker: alpaca
+          - id: ctrader-demo
+            broker: ctrader
+            ctid: "${PREFLIGHT_TEST_SECRET_REF}"
 
         deployments:
-          - strategy_name: discord_follow
-            account_id: alpaca-paper
-            symbols: "${PREFLIGHT_TEST_SECRET_REF}"
-            timeframe: 1h
+          - strategy_name: fx_breakout
+            account_id: ctrader-demo
+            symbols: [EURUSD]
+            timeframe: 15m
         """,
     )
     accounts_env = _secret_ref_accounts_env(tmp_path)
@@ -582,8 +581,9 @@ def test_live_preflight_config_error_never_echoes_expanded_values(
 
     assert result.ok is False
     assert not any(_SECRET_REF_VALUE in err for err in result.deployment_errors)
-    # The operator can still tell which field failed and why.
-    assert any("symbols" in err for err in result.deployment_errors)
+    # The operator can still tell which reference failed and why.
+    assert any("PREFLIGHT_TEST_SECRET_REF" in err for err in result.deployment_errors)
+    assert any("numeric" in err for err in result.deployment_errors)
 
 
 def test_live_preflight_config_error_rewrites_file_values_to_their_ref(
@@ -700,3 +700,55 @@ def test_live_preflight_credentials_are_not_filled_from_process_env(
 
     assert result.ok is False
     assert any("Missing Alpaca credentials" in e for e in result.accounts[0].errors)
+
+
+def test_config_error_redaction_replaces_longest_value_first() -> None:
+    """A shorter value that prefixes a longer one must not cut it short.
+
+    Replacing ``abc`` first would leave ``${SHORT}def`` - the secret's tail
+    still in the message. The longer value has to be redacted as a whole.
+    """
+    from live_runner.preflight import _config_error_message
+
+    message = _config_error_message(
+        ValueError("resolved to 'abcdef' here"),
+        redact={"SHORT": "abc", "LONG": "abcdef"},
+    )
+
+    assert message == "resolved to '${LONG}' here"
+
+
+def test_config_error_redaction_threshold_is_exactly_three_characters() -> None:
+    """Values of three characters are redacted; shorter ones are treated as non-secret."""
+    from live_runner.preflight import _config_error_message
+
+    message = _config_error_message(
+        ValueError("resolved to 'Zq9' and 'Zq'"),
+        redact={"THREE": "Zq9", "TWO": "Zq"},
+    )
+
+    assert message == "resolved to '${THREE}' and 'Zq'"
+
+
+def test_redaction_values_cover_referenced_keys_and_the_accounts_file_only(
+    tmp_path: Path,
+) -> None:
+    """Redaction covers the file values and the expansion values the config
+    references - never every process-env key, which would mangle messages."""
+    from live_runner.preflight import _redaction_values
+
+    config_path = tmp_path / "live_deployments.yaml"
+    config_path.write_text('broker_login: "${REFERENCED_KEY}"\n', encoding="utf-8")
+    expansion_env = {
+        "FILE_KEY": "filevalue1",
+        "REFERENCED_KEY": "refvalue1",
+        "UNREFERENCED_KEY": "otherval1",
+    }
+
+    values = _redaction_values(
+        config_path,
+        env_values={"FILE_KEY": "filevalue1"},
+        expansion_env=expansion_env,
+    )
+
+    assert values == {"FILE_KEY": "filevalue1", "REFERENCED_KEY": "refvalue1"}
