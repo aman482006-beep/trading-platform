@@ -871,15 +871,17 @@ def test_atr_smoothing_is_selectable_and_defaults_to_mt5_sma():
 )
 def test_invalid_mt5_daily_settings_fail_closed(overrides, message):
     mod, params = _atr_params(**overrides)
+    bars = _one_bar_per_day(_WEEKEND_ROWS)
     with pytest.raises(ValueError, match=message):
-        mod.generate_signals(_one_bar_per_day(_WEEKEND_ROWS), params)
+        mod.generate_signals(bars, params)
 
 
 def test_native_daily_ohlcv_is_refused_with_a_broker_clock():
     mod, params = _atr_params(broker_clock="ny_close")
     params["daily_ohlcv"] = _one_bar_per_day(_WEEKEND_ROWS)
+    bars = _one_bar_per_day(_WEEKEND_ROWS)
     with pytest.raises(ValueError, match="daily_ohlcv cannot be combined with broker_clock"):
-        mod.generate_signals(_one_bar_per_day(_WEEKEND_ROWS), params)
+        mod.generate_signals(bars, params)
 
 
 @pytest.mark.parametrize(
