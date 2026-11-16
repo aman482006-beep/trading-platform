@@ -2845,6 +2845,74 @@ def test_discord_deployment_routing_uses_the_configured_account_label(monkeypatc
     assert "must route to Alpaca account" in response.json()["detail"]
 
 
+def test_create_rejects_unsupported_trailing_override_with_400(monkeypatch):
+    """#150 nit: the write-path trailing check must surface as a 400, not a 500."""
+    import live_runner.credential_env as credential_env
+    import viewer.main as viewer_main_module
+
+    monkeypatch.setattr(viewer_main_module, "_seed_default_live_accounts", lambda: None)
+    monkeypatch.setattr(
+        viewer_main_module,
+        "list_services",
+        lambda *args, **kwargs: [
+            Service(
+                id="88888888-8888-8888-8888-888888888888",
+                name="RAMJET",
+                type=ServiceType.DISCORD_BOT,
+                status=ServiceStatus.RUNNING,
+                config={
+                    "token_env_key": "DISCORD_BOT_RAMJET_TOKEN",
+                    "channel_id": "100000000000000002",
+                },
+                created_at=datetime.now(timezone.utc),
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        viewer_main_module,
+        "_ensure_live_account_for_deployment",
+        lambda account_id: {
+            "id": account_id,
+            "broker": "alpaca",
+            "name": "Labelled paper account",
+            "broker_login": "PA-LABELLED-RAMJET",
+        },
+    )
+    monkeypatch.setattr(
+        viewer_main_module,
+        "create_live_deployment",
+        lambda deployment: deployment,
+    )
+
+    client = TestClient(viewer_main_module.app)
+    payload = {
+        "strategy_name": "discord::ramjet",
+        "account_id": "acc-1",
+        "symbols": ["AAPL"],
+        "timeframe": "1h",
+        "signal_source_type": "discord",
+        "signal_source_id": "RAMJET",
+        "signal_source": "discord",
+        "signal_config": {
+            "channel_id": "100000000000000002",
+            "signal_processor_config": {"trailing_mode": "percent"},
+        },
+    }
+
+    monkeypatch.setattr(
+        credential_env,
+        "load_accounts_env_values",
+        lambda *_args, **_kwargs: {
+            "ALPACA_ACCOUNT_NAME_ACC1": "RamJet",
+            "ALPACA_ACCOUNT_NUMBER_ACC1": "PA-LABELLED-RAMJET",
+        },
+    )
+    response = client.post("/api/live/deployments", json=payload)
+    assert response.status_code == 400
+    assert "trailing" in response.json()["detail"]
+    assert "percent" in response.json()["detail"]
+
+
 def _store_backtest(database, backtest_id: str, *, stats: dict, equity_curve: list[dict]) -> None:
     with database.get_session() as session:
         session.add(
