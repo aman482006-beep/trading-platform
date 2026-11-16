@@ -5,6 +5,7 @@ import asyncio
 import contextlib
 import json
 import re
+import traceback
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -210,7 +211,10 @@ def _ctrader_preflight_credentials(
     try:
         return _resolve_ctrader_credentials(env_values)
     except ValueError as exc:
-        errors.append(str(exc))
+        # The boolean error quotes the CTRADER_DEMO value it rejected, which may be a
+        # mistyped secret. ``env_values`` is the credentials view, so it is the
+        # redaction set for every file/explicit-env value.
+        errors.append(_redact_values(str(exc), env_values))
         return None
 
 
@@ -403,14 +407,17 @@ def _redaction_values(
 def _redact_values(message: str, values: Mapping[str, str]) -> str:
     """Rewrite each redactable value in *message* back to its ``${KEY}`` reference.
 
-    One pass over a longest-first alternation: a value that prefixes a longer
-    redacted value cannot cut it short, and inserted references are never
-    rescanned.
+    A value is matched both raw and in its ``repr`` form (the text between the
+    quotes), because exception text often quotes a value with ``!r``, which
+    escapes backslashes and quotes. One pass over a longest-first alternation: a
+    value that prefixes a longer redacted value cannot cut it short, and inserted
+    references are never rescanned.
     """
     by_value: dict[str, str] = {}
     for key, value in values.items():
-        if len(value) >= _MIN_REDACTABLE_VALUE_LENGTH:
-            by_value.setdefault(value, key)
+        for form in (value, repr(value)[1:-1]):
+            if len(form) >= _MIN_REDACTABLE_VALUE_LENGTH:
+                by_value.setdefault(form, key)
     if not by_value:
         return message
     pattern = re.compile(
@@ -562,19 +569,40 @@ def _result_to_jsonable(result: LivePreflightResult) -> dict[str, Any]:
     return asdict(result)
 
 
-def _crash_message(exc: Exception, *, accounts_env: Path) -> str:
-    """``Type: message`` for an unhandled failure, with expanded values redacted.
+def _crash_redaction(accounts_env: Path) -> dict[str, str] | None:
+    """The values an unhandled failure must not print, or ``None`` if unknowable.
 
     The config is not read again here, so its references are unknown and every
-    expansion value counts as referenced. If the accounts env file cannot be
-    resolved at all, the message keeps only the exception type.
+    expansion value counts as referenced. ``None`` means the accounts env file
+    could not be resolved at all, so no redaction set exists.
     """
     try:
         env_values, expansion_env = _accounts_env_views(accounts_env)
     except Exception:
+        return None
+    return _redaction_values(env_values=env_values, expansion_env=expansion_env, referenced=None)
+
+
+def _crash_message(exc: Exception, *, redact: Mapping[str, str] | None) -> str:
+    """``Type: message`` for an unhandled failure, with expanded values redacted.
+
+    Without a redaction set the message keeps only the exception type.
+    """
+    if redact is None:
         return type(exc).__name__
-    redact = _redaction_values(env_values=env_values, expansion_env=expansion_env, referenced=None)
     return _redact_values(f"{type(exc).__name__}: {exc}", redact)
+
+
+def _crash_traceback(exc: Exception, *, redact: Mapping[str, str] | None) -> str | None:
+    """The full traceback of an unhandled failure, redacted like ``_crash_message``.
+
+    Operators need the traceback, but its exception text can quote an expanded
+    value, so the whole formatted text goes through the same redaction. Without a
+    redaction set there is no safe text, so there is no traceback at all.
+    """
+    if redact is None:
+        return None
+    return _redact_values("".join(traceback.format_exception(exc)), redact)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -606,9 +634,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     except Exception as exc:
         # An unhandled failure (e.g. missing or malformed config) must still honour
-        # the stdout contract: a failed result document, traceback on stderr.
-        logger.exception(
-            "Live preflight crashed",
+        # the stdout contract: a failed result document, traceback on stderr. Both
+        # the traceback and the document are redacted, so an expanded value that
+        # reached the exception text is printed nowhere.
+        redact = _crash_redaction(Path(args.accounts_env))
+        crash_traceback = _crash_traceback(exc, redact=redact)
+        crash_log = "Live preflight crashed"
+        if crash_traceback is not None:
+            crash_log = f"{crash_log}\n{crash_traceback}"
+        logger.error(
+            crash_log,
             extra={"data": {"config_path": str(args.config)}},
         )
         result = LivePreflightResult(
@@ -616,7 +651,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             config_path=str(args.config),
             accounts_env_path=str(args.accounts_env),
             accounts=[],
-            deployment_errors=[_crash_message(exc, accounts_env=Path(args.accounts_env))],
+            deployment_errors=[_crash_message(exc, redact=redact)],
         )
     print(json.dumps(_result_to_jsonable(result), indent=2, sort_keys=True))
     return 0 if result.ok else 1
