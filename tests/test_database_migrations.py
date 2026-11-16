@@ -436,6 +436,29 @@ def test_malformed_stored_conflict_value_is_ignored_not_iterated(
     ]
 
 
+@pytest.mark.parametrize("stored", ["BRK-BBB", 42, {"id": "BRK-BBB"}])
+def test_conflict_query_skips_a_malformed_row_and_keeps_valid_ones(
+    isolated_db, signal_parent, stored
+) -> None:
+    """One row with a non-list value under the key must not break the whole report."""
+    from shared.database import list_live_signal_broker_order_conflicts
+
+    save_live_signal(_make_live_signal(discord_message_id="ord-ok", broker_order_id="BRK-AAA"))
+    save_live_signal(_make_live_signal(discord_message_id="ord-ok", broker_order_id="BRK-CCC"))
+    bad_id, _ = save_live_signal(
+        _make_live_signal(discord_message_id="ord-bad", broker_order_id="BRK-DDD")
+    )
+    with get_session() as session:
+        row = session.get(LiveSignalModel, bad_id)
+        row.metadata_json = {**row.metadata_json, "conflicting_broker_order_ids": stored}
+        session.add(row)
+        session.commit()
+
+    conflicts = list_live_signal_broker_order_conflicts()
+
+    assert [c["conflicting_broker_order_ids"] for c in conflicts] == [["BRK-CCC"]]
+
+
 def test_producer_cannot_preseed_the_conflict_ledger(isolated_db, signal_parent) -> None:
     """The reserved key is written only by the conflict ledger, never by producer metadata."""
     from shared.database import list_live_signal_broker_order_conflicts

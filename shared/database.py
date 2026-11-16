@@ -2408,7 +2408,12 @@ def _conflicting_broker_order_ids(metadata: Mapping[str, Any]) -> list[str]:
 def _reconcile_existing_live_signal(
     session: Session, existing: LiveSignalModel, record: LiveSignalModel
 ) -> None:
-    """Backfill broker_order_id onto an existing duplicate signal."""
+    """Reconcile a duplicate delivery onto the stored signal and commit.
+
+    Backfills ``broker_order_id`` when the stored row lacks one, and records a different
+    broker order id carried by the duplicate in the conflict list
+    (``conflicting_broker_order_ids``) instead of replacing the tracked id.
+    """
     # Reconcile broker_order_id: if existing lacks it but new record has it, update
     new_broker_id = (record.broker_order_id or "").strip()
     existing_broker_id = (existing.broker_order_id or "").strip()
@@ -3106,11 +3111,15 @@ def list_live_signal_broker_order_conflicts(limit: int = 200) -> list[dict[str, 
     should be checked against the broker's open orders and positions.
     """
     init_db()
-    # Filter and cap in SQL so the scan is bounded by the conflicted rows, not the table.
-    # json_array_length is 0 for a non-array value and NULL when the key is absent, so only
-    # signals holding a non-empty list pass the predicate.
+    # Filter and cap in SQL so only conflicted rows are returned (the scan itself is still a
+    # full table scan; there is no index on the JSON key). The two-argument form of
+    # json_array_length reads the key inside the stored document: it is 0 for any non-array
+    # value (a string, number or object under the key) and NULL when the key is absent, so
+    # only signals holding a non-empty list pass. Unwrapping the value first with
+    # json_extract would hand a stored string to json_array_length as JSON text and raise
+    # "malformed JSON" for the whole query.
     conflict_count = func.json_array_length(
-        func.json_extract(LiveSignalModel.metadata_json, f"$.{BROKER_ORDER_CONFLICTS_KEY}")
+        LiveSignalModel.metadata_json, f"$.{BROKER_ORDER_CONFLICTS_KEY}"
     )
     with get_session() as session:
         rows = session.exec(
