@@ -132,9 +132,11 @@ The optimization result JSON now carries the following keys (in addition to the 
 Two measures are combined into a verdict:
 
 1. **Train→Validation degradation** — relative drop `(train - validation) / |train|`. Threshold: `max_train_validation_degradation` (default 0.5 = 50%).
-2. **Deflated Sharpe Ratio (DSR)** — probability that the selected Sharpe is real rather than the best of N unskilled trials (Bailey & Lopez de Prado 2014). Threshold: `min_deflated_sharpe` (default 0.95).
+2. **Deflated Sharpe Ratio (DSR)** — probability that the selected Sharpe is real rather than the best of N unskilled trials (Bailey & Lopez de Prado 2014). Threshold: `min_deflated_sharpe` (default 0.90). This is an overfitting /
+selection-luck hint, not a judgement of strategy quality: a low-Sharpe strategy
+can still be a useful part of a portfolio with negatively correlated drawdowns.
 
-The verdict is **passed** only if **both** checks are computable and pass. If any check fails or is uncomputable, the verdict is **flagged** (not blocked). Blocking happens at the promotion gate (#165), which uses the verdict as a criterion.
+The verdict is **passed** only if **both** checks are computable and pass. If any check fails or is uncomputable, the verdict is **flagged** (not blocked). Blocking happens at the promotion gate (#165), which uses the verdict as a criterion. The verdict is an overfitting hint, not a quality score: a flag means the result may be selection luck, not that the strategy is poor.
 
 ## Walk-Forward Folds
 
@@ -160,7 +162,7 @@ embargo_days: 5
 embargo_pct: 0.01
 test_top_fraction: 0.10
 max_train_validation_degradation: 0.5
-min_deflated_sharpe: 0.95
+min_deflated_sharpe: 0.90
 ```
 
 Defaults are shown above; only `train_split_pct` is required for backward compatibility (the remainder is split equally).
