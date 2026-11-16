@@ -25,6 +25,7 @@ from shared.trailing import (
     REPLAY_SUPPORTED_TRAILING_MODES,
     RISK_ENGINE_SUPPORTED_TRAILING_MODES,
     live_supported_trailing_modes,
+    tp1_partial_quantity,
     validate_live_deployment_trailing_override,
     validate_trailing_mode,
     validate_trailing_sl_config,
@@ -492,3 +493,31 @@ def test_deployment_override_supertrend_flip_is_refused_per_broker(broker) -> No
             context="test",
             broker=broker,
         )
+
+
+# ── #168: the TP1 tranche is whole shares, floored ──────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("quantity", "fraction", "expected"),
+    [
+        (7.0, 0.5, 3.0),
+        (1.0, 0.5, 0.0),  # the original bot: nothing to sell at TP1
+        (7.5, 0.5, 3.0),  # 3.75 floors to 3, never up to 4
+        (7.0, 0.25, 1.0),
+        (200.0, 0.5, 100.0),
+        (7.0, 1.0, 7.0),  # a full fraction still floors to the whole quantity
+        (0.0, 0.5, 0.0),
+        (-7.0, 0.5, 0.0),  # fail closed: never a negative tranche
+        (3.0, 0.999999, 2.0),  # never rounds up to the whole position
+    ],
+)
+def test_tp1_partial_quantity_floors_to_whole_shares(quantity, fraction, expected) -> None:
+    assert tp1_partial_quantity(quantity, fraction) == expected
+
+
+def test_tp1_partial_quantity_of_non_finite_inputs_is_zero() -> None:
+    """A non-finite quantity/fraction cannot produce a tranche: 0, which the
+    caller must treat as \"nothing to sell\" (never a NaN order quantity)."""
+    for quantity, fraction in ((float("nan"), 0.5), (7.0, float("inf")), (7.0, float("nan"))):
+        assert tp1_partial_quantity(quantity, fraction) == 0.0

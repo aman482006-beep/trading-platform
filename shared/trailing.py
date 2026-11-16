@@ -245,10 +245,16 @@ class SupertrendFlipPlan:
 
     Workflow (long entries only, as emitted by the RamJet processor):
 
-    1. TP1: exit ``tp1_exit_fraction`` of the entry quantity at ``tp1_price``.
+    1. TP1: exit the whole-share tranche
+       :func:`tp1_partial_quantity`(entry quantity, ``tp1_exit_fraction``) at
+       ``tp1_price``. A tranche of zero whole shares is skipped entirely (the
+       original bot's behaviour): the whole position stays under the original
+       stop and the workflow below never runs.
     2. After TP1: move the stop to the entry price if ``breakeven_after_tp1``.
-    3. Activation: the first closed bar after TP1 whose Supertrend is ready
-       and green.
+    3. Activation: the first closed bar AFTER the TP1 bar whose Supertrend is
+       ready and green. The TP1 bar after the TP1 fill is dead for the
+       workflow: nothing that happens at or inside it may move or trigger
+       the trail.
     4. Exit: the remainder on the first closed bar after activation whose
        Supertrend is ready and red; filled at the next bar's open.
     """
@@ -258,6 +264,26 @@ class SupertrendFlipPlan:
     breakeven_after_tp1: bool
     supertrend_period: int
     supertrend_multiplier: float
+
+
+def tp1_partial_quantity(quantity: float, fraction: float) -> float:
+    """Whole-share TP1 tranche: ``quantity * fraction`` floored to an integer.
+
+    The original bot sizes its TP1 exit as ``int(qty * tp1_exit_percent)``
+    (``RamJetStrategy.compute_tp1_qty`` in ``stockkit_ai_bot``): a whole-share
+    quantity that is floored, never rounded up. The replay mirrors it so a
+    backtest never sells more shares than the bot would, and so a live TP1
+    tranche order — which must be whole shares too (``Alpaca`` refuses
+    fractional bracket quantities) — matches the replayed one.
+
+    ``0.0`` is a meaningful answer, not an error: the bot then refuses to sell
+    anything at TP1 ("No shares to sell at TP1. Skipping."), keeps the whole
+    position and never arms the trailing workflow. Callers must handle it.
+    """
+    shares = float(quantity) * float(fraction)
+    if not math.isfinite(shares) or shares <= 0.0:
+        return 0.0
+    return float(math.floor(shares))
 
 
 def _finite_float(value: Any, *, field: str, context: str) -> float:

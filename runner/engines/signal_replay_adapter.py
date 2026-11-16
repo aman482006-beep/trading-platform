@@ -25,6 +25,7 @@ from shared.trailing import (
     TRAILING_SL_CONFIG_METADATA_KEY,
     SupertrendFlipPlan,
     parse_supertrend_flip_plan,
+    tp1_partial_quantity,
     validate_trailing_sl_config,
 )
 from signal_bots.ramjet.processor import calculate_supertrend
@@ -141,6 +142,9 @@ class _FlipState:
     #: is then closed at the OPEN of the next bar (next-open fill model).
     exit_pending: bool = False
     tp1_time: pd.Timestamp | None = None
+    #: Bar that touched the TP1 level while the whole-share tranche floored to
+    #: zero shares, so TP1 was skipped there (the original bot's answer).
+    tp1_skipped_time: pd.Timestamp | None = None
     activation_time: pd.Timestamp | None = None
     flip_bar_time: pd.Timestamp | None = None
 
@@ -156,6 +160,7 @@ class _FlipState:
             "supertrend_multiplier": self.plan.supertrend_multiplier,
             "phase": self.phase,
             "tp1_time": iso(self.tp1_time),
+            "tp1_skipped_time": iso(self.tp1_skipped_time),
             "activation_time": iso(self.activation_time),
             "flip_bar_time": iso(self.flip_bar_time),
         }
@@ -709,13 +714,33 @@ class SignalReplayAdapter:
     def _take_tp1(
         self, position: _OpenPosition, bar_time: pd.Timestamp, index: int
     ) -> Trade | None:
-        """Exit the TP1 fraction at the TP1 price; returns a trade if nothing is left."""
+        """Exit the whole-share TP1 tranche at the TP1 price; returns a trade
+        if nothing is left.
+
+        The tranche is ``quantity * tp1_exit_fraction`` floored to whole shares
+        — the original bot's arithmetic (``shared.trailing.tp1_partial_quantity``),
+        so the replay never sells shares the bot would not, and a live TP1
+        tranche order (whole shares only) matches the replayed one.
+        """
         flip = position.flip
         assert flip is not None
         plan = flip.plan
+        exit_quantity = tp1_partial_quantity(position.quantity, plan.tp1_exit_fraction)
+        if exit_quantity <= 0.0:
+            # The original bot skips TP1 here ("No shares to sell at TP1.
+            # Skipping."): no sell, no breakeven stop, and ``tp1_hit`` stays
+            # false, so the Supertrend workflow is never armed. Mirrored: the
+            # position stays in the before-TP1 phase under its ORIGINAL stop,
+            # and the TP1 level keeps being re-checked on the following bars
+            # exactly like the bot re-checks it on every pass. The event is
+            # reported once, at the bar that first reached TP1 and sold
+            # nothing — every later bar only repeats it.
+            if flip.tp1_skipped_time is None:
+                flip.tp1_skipped_time = bar_time
+            return None
         flip.phase = _FLIP_PHASE_AWAIT_GREEN
         flip.tp1_time = bar_time
-        if plan.tp1_exit_fraction >= 1.0:
+        if exit_quantity >= float(position.quantity):
             return self._close_position(
                 position,
                 exit_time=bar_time,
@@ -723,7 +748,6 @@ class SignalReplayAdapter:
                 exit_reason="tp1",
                 exit_bar_index=index,
             )
-        exit_quantity = float(position.quantity) * plan.tp1_exit_fraction
         if position.direction == "LONG":
             pnl = (plan.tp1_price - position.entry_price) * exit_quantity
         else:

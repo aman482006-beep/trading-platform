@@ -94,6 +94,9 @@ def _signal(
 
 def _adapter(**kwargs) -> SignalReplayAdapter:
     kwargs.setdefault("fee_params", {"fees": "zero"})
+    # ``initial_capital`` is overridable: it is the lever that sizes a position
+    # to a known quantity (risk % of the balance / stop distance).
+    kwargs.setdefault("initial_capital", 100_000.0)
     return SignalReplayAdapter(
         risk_config=RiskConfig(
             max_risk_per_trade=0.01,
@@ -101,7 +104,6 @@ def _adapter(**kwargs) -> SignalReplayAdapter:
             max_positions=5,
             max_notional_per_trade=1.0,
         ),
-        initial_capital=100_000.0,
         default_timeframe="1m",
         **kwargs,
     )
@@ -219,6 +221,116 @@ def test_a_full_tp1_fraction_closes_the_whole_position_at_tp1(monkeypatch) -> No
     assert trade.exits[0].reason == "tp1"
     assert trade.exits[0].price == TP1
     assert trade.exits[0].quantity == pytest.approx(trade.quantity)
+
+
+# ── TP1 partial quantity: whole shares, floored (#168 review decision) ──────
+
+
+def test_tp1_partial_quantity_is_floored_to_whole_shares(monkeypatch) -> None:
+    """The TP1 tranche is whole shares, FLOORED, like the original bot
+    (``int(qty * tp1_exit_percent)``): 7 shares at a 0.5 fraction sells 3, not
+    3.5."""
+    frame = _frame([ENTRY_BAR, TP1_BAR, _flat(), _flat()])
+    _stub_supertrend(monkeypatch, "rrrr")
+    trade = _run(frame, adapter=_adapter(initial_capital=3500.0)).trades[0]
+
+    assert trade.quantity == 7.0
+    tp1_leg, last = trade.exits
+    assert [leg.reason for leg in trade.exits] == ["tp1", "end_of_data"]
+    assert tp1_leg.quantity == 3.0
+    assert tp1_leg.pnl == pytest.approx((TP1 - ENTRY) * 3.0)
+    assert last.quantity == 4.0
+    assert last.pnl == pytest.approx((102.0 - ENTRY) * 4.0)
+    assert trade.pnl == pytest.approx(38.0)
+    assert trade.pnl_pct == pytest.approx(38.0 / (ENTRY * 7.0) * 100.0)
+    assert trade.meta["supertrend_flip"]["tp1_skipped_time"] is None
+
+
+def test_a_fractional_position_floors_the_partial_to_whole_shares(monkeypatch) -> None:
+    """7.5 shares at a 0.5 fraction: 3.75 floors to 3 sold, 4.5 stay open."""
+    frame = _frame([ENTRY_BAR, TP1_BAR, _flat(), _flat()])
+    _stub_supertrend(monkeypatch, "rrrr")
+    trade = _run(frame, adapter=_adapter(initial_capital=3750.0)).trades[0]
+
+    assert trade.quantity == 7.5
+    tp1_leg, last = trade.exits
+    assert tp1_leg.quantity == 3.0
+    assert tp1_leg.pnl == pytest.approx((TP1 - ENTRY) * 3.0)
+    assert last.quantity == 4.5
+    assert last.reason == "end_of_data"
+
+
+def test_a_tp1_that_floors_to_zero_shares_is_skipped_like_the_original_bot(
+    monkeypatch,
+) -> None:
+    """The original bot skips TP1 when the tranche floors to zero shares
+    ("No shares to sell at TP1. Skipping."): no sell, no breakeven stop, and
+    ``tp1_hit`` stays false, so the Supertrend workflow never arms and the
+    whole position stays open under the ORIGINAL stop.
+
+    1 share at a 0.5 fraction sells 0.5 shares, which is 0 whole shares.
+    """
+    stop_bar = (97.0, 97.5, 94.0, 94.5)
+    frame = _frame([ENTRY_BAR, TP1_BAR, _flat(), stop_bar, _flat()])
+    _stub_supertrend(monkeypatch, "ggggg")
+    trade = _run(frame, adapter=_adapter(initial_capital=500.0)).trades[0]
+
+    assert trade.quantity == 1.0
+    # The whole position leaves on the initial stop: no TP1 leg at all.
+    assert [leg.reason for leg in trade.exits] == ["stop_loss"]
+    assert trade.exits[0].price == STOP
+    assert trade.exits[0].quantity == pytest.approx(1.0)
+    assert trade.meta["final_stop_loss"] == STOP
+    assert trade.meta["trailing_stop_updates"] == 0
+    flip = trade.meta["supertrend_flip"]
+    assert flip["tp1_time"] is None
+    assert flip["tp1_skipped_time"] == _times(frame, 1)
+    # The workflow never left its first phase, so no trail was ever armed.
+    assert flip["phase"] == "before_tp1"
+    assert flip["activation_time"] is None
+
+
+def test_the_skip_is_sticky_until_the_position_closes(monkeypatch) -> None:
+    """The original bot retries TP1 on every pass and skips it again; the
+    replay mirrors that by keeping the position in the before-TP1 phase, so a
+    later bar that touches TP1 still sells nothing and the trail still never
+    arms."""
+    frame = _frame([ENTRY_BAR, TP1_BAR, TP1_BAR, TP1_BAR, _flat()])
+    _stub_supertrend(monkeypatch, "ggggg")
+    trade = _run(frame, adapter=_adapter(initial_capital=500.0)).trades[0]
+
+    assert [leg.reason for leg in trade.exits] == ["end_of_data"]
+    flip = trade.meta["supertrend_flip"]
+    assert flip["tp1_time"] is None
+    assert flip["tp1_skipped_time"] == _times(frame, 1)
+    assert flip["phase"] == "before_tp1"
+    assert trade.meta["final_stop_loss"] == STOP
+
+
+def test_excursions_and_equity_use_the_floored_quantities(monkeypatch) -> None:
+    """After the partial, MFE/MAE are measured on the shares that are still
+    open (4 of 7) and the equity curve books the floored legs' net PnL."""
+    tp1_bar = (109.0, 110.0, 108.0, 109.5)  # touches TP1 (110) with its high
+    after_tp1 = (111.0, 118.0, 99.5, 100.5)  # high 118, low 99.5 -> breakeven stop
+    frame = _frame([ENTRY_BAR, tp1_bar, after_tp1])
+    _stub_supertrend(monkeypatch, "rrr")
+    result = _run(frame, adapter=_adapter(initial_capital=3500.0))
+    trade = result.trades[0]
+
+    assert trade.quantity == 7.0
+    tp1_leg, remainder = trade.exits
+    assert [leg.reason for leg in trade.exits] == ["tp1", "breakeven_stop"]
+    assert (tp1_leg.quantity, remainder.quantity) == (3.0, 4.0)
+    assert remainder.price == ENTRY
+    assert remainder.pnl == pytest.approx(0.0)
+    # Only the 4 shares still open are measured on the last bar: the full
+    # 7-share reading would give (118 - 100) * 7 = 126 and (99.5 - 100) * 7.
+    assert trade.mfe == pytest.approx((118.0 - ENTRY) * 4.0)
+    assert trade.mfe > (110.0 - ENTRY) * 7.0  # ... and the TP1 bar's 7-share run
+    assert trade.mae == pytest.approx((99.5 - ENTRY) * 4.0)
+    assert trade.pnl == pytest.approx((TP1 - ENTRY) * 3.0)
+    assert result.equity_curve[-1].equity == pytest.approx(3500.0 + trade.net_pnl)
+    assert result.equity_curve[-1].time == trade.exits[-1].time
 
 
 # ── stop before TP1 ──────────────────────────────────────────────────────────
@@ -713,4 +825,6 @@ def test_ramjet_processor_with_supertrend_flip_runs_in_replay() -> None:
     assert flip["supertrend_period"] == 3
     assert flip["tp1_price"] == pytest.approx(trade.meta["signal_take_profit"])
     assert trade.exits[0].reason == "tp1"
-    assert math.isclose(trade.exits[0].quantity, trade.quantity * 0.5)
+    # Half the position, floored to whole shares (the original bot's tranche).
+    assert trade.exits[0].quantity == math.floor(trade.quantity * 0.5)
+    assert trade.exits[0].quantity + trade.exits[-1].quantity == pytest.approx(trade.quantity)
