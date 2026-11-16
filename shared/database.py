@@ -3144,6 +3144,9 @@ def _list_unfilled_exit_orders(
     account_id: str | None = None,
     exclude_deployment_id: str | None = None,
 ) -> list[dict[str, Any]]:
+    # Lazy: keeps shared/ free of an import-time dependency on live_runner.
+    from live_runner.base_adapter import EXIT_ONLY_RISK_SIZING_MODE
+
     init_db()
     with get_session() as session:
         # Two queries rather than one grouped join: grouping by a JSON column is
@@ -3186,8 +3189,7 @@ def _list_unfilled_exit_orders(
     pending: list[dict[str, Any]] = []
     for signal_id, signal_deployment_id, broker_order_id, metadata in signals:
         metadata = metadata if isinstance(metadata, dict) else {}
-        # Same value as live_runner.base_adapter.EXIT_ONLY_RISK_SIZING_MODE.
-        if str(metadata.get("risk_sizing_mode") or "") != "exit_only":
+        if str(metadata.get("risk_sizing_mode") or "") != EXIT_ONLY_RISK_SIZING_MODE:
             continue
         filled_qty = float(fills.get(signal_id) or 0.0)
         requested_qty: float | None

@@ -24,8 +24,9 @@ the same rule:
   signal and logs it; nothing reaches the broker.
 
 Everything here is pure and keyed on ``signal_intent`` rather than on the order
-side or the deployment status, so the exit path can be dispatched on its own,
-independently of the entry path (#126 lets PAUSED deployments accept exits).
+side or the deployment status. Dispatch is not: an exit reaches a broker only
+through the ACTIVE-only fan-out (and the pre-submit ACTIVE re-check), so an exit
+on a PAUSED deployment is dropped (known limitation, see docs/signal_bots.md).
 """
 from __future__ import annotations
 
@@ -34,6 +35,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 
+from live_runner.base_adapter import EXIT_ONLY_RISK_SIZING_MODE
 from shared.logging import get_logger
 
 logger = get_logger("live-runner")
@@ -225,7 +227,7 @@ def exit_intent_metadata(instruction: ExitInstruction) -> dict[str, object]:
         # Same flags the daemon uses for every reduce-only order: the adapters
         # key on risk_sizing_mode to build a plain close without SL/TP legs.
         "exit_only": True,
-        "risk_sizing_mode": "exit_only",
+        "risk_sizing_mode": EXIT_ONLY_RISK_SIZING_MODE,
     }
     if instruction.position_side is not None:
         metadata[EXIT_POSITION_SIDE_KEY] = instruction.position_side
@@ -348,12 +350,18 @@ def broker_position_qty(positions: Iterable[Mapping[str, object]], symbol: str) 
     return 0.0 if quantity is None else quantity
 
 
+#: Largest adapter-reported tolerance accepted: one whole unit. Both in-repo
+#: adapters report at most half a volume step; anything looser would let a
+#: mis-scaled value silence the ledger-vs-broker alert.
+MAX_QTY_TOLERANCE = 1.0
+
+
 def usable_qty_tolerance(raw: object) -> float:
-    """``raw`` when it is a finite, non-negative number, else the strict default."""
+    """``raw`` when finite, non-negative and at most one whole unit, else the strict default."""
     if isinstance(raw, bool) or not isinstance(raw, (int, float)):
         return DEFAULT_QTY_TOLERANCE
     value = float(raw)
-    if not math.isfinite(value) or value < 0.0:
+    if not math.isfinite(value) or value < 0.0 or value > MAX_QTY_TOLERANCE:
         return DEFAULT_QTY_TOLERANCE
     return value
 

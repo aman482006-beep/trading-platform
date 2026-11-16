@@ -938,7 +938,7 @@ def test_without_a_known_precision_the_match_is_strict(monkeypatch, caplog) -> N
     assert len(_alerts(caplog)) == 1
 
 
-@pytest.mark.parametrize("tolerance", [float("nan"), float("inf"), -1.0, "x"])
+@pytest.mark.parametrize("tolerance", [float("nan"), float("inf"), -1.0, "x", 1.5, 100.0])
 def test_an_unusable_precision_falls_back_to_strict(monkeypatch, caplog, tolerance) -> None:
     deployment = _deployment(allow_short=False)
     _patch_ledger(monkeypatch, deployment, 1.000001, others={_OTHER: 2.0})
@@ -949,6 +949,30 @@ def test_an_unusable_precision_falls_back_to_strict(monkeypatch, caplog, toleran
 
     assert len(adapter.submitted) == 1
     assert len(_alerts(caplog)) == 1
+
+
+def test_usable_qty_tolerance_is_bounded_to_one_whole_unit() -> None:
+    from live_runner.exit_signals import DEFAULT_QTY_TOLERANCE, usable_qty_tolerance
+
+    assert usable_qty_tolerance(1.0) == 1.0
+    assert usable_qty_tolerance(0.5) == 0.5
+    assert usable_qty_tolerance(0.0) == 0.0
+    assert usable_qty_tolerance(1.0000001) == DEFAULT_QTY_TOLERANCE
+    assert usable_qty_tolerance(100.0) == DEFAULT_QTY_TOLERANCE
+
+
+def test_exit_metadata_uses_the_shared_exit_only_constant(monkeypatch) -> None:
+    import live_runner.exit_signals as exit_signals
+    from live_runner.exit_signals import ExitInstruction, exit_intent_metadata
+
+    assert exit_intent_metadata(ExitInstruction(fraction=1.0, position_side=None))[
+        "risk_sizing_mode"
+    ] == "exit_only"
+    # The persisted marker follows the constant, not a second spelling.
+    monkeypatch.setattr(exit_signals, "EXIT_ONLY_RISK_SIZING_MODE", "sentinel_mode")
+    assert exit_intent_metadata(ExitInstruction(fraction=1.0, position_side=None))[
+        "risk_sizing_mode"
+    ] == "sentinel_mode"
 
 
 def test_ledgers_must_match_broker_pure() -> None:
