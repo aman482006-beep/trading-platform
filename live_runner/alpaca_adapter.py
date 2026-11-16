@@ -7,7 +7,7 @@ import os
 import re
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
 from typing import Any
 from uuid import UUID
 
@@ -33,6 +33,8 @@ from live_runner.base_adapter import (
     order_not_submitted,
 )
 from live_runner.credential_env import parse_bool_env, resolve_env_value
+from live_runner.exit_signals import ExitBelowStepError, round_exit_qty_down
+from live_runner.symbol_class import canonical_crypto_symbol, classify_symbol
 from shared.alpaca_symbols import classify_alpaca_symbol, crypto_pair_key
 from shared.database import (
     apply_live_execution_commissions,
@@ -64,6 +66,87 @@ _ALPACA_ACC_RE = re.compile(r"^ALPACA_API_KEY_ACC(?P<index>\d+)$")
 
 _SL_METADATA_KEYS = ("stop_loss", "sl_price", "stop_price", "resolved_stop_loss")
 _TP_METADATA_KEYS = ("take_profit", "tp_price")
+#: Alpaca rejects sub-penny prices: two decimals at or above $1, four below
+#: ("sub-penny increment does not fulfill minimum pricing criteria", HTTP 422).
+_ALPACA_TICK_AT_OR_ABOVE_ONE = Decimal("0.01")
+_ALPACA_TICK_BELOW_ONE = Decimal("0.0001")
+
+_EXTENDED_HOURS_BRACKET_MESSAGE = (
+    "Extended-hours entry with mandatory SL/TP is not supported: "
+    "the broker rejects bracket orders with extended_hours enabled "
+    "(signal_id={signal_id}, symbol={symbol})."
+)
+
+
+def _round_bracket_price_toward_entry(price: float, *, entry_price: float) -> float:
+    """Round a bracket leg price onto Alpaca's tick, toward the entry.
+
+    Toward the entry, because sizing divided the risk budget by the unrounded
+    stop distance: a stop rounded away from the entry would lose more than the
+    budget. The take profit uses the same direction so it is never placed
+    beyond the level the signal asked for.
+    """
+    value = Decimal(repr(float(price)))
+    tick = _ALPACA_TICK_AT_OR_ABOVE_ONE if value >= 1 else _ALPACA_TICK_BELOW_ONE
+    rounding = ROUND_CEILING if float(price) < float(entry_price) else ROUND_FLOOR
+    return float(value.quantize(tick, rounding=rounding))
+
+
+def _round_bracket_levels_in_place(
+    metadata: dict[str, Any], *, entry_price: float, signal: LiveSignal
+) -> None:
+    """Rewrite every SL/TP alias in *metadata* onto Alpaca's tick, toward the entry.
+
+    A level on the wrong side of the entry is refused here, before persistence,
+    mirroring the cTrader adapter's ``stop_outward``/``take_outward`` guard: a
+    buy's take profit below the entry is an instantly marketable sell limit that
+    would flatten the position at once, and sizing only checks the stop side.
+    """
+    if signal.action not in {"buy", "sell"}:
+        raise ValueError(
+            f"Unsupported action {signal.action!r} for a bracket entry "
+            f"(signal_id={signal.id})."
+        )
+    buy = signal.action == "buy"
+    for canonical_key, keys in (
+        ("stop_loss", _SL_METADATA_KEYS),
+        ("take_profit", _TP_METADATA_KEYS),
+    ):
+        level = _resolve_optional_float(metadata, keys)
+        if level is None or not math.isfinite(level) or level <= 0:
+            # Missing/invalid levels are refused by _resolve_broker_sl_tp.
+            continue
+        is_stop = canonical_key == "stop_loss"
+        # Distance from the entry in the direction the leg must lie: below the
+        # entry for a buy's stop and a sell's take profit, above otherwise.
+        outward = (entry_price - level) if (buy == is_stop) else (level - entry_price)
+        if outward <= 0:
+            raise ValueError(
+                f"{canonical_key} {level!r} for a {signal.action} of {signal.symbol} is "
+                f"on the wrong side of the entry {entry_price!r}; refusing to submit "
+                f"(signal_id={signal.id})."
+            )
+        rounded = _round_bracket_price_toward_entry(level, entry_price=entry_price)
+        if (rounded - entry_price) * (level - entry_price) <= 0:
+            raise ValueError(
+                f"{canonical_key} {level!r} for {signal.symbol} is within one tick "
+                f"of the entry {entry_price!r}; refusing to submit "
+                f"(signal_id={signal.id})."
+            )
+        for key in keys:
+            if key in metadata:
+                metadata[key] = rounded
+        metadata[canonical_key] = rounded
+
+
+def _floor_to_whole_shares(qty: float) -> float:
+    """Alpaca accepts fractional quantities only for simple orders.
+
+    A bracket/OTO entry with a fractional qty is rejected ("fractional orders
+    must have order_class=simple", HTTP 422). Floor, never round up: rounding
+    up would exceed the risk-sized quantity.
+    """
+    return float(math.floor(float(qty) + 1e-9))
 
 
 def _normalize_broker_order_id(value: Any) -> str | None:
@@ -108,15 +191,23 @@ def _order_legs(order: Any) -> list[Any]:
     return list(legs) if isinstance(legs, (list, tuple)) else []
 
 
+def _enum_text(raw: Any) -> str:
+    """Lower-case text of an alpaca-py enum or plain string, without any ``Enum.`` prefix."""
+    text = str(getattr(raw, "value", raw) or "").strip().lower()
+    return text.rsplit(".", 1)[-1]
+
+
+def _order_status(order: Any) -> str:
+    return _enum_text(_order_attr(order, "status", ""))
+
+
 def _order_symbol(order: Any) -> str:
     return str(_order_attr(order, "symbol", "") or "").strip().upper()
 
 
 def _order_side(order: Any) -> str:
     """The order's side as ``buy``/``sell``, whether it arrives as an enum or a string."""
-    raw = _order_attr(order, "side", "")
-    text = str(getattr(raw, "value", raw) or "").strip().lower()
-    return text.rsplit(".", 1)[-1]
+    return _enum_text(_order_attr(order, "side", ""))
 
 
 def _alpaca_timeframe(value: str):
@@ -270,7 +361,7 @@ def _known_commission(order: Any) -> float | None:
     zero, NULL for everything else.
     """
     raw = _order_attr(order, "asset_class", None)
-    asset_class = str(getattr(raw, "value", raw) or "").strip().lower().rsplit(".", 1)[-1]
+    asset_class = _enum_text(raw)
     return 0.0 if asset_class == "us_equity" else None
 
 
@@ -608,6 +699,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         self._trading_client: Any | None = None
         self._trading_stream: Any | None = None
         self._historical_data_client: Any | None = None
+        self._crypto_data_client: Any | None = None
         # #78: subscribe exactly once per stream instance. Re-subscribing
         # the same (or a reconnected) stream duplicates callbacks. The
         # subscribed stream object itself is tracked (not its id(): CPython
@@ -922,6 +1014,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         self._subscribed_stream = None
         self._trading_client = None
         self._historical_data_client = None
+        self._crypto_data_client = None
         self._connected = False
         if stream is None:
             return
@@ -1054,6 +1147,62 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 )
         return float(stop_loss), float(take_profit)
 
+    def _normalize_bracket_entry(self, signal: LiveSignal, qty: float) -> tuple[LiveSignal, float]:
+        """Bring an entry onto the grid Alpaca accepts for bracket/OTO orders.
+
+        Runs before the signal row is persisted (B-8), so a refusal here never
+        leaves a persisted signal without a broker order. The persisted
+        metadata carries exactly the qty and SL/TP that are submitted.
+        Exit-only orders are simple orders and pass through unchanged.
+        """
+        metadata = dict(signal.metadata or {})
+        if str(metadata.get("risk_sizing_mode") or "") == EXIT_ONLY_RISK_SIZING_MODE:
+            return signal, qty
+        if classify_alpaca_symbol(signal.symbol) == "crypto":
+            raise ValueError(
+                f"Alpaca does not support bracket/OTO orders for crypto ({signal.symbol}); "
+                f"refusing to submit before persistence (signal_id={signal.id})."
+            )
+        if metadata.get("extended_hours"):
+            raise ValueError(
+                _EXTENDED_HOURS_BRACKET_MESSAGE.format(
+                    signal_id=signal.id, symbol=signal.symbol
+                )
+            )
+        whole_qty = _floor_to_whole_shares(qty)
+        if whole_qty < 1:
+            raise ValueError(
+                f"Risk-sized qty {qty!r} for {signal.symbol} is below one whole share; "
+                "Alpaca bracket orders require whole shares, and rounding up would "
+                f"exceed the risk budget (signal_id={signal.id})."
+            )
+        if whole_qty != qty:
+            logger.info(
+                "Floored Alpaca bracket entry qty to whole shares",
+                extra={
+                    "data": {
+                        "signal_id": str(signal.id),
+                        "symbol": signal.symbol,
+                        "risk_sized_qty": qty,
+                        "submitted_qty": whole_qty,
+                    }
+                },
+            )
+        metadata["qty"] = whole_qty
+        metadata["explicit_qty"] = whole_qty
+        entry_price = float(signal.theoretical_price)
+        if not math.isfinite(entry_price) or entry_price <= 0:
+            raise ValueError(
+                f"Invalid reference price for {signal.symbol}: "
+                f"{signal.theoretical_price!r}; refusing to submit."
+            )
+        _round_bracket_levels_in_place(metadata, entry_price=entry_price, signal=signal)
+        normalized = signal.model_copy(update={"metadata": metadata})
+        # Missing/NaN/inf/non-positive levels are refused here, not after
+        # persistence, so a refusal never leaves a signal row without an order.
+        self._resolve_broker_sl_tp(normalized)
+        return normalized, whole_qty
+
     def _build_order_request(
         self,
         signal: LiveSignal,
@@ -1086,9 +1235,9 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             # sizing assumed: the caller must choose bounded-hours bracket or
             # naked extended-hours — and naked entries are not allowed.
             raise ValueError(
-                "Extended-hours entry with mandatory SL/TP is not supported: "
-                "the broker rejects bracket orders with extended_hours enabled "
-                f"(signal_id={signal.id}, symbol={signal.symbol})."
+                _EXTENDED_HOURS_BRACKET_MESSAGE.format(
+                    signal_id=signal.id, symbol=signal.symbol
+                )
             )
         # C1: explicit unbounded policy rides as OTO (entry + stop leg,
         # no take-profit leg) instead of an invented bracket.
@@ -1141,7 +1290,8 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         open it unbounded. The same is true of an order larger than the position:
         the excess becomes a new naked position on the other side.
 
-        Returns the quantity to submit, capped at the broker's current position.
+        Returns the quantity to submit, capped at the broker's current position
+        and rounded down to the quantity step (#121 review).
         Capping rather than refusing is deliberate: the order's intent is to
         close what exists, and refusing would leave the exposure in place. The
         cap is logged because a size mismatch means the daemon's book moved
@@ -1198,8 +1348,26 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     }
                 },
             )
-            return position_qty
-        return qty
+            qty = position_qty
+        return self._floor_exit_qty(symbol, qty)
+
+    def _floor_exit_qty(self, symbol: str, qty: float) -> float:
+        """An exit qty rounded DOWN to Alpaca's quantity step (#121 review).
+
+        A partial of a fractional position (1/3 of 0.5 = 0.1666...) has more
+        decimals than Alpaca accepts; rounding it to nearest could close more
+        than asked. Raises :class:`ExitBelowStepError` below one step.
+        """
+        step = self.exit_qty_step(symbol)
+        floored = round_exit_qty_down(qty, step)
+        if floored <= 0.0:
+            raise ExitBelowStepError(
+                f"Alpaca exit for {symbol} ignored: the requested qty {qty:g} is below "
+                f"the quantity step {step:g}.",
+                requested_qty=qty,
+                qty_step=step,
+            )
+        return floored
 
     async def submit_order(self, signal: LiveSignal, *, qty: float | None = None) -> str:
         # Everything up to and including the request build is provably before
@@ -1246,6 +1414,8 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             order_side, time_in_force, market_request_cls = (
                 self._load_alpaca_order_types()
             )
+
+            signal, qty = self._normalize_bracket_entry(signal, qty)
 
             canonical_signal_id, created = await asyncio.to_thread(
                 save_live_signal, signal
@@ -1312,6 +1482,10 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         normalized_symbol = str(symbol or "").strip().upper()
         if not normalized_symbol:
             raise ValueError("symbol is required for Alpaca market data")
+        # Raises UnclassifiableSymbolError (a ValueError) rather than guessing the feed.
+        is_crypto = classify_symbol(normalized_symbol) == "crypto"
+        if is_crypto:
+            normalized_symbol = canonical_crypto_symbol(normalized_symbol)
         resolved_timeframe, _normalized = _alpaca_timeframe(timeframe)
         bounded_limit = max(1, min(int(limit), 1000))
         if not self._connected or self._historical_data_client is None:
@@ -1319,7 +1493,28 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 "Alpaca adapter must be connected before requesting market data"
             )
 
+        def _fetch_crypto(slack_multiplier: float) -> pd.DataFrame:
+            from alpaca.data.historical import CryptoHistoricalDataClient
+            from alpaca.data.requests import CryptoBarsRequest
+
+            if self._crypto_data_client is None:
+                self._crypto_data_client = CryptoHistoricalDataClient(
+                    self.api_key, self.secret_key
+                )
+            request = CryptoBarsRequest(
+                symbol_or_symbols=[normalized_symbol],
+                timeframe=resolved_timeframe,
+                start=_alpaca_market_data_start(
+                    timeframe, bounded_limit, slack_multiplier=slack_multiplier
+                ),
+                limit=1000,
+                sort=Sort.DESC,
+            )
+            return self._crypto_data_client.get_crypto_bars(request).df
+
         def _fetch(slack_multiplier: float) -> pd.DataFrame:
+            if is_crypto:
+                return _fetch_crypto(slack_multiplier)
             request = StockBarsRequest(
                 symbol_or_symbols=[normalized_symbol],
                 timeframe=resolved_timeframe,
@@ -1468,8 +1663,25 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             raise RuntimeError("Alpaca trading client is unavailable after connect.")
         return client
 
-    async def _list_open_orders(self, client: Any) -> list[Any]:
-        """Every working order, or a hard failure - never a silent empty list."""
+    #: Alpaca's maximum page size for the orders listing (its default is 50).
+    _OPEN_ORDERS_LIMIT = 500
+
+    async def _list_open_orders(self, client: Any, *, nested: bool = False) -> list[Any]:
+        """Every working order, or a hard failure - never a silent empty list.
+
+        Asks for the maximum page (the default of 50 would silently drop orders on
+        a busy account) and fails when the page comes back full, since orders may
+        then be missing. ``nested`` returns bracket legs under their parent.
+        """
+        orders = await self._list_open_orders_page(client, nested=nested)
+        if len(orders) >= self._OPEN_ORDERS_LIMIT:
+            raise RuntimeError(
+                f"Alpaca returned {len(orders)} open orders, the page limit; "
+                "refusing to treat the list as complete"
+            )
+        return orders
+
+    async def _list_open_orders_page(self, client: Any, *, nested: bool) -> list[Any]:
         get_orders = getattr(client, "get_orders", None)
         if not callable(get_orders):
             raise RuntimeError(
@@ -1479,7 +1691,11 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             from alpaca.trading.enums import QueryOrderStatus
             from alpaca.trading.requests import GetOrdersRequest
 
-            request = GetOrdersRequest(status=QueryOrderStatus.OPEN)
+            request = GetOrdersRequest(
+                status=QueryOrderStatus.OPEN,
+                limit=self._OPEN_ORDERS_LIMIT,
+                nested=nested,
+            )
             result = await asyncio.to_thread(get_orders, filter=request)
         except ModuleNotFoundError:
             result = await asyncio.to_thread(get_orders)
@@ -1500,6 +1716,36 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             f"Alpaca order list has an unrecognised shape ({type(result).__name__}); "
             "refusing to report a clean sweep"
         )
+
+    async def working_order_ids(self) -> set[str]:
+        """Ids of every working (open) order: broker ids and client order ids.
+
+        Used before sizing an exit, to tell whether an earlier exit is still
+        working (#121). The client order id is the canonical signal id, which
+        names an order whose broker id was never persisted. Nested legs are
+        included. Fails rather than returning an empty set it cannot vouch for.
+        """
+        client = await self._require_trading_client()
+        ids: set[str] = set()
+        for order in await self._list_open_orders(client, nested=True):
+            for item in (order, *_order_legs(order)):
+                for name in ("id", "client_order_id"):
+                    order_id = _control_order_id(_order_attr(item, name))
+                    if order_id is not None:
+                        ids.add(order_id)
+        return ids
+
+    def exit_qty_step(self, symbol: str) -> float:
+        """Alpaca's smallest quantity step (9 decimals): what an exit is floored to."""
+        return 1e-9
+
+    def position_qty_tolerance(self, symbol: str) -> float:
+        """Half of Alpaca's smallest quantity step (9 decimals, fractional shares).
+
+        Ledger sums and the broker position agree to that step or not at all;
+        half a step absorbs float summation noise without hiding a real share.
+        """
+        return 0.5e-9
 
     @staticmethod
     def _protection_order_ids(
@@ -1563,6 +1809,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         completed = 0
         unidentified: list[str] = []
         failed: list[str] = []
+        cancel_accepted: set[str] = set()
         for order in orders:
             order_id = _control_order_id(_order_attr(order, "id"))
             if order_id is None:
@@ -1570,9 +1817,25 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 continue
             if order_id in protected:
                 continue
+            # An order an earlier pass already cancelled is still pending_cancel. The
+            # repeat cancel is kept (it costs nothing and may nudge a stuck cancel),
+            # but a refusal of it is not a dropped cancel: the order is already on its
+            # way out. The re-read below still decides - a settled order is gone, one
+            # still pending_cancel is reported as such, anything else is a failure.
+            was_pending_cancel = _order_status(order) == "pending_cancel"
             try:
                 await self._cancel_one(client, order_id)
+                cancel_accepted.add(order_id)
             except Exception as exc:
+                if was_pending_cancel:
+                    cancel_accepted.add(order_id)
+                    logger.info(
+                        "Alpaca refused a repeat cancel of pending_cancel order %s: %s. "
+                        "Verifying on re-read.",
+                        order_id,
+                        exc,
+                    )
+                    continue
                 failed.append(f"{order_id}:{exc}")
                 logger.warning(
                     "Alpaca refused to cancel order %s: %s. Continuing the sweep.",
@@ -1593,17 +1856,42 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 unidentified=tuple(unidentified),
                 failed=tuple(failed) + (f"verify:{exc}",),
             )
+        # Alpaca keeps listing a cancel it accepted as ``pending_cancel`` until the
+        # cancel settles, so that status on an id this sweep cancelled without error
+        # is treated as an accepted request, not a dropped cancel. It is NOT proof
+        # the order can no longer fill: a pending_cancel order may still execute in
+        # a cancel/fill race. Those ids are returned in ``pending_cancel`` and the
+        # daemon refuses to stamp a STOPPED deployment enforced while any remain
+        # (fail closed); it retries until the re-read shows them cancelled or filled,
+        # and the flatten handles a fill. Only ids this sweep cancelled count; an
+        # order that was never ours to cancel and sits in ``pending_cancel`` is not
+        # vouched for.
+        def accepted_pending_cancel(order_id: str | None, order: Any) -> bool:
+            return order_id in cancel_accepted and _order_status(order) == "pending_cancel"
+
         still_working = {
-            _control_order_id(_order_attr(order, "id"))
+            order_id
             for order in remaining
-            if _control_order_id(_order_attr(order, "id")) not in protected
+            if (order_id := _control_order_id(_order_attr(order, "id"))) not in protected
+            and not accepted_pending_cancel(order_id, order)
         }
         still_working.discard(None)
         failed.extend(sorted(still_working))
+        pending_cancel = sorted(
+            {
+                order_id
+                for order in remaining
+                if (order_id := _control_order_id(_order_attr(order, "id")))
+                is not None
+                and order_id not in protected
+                and accepted_pending_cancel(order_id, order)
+            }
+        )
         return ControlOutcome(
             completed=completed,
             unidentified=tuple(unidentified),
             failed=tuple(failed),
+            pending_cancel=tuple(pending_cancel),
         )
 
     @staticmethod

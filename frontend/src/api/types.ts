@@ -294,6 +294,8 @@ export interface OptimizationRunRequest {
   target_metric: "sharpe" | "net_profit" | "calmar" | "cagr" | "win_rate";
   n_trials: number;
   train_split_pct: number;
+  validation_split_pct?: number;
+  test_split_pct?: number;
   parameter_ranges: Record<string, OptimizationParameterRange>;
   optimization_mode?:
     | "parameter"
@@ -311,6 +313,88 @@ export interface OptimizationRunResponse {
 export interface OptimizationPeriod {
   start: string;
   end: string;
+}
+
+// Three-way split types (issue #164)
+export interface ThreeWaySplitSegments {
+  train: OptimizationPeriod;
+  validation: OptimizationPeriod;
+  test: OptimizationPeriod;
+  embargo_train_val: OptimizationPeriod;
+  embargo_val_test: OptimizationPeriod;
+}
+
+export interface ThreeWayWinnerMetrics {
+  trial_number: number;
+  train_metrics: OptimizationStatMap;
+  validation_metrics: OptimizationStatMap;
+  test_metrics: OptimizationStatMap;
+}
+
+export interface ThreeWaySelection {
+  winner_trial_number: number;
+  score_source: string;
+  target_metric: string;
+  study_direction: string;
+  top_fraction: number;
+  top_set_size: number;
+  n_selectable_trials: number;
+  n_unselectable_trials: number;
+  tie_break: string;
+  ranked_top_set: Array<{
+    rank: number;
+    trial_number: number;
+    validation_score: number;
+    validation_metric_value: number;
+    params: Record<string, StrategyParameterValue>;
+    is_winner: boolean;
+  }>;
+}
+
+export interface ThreeWayTestDistribution {
+  count: number;
+  share_profitable: number;
+  median_target_metric: number;
+  target_metric: string;
+  spearman_validation_to_test: number;
+  ranked_by_test: Array<Record<string, unknown>>;
+  note: string;
+}
+
+export interface ThreeWayOverfittingCheck {
+  value: number | null;
+  threshold: number;
+  passed: boolean;
+  computable: boolean;
+}
+
+export interface ThreeWayOverfitting {
+  passed: boolean;
+  checks: {
+    degradation: ThreeWayOverfittingCheck;
+    deflated_sharpe: ThreeWayOverfittingCheck;
+  };
+  thresholds: {
+    max_train_validation_degradation: number;
+    min_deflated_sharpe: number;
+  };
+  reasons: string[];
+  degradation: number | null;
+  deflated_sharpe: number | null;
+  metric: string;
+  train_metric_value: number;
+  validation_metric_value: number;
+  n_selectable_trials: number;
+  var_sharpe_per_obs: number;
+  note: string;
+}
+
+export interface ThreeWayPayload {
+  segments: ThreeWaySplitSegments;
+  winner: ThreeWayWinnerMetrics;
+  selection: ThreeWaySelection;
+  test_distribution: ThreeWayTestDistribution;
+  overfitting: ThreeWayOverfitting;
 }
 
 export interface OptimizationTrial {
@@ -364,6 +448,14 @@ export interface OptimizationSummary {
   train_stats: OptimizationStatMap;
   test_stats: OptimizationStatMap;
   oos_status?: OptimizationOosStatus | null;
+  // Three-way split keys (issue #164)
+  validation_split_pct?: number;
+  test_split_pct?: number;
+  validation_period?: OptimizationPeriod;
+  validation_stats?: OptimizationStatMap;
+  final_test_period?: OptimizationPeriod;
+  final_test_stats?: OptimizationStatMap;
+  three_way?: ThreeWayPayload;
 }
 
 export interface OptimizationDetail {
@@ -400,6 +492,14 @@ export interface OptimizationDetail {
   test_stats: OptimizationStatMap;
   oos_status?: OptimizationOosStatus | null;
   top_trials: OptimizationTrial[];
+  // Three-way split keys (issue #164)
+  validation_split_pct?: number;
+  test_split_pct?: number;
+  validation_period?: OptimizationPeriod;
+  validation_stats?: OptimizationStatMap;
+  final_test_period?: OptimizationPeriod;
+  final_test_stats?: OptimizationStatMap;
+  three_way?: ThreeWayPayload;
 }
 
 export interface BacktestStats {
@@ -1059,22 +1159,70 @@ export interface MatrixGridOverview {
 
 export interface MaintenanceDeleteItem {
   id: string;
-  status: "deleted" | "not_found" | "failed" | "cleanup_pending";
+  status: "deleted" | "not_found" | "failed" | "cleanup_pending" | "skipped";
   database: string;
   artifact: string;
   error?: string;
   journal_pending?: boolean;
+  /** Set on `skipped` items of a two-phase bulk delete: why the confirmed id
+   * was not deleted (e.g. `no_longer_empty`, `now_kept_entry`, `not_found`). */
+  reason?: string;
 }
+
+/** Display info of one backtest a two-phase bulk delete would remove. */
+export interface BacktestBulkDeleteCandidate {
+  id: string;
+  display_name: string;
+  strategy_name: string;
+  symbols: string[];
+  timeframe: string;
+  trade_count: number;
+  created_at: string;
+}
+
+/** Display info of one portfolio a two-phase bulk delete would remove. */
+export interface PortfolioBulkDeleteCandidate {
+  id: string;
+  name: string;
+  component_count: number;
+  created_at: string;
+}
+
+/** Fields every deduplicate dry-run candidate carries on top of its display info. */
+export interface DuplicateCandidateInfo {
+  status: "candidate";
+  fingerprint: string;
+  kept_id: string;
+  is_kept: boolean;
+}
+
+/** Request body of the two-phase bulk-delete endpoints. */
+export type BulkDeleteDryRunRequest = { dry_run: true };
+export type BulkDeleteConfirmRequest = { dry_run: false; ids: string[] };
 
 export interface BacktestsBulkDeleteResponse {
   deleted: number;
   items: MaintenanceDeleteItem[];
 }
 
-export interface BacktestsRemoveEmptyResponse {
-  removed: number;
+export interface BacktestsRemoveEmptyDryRunResponse {
+  dry_run: true;
+  candidates: BacktestBulkDeleteCandidate[];
+  candidate_ids: string[];
+}
+
+export interface BacktestsRemoveEmptyConfirmResponse {
+  dry_run: false;
+  deleted: number;
+  skipped: number;
+  failed: number;
+  removed_ids: string[];
   items: MaintenanceDeleteItem[];
 }
+
+export type BacktestsRemoveEmptyResponse =
+  | BacktestsRemoveEmptyDryRunResponse
+  | BacktestsRemoveEmptyConfirmResponse;
 
 export interface PortfoliosBulkDeleteResponse {
   deleted: number;
@@ -1101,12 +1249,29 @@ export interface BacktestsDuplicatesResponse {
   total_backtests: number;
 }
 
-export interface BacktestsDeduplicateResponse {
+export interface BacktestsDeduplicateDryRunResponse {
+  dry_run: true;
   deleted_ids: string[];
   kept_ids: string[];
+  candidate_ids: string[];
+  skipped_ids: string[];
+  groups_affected: number;
+  items: Array<BacktestBulkDeleteCandidate & DuplicateCandidateInfo>;
+}
+
+export interface BacktestsDeduplicateConfirmResponse {
+  dry_run: false;
+  deleted_ids: string[];
+  kept_ids: string[];
+  candidate_ids: string[];
+  skipped_ids: string[];
   groups_affected: number;
   items: MaintenanceDeleteItem[];
 }
+
+export type BacktestsDeduplicateResponse =
+  | BacktestsDeduplicateDryRunResponse
+  | BacktestsDeduplicateConfirmResponse;
 
 export interface PortfolioDuplicateGroup {
   fingerprint: string;
@@ -1126,19 +1291,49 @@ export interface PortfoliosDuplicatesResponse {
   total_portfolios: number;
 }
 
-export interface PortfoliosDeduplicateResponse {
+export interface PortfoliosDeduplicateDryRunResponse {
+  dry_run: true;
   deleted_ids: string[];
   kept_ids: string[];
+  candidate_ids: string[];
+  skipped_ids: string[];
+  groups_affected: number;
+  items: Array<PortfolioBulkDeleteCandidate & DuplicateCandidateInfo>;
+}
+
+export interface PortfoliosDeduplicateConfirmResponse {
+  dry_run: false;
+  deleted_ids: string[];
+  kept_ids: string[];
+  candidate_ids: string[];
+  skipped_ids: string[];
   groups_affected: number;
   items: MaintenanceDeleteItem[];
 }
 
-export interface PortfoliosRemoveEmptyResponse {
-  removed: number;
-  remaining: number;
+export type PortfoliosDeduplicateResponse =
+  | PortfoliosDeduplicateDryRunResponse
+  | PortfoliosDeduplicateConfirmResponse;
+
+export interface PortfoliosRemoveEmptyDryRunResponse {
+  dry_run: true;
+  candidates: PortfolioBulkDeleteCandidate[];
+  candidate_ids: string[];
+}
+
+export interface PortfoliosRemoveEmptyConfirmResponse {
+  dry_run: false;
+  deleted: number;
+  skipped: number;
+  failed: number;
   removed_ids: string[];
   items: MaintenanceDeleteItem[];
+  remaining: number;
 }
+
+export type PortfoliosRemoveEmptyResponse =
+  | PortfoliosRemoveEmptyDryRunResponse
+  | PortfoliosRemoveEmptyConfirmResponse;
 
 export interface TradeDetail extends Trade {
   ohlcv: OHLCVBar[];
@@ -1152,9 +1347,7 @@ export interface ChartMarkerDrawing {
   color?: string;
   text?: string;
   symbol?: string;
-}
-
-export interface ChartLineDrawing {
+}export interface ChartLineDrawing {
   type: "line";
   start_time: number;
   end_time: number;

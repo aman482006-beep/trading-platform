@@ -156,6 +156,20 @@ Persistiert wird auf der Signal-Metadata: `entry_quote_bid`, `entry_quote_ask`,
 akzeptierten Signalen; abgelehnte werden noch nicht persistiert, nur geloggt).
 Payload-Werte unter diesen Keys werden überschrieben. Ein Schema für Quote-Snapshots (auch abgelehnter Signale) ist #134.
 
+## Broker-Raster (Alpaca)
+
+Alpaca nimmt Bracket-/OTO-Entries nur in ganzen Stück und mit SL/TP auf dem
+Preisraster an (0.01 ab 1 USD, 0.0001 darunter). `AlpacaLiveAdapter` normalisiert
+jede Entry vor dem Persistieren: die risk-gesizte `qty` wird auf ganze Stück
+**abgerundet** (unter 1 Stück → abgelehnt), SL und TP werden **zum Entry hin**
+gerundet. Damit liegt das tatsächliche Risiko nie über dem gesizten Budget. Exit-only
+Orders (simple) bleiben unverändert.
+
+Vor dem Persistieren werden zusätzlich abgelehnt (ValueError, kein Signal-Row, keine
+Order): SL/TP auf der falschen Seite des Entry, SL/TP innerhalb eines Ticks vom Entry,
+fehlende/ungültige SL/TP-Level, Extended-Hours-Brackets und Crypto-Symbole (Alpaca
+kennt keine Bracket-/OTO-Orders für Crypto).
+
 ## Implizite Divergenz
 
 Der Unterschied bei `enforce_stop_direction` führt dazu, dass:
