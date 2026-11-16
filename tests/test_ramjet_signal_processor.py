@@ -131,6 +131,15 @@ def test_trailing_percent_out_of_range_rejected():
         )
 
 
+@pytest.mark.parametrize("trailing_percent", [0.0, 1.0, -0.01, float("nan")])
+def test_trailing_percent_boundaries_rejected(trailing_percent):
+    """Survivor: the open interval (0, 1) must exclude both endpoints and NaN."""
+    with pytest.raises(ValueError, match="trailing_percent"):
+        RamJetSignalProcessor(
+            {"ram_jet": {"trailing_mode": "percent", "trailing_percent": trailing_percent}}
+        )
+
+
 def test_process_signal_rejects_non_buy_actions():
     processor = RamJetSignalProcessor({"ram_jet": {"candle_timeframe": "5Min"}})
     with pytest.raises(ValueError, match="BUY/LONG"):

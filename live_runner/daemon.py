@@ -72,6 +72,7 @@ from shared.database import (
     save_live_balance,
     update_service_status,
 )
+from shared.fill_keys import canonical_utc_timestamp
 from shared.logging import get_logger
 from shared.models import (
     LiveAccountConfig,
@@ -85,6 +86,7 @@ from shared.models import (
 from shared.sentry import capture_exception, initialize_sentry
 from shared.trailing import (
     TRAILING_SL_CONFIG_METADATA_KEY,
+    validate_live_deployment_trailing_override,
     validate_trailing_sl_config,
 )
 from signal_bots.registry import get_signal_processor
@@ -98,6 +100,12 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_ACCOUNTS_ENV = PROJECT_ROOT / ".accounts.env"
 BALANCE_POLL_INTERVAL_SECONDS = 60
 DEPLOYMENT_POLL_INTERVAL_SECONDS = 10
+# A broker-side ``pending_cancel`` order normally settles within seconds. A STOPPED
+# deployment stays unstamped while one is listed (it could still fill); after this many
+# consecutive enforcement passes (~1 minute at the poll interval) the WARNING becomes an
+# ERROR so a stuck cancel reaches an operator.
+PENDING_CANCEL_ESCALATION_PASSES = 6
+_PENDING_CANCEL_PASSES: dict[str, int] = {}
 SERVICE_SYNC_INTERVAL_SECONDS = 60
 _DISCORD_AUTH_BLOCKED_ACCOUNTS: set[str] = set()
 _DISCORD_AUTH_BLOCKED_REASONS: dict[str, str] = {}
@@ -1220,21 +1228,38 @@ def _mint_signal_idempotency_key(
     producer_stamp = metadata.get("signal_timestamp") or metadata.get("timestamp")
     if not producer_stamp:
         return
-    key_material = "|".join(
-        [
-            str(deployment.id),
-            str(signal.symbol).upper(),
-            str(signal.action).lower(),
-            repr(float(signal.entry_price)),
-            repr(signal.stop_loss),
-            repr(signal.take_profit),
-            str(signal.timeframe),
-            str(producer_stamp),
-        ]
-    )
-    metadata["idempotency_key"] = hashlib.sha256(key_material.encode("utf-8")).hexdigest()[
-        :32
-    ]
+    # The same producer event can be redelivered with its timestamp spelled differently (``Z``
+    # vs ``+00:00``, aware vs naive, another UTC offset). Key on the instant, not the spelling,
+    # without rounding it: distinct instants - even a microsecond apart - keep distinct keys.
+    # Text that is not a time keeps its verbatim form.
+    raw_stamp = str(producer_stamp)
+    canonical_stamp = canonical_utc_timestamp(producer_stamp) or raw_stamp
+
+    def _key(stamp: str) -> str:
+        key_material = "|".join(
+            [
+                str(deployment.id),
+                str(signal.symbol).upper(),
+                str(signal.action).lower(),
+                repr(float(signal.entry_price)),
+                repr(signal.stop_loss),
+                repr(signal.take_profit),
+                str(signal.timeframe),
+                stamp,
+            ]
+        )
+        return hashlib.sha256(key_material.encode("utf-8")).hexdigest()[:32]
+
+    metadata["idempotency_key"] = _key(canonical_stamp)
+    if canonical_stamp != raw_stamp:
+        # Signals persisted before #127 were keyed on the verbatim spelling. A replay of one of
+        # them right after the upgrade (a restart is exactly when producers replay) must still
+        # find that row instead of placing a second broker order, so the pre-#127 key travels
+        # along as a lookup-only fallback. It is never stored as the row's own key.
+        # Bound: this only dedupes a replay that carries the SAME spelling as the stored
+        # pre-#127 row. A replay re-spelled differently (``Z`` stored, ``+00:00`` replayed)
+        # misses it; closing that needs a data migration of stored keys and is not done here.
+        metadata["legacy_idempotency_key"] = _key(raw_stamp)
 
 
 def _trade_signal_to_live_signal(
@@ -1864,8 +1889,9 @@ def _deployment_accepts_signal_author(
     resolver fell back to `os.environ` - and `.accounts.env` is never installed
     there, only read into a mapping. The allowlist therefore resolved empty, the
     empty case was treated as "no restriction", and this gate was **inert**: it
-    accepted every author. An empty allowlist now rejects every author. The one defence against a deployment trading on another bot's author
-    was not running, silently, in the documented production config.
+    accepted every author. An empty allowlist now rejects every author. The one
+    defence against a deployment trading on another bot's author was not running,
+    silently, in the documented production config.
     """
     allowlist = _deployment_trusted_author_ids(
         deployment, accounts_env_values=accounts_env_values
@@ -3059,6 +3085,59 @@ async def _poll_balances(
         await asyncio.sleep(interval_seconds)
 
 
+#: How often unknown commissions are backfilled (#124). Alpaca posts crypto fees once a day, so an
+#: hourly pass prices a posted day within the hour and costs a handful of REST calls.
+COMMISSION_BACKFILL_INTERVAL_SECONDS = 3600
+#: One hung broker must not stall the pass for the others.
+COMMISSION_BACKFILL_TIMEOUT_SECONDS = 120.0
+
+
+async def _backfill_commissions_once(adapters: dict[str, BaseLiveAdapter]) -> None:
+    """Run every ready adapter's commission backfill once; a failure is logged, never raised."""
+    ready = [
+        (account_id, adapter)
+        for account_id, adapter in list(adapters.items())
+        if _adapter_is_ready(adapter)
+    ]
+
+    async def _backfill_one(account_id: str, adapter: BaseLiveAdapter) -> None:
+        try:
+            updated = await asyncio.wait_for(
+                adapter.backfill_commissions(), timeout=COMMISSION_BACKFILL_TIMEOUT_SECONDS
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Commission backfill failed; commissions stay unknown until the next pass",
+                extra={
+                    "data": {
+                        "account_id": account_id,
+                        "adapter": type(adapter).__name__,
+                        "error": str(exc) or type(exc).__name__,
+                    }
+                },
+            )
+            return
+        if updated:
+            logger.info(
+                "Backfilled commissions",
+                extra={"data": {"account_id": account_id, "executions": updated}},
+            )
+
+    await asyncio.gather(*(_backfill_one(account_id, adapter) for account_id, adapter in ready))
+
+
+async def _backfill_commissions_loop(
+    adapters: dict[str, BaseLiveAdapter],
+    *,
+    interval_seconds: int = COMMISSION_BACKFILL_INTERVAL_SECONDS,
+) -> None:
+    while True:
+        await _backfill_commissions_once(adapters)
+        await asyncio.sleep(interval_seconds)
+
+
 def _deployment_task_name(account_id: str, kind: str) -> str:
     return f"deployment-{kind}-{account_id}"
 
@@ -3347,6 +3426,13 @@ async def _enforce_stopped_deployments(
     order - or a cancel call that failed outright - still lets the flatten run,
     because leaving positions open is worse than leaving an order resting. It
     does gate the stamp.
+
+    The stamp is also withheld while the cancel sweep reports ids still in the
+    broker's ``pending_cancel`` state (``ControlOutcome.pending_cancel``): such an
+    order can still fill in a cancel/fill race, so the pass logs a WARNING naming
+    them and retries, escalating to ERROR after
+    ``PENDING_CANCEL_ESCALATION_PASSES`` consecutive passes. A fill is flattened
+    by the next pass before the stamp. cTrader never reports any, so it is unchanged.
     """
     stopped = [
         deployment
@@ -3362,6 +3448,13 @@ async def _enforce_stopped_deployments(
         if deployment_id not in stopped_ids
     }
     already_enforced.difference_update(left_stopped)
+    # The pending_cancel escalation count belongs to one STOPPED episode. Drop it for
+    # any deployment that is no longer STOPPED or was deleted - including one that
+    # never got stamped, which the ledger above does not track - so the count cannot
+    # grow without bound or carry over into a later STOPPED episode.
+    for deployment_id in list(_PENDING_CANCEL_PASSES):
+        if deployment_id not in stopped_ids:
+            del _PENDING_CANCEL_PASSES[deployment_id]
     # The persisted stamp is authoritative, not this process's ledger: a deployment
     # that was resumed and stopped again between two ticks was never observed
     # leaving STOPPED, so the ledger still lists it while its stamp (cleared by the
@@ -3613,6 +3706,30 @@ async def _enforce_stopped_deployments(
                 },
             )
             continue
+        if cancelled.pending_cancel:
+            passes = _PENDING_CANCEL_PASSES.get(deployment_id, 0) + 1
+            _PENDING_CANCEL_PASSES[deployment_id] = passes
+            log = (
+                logger.error
+                if passes >= PENDING_CANCEL_ESCALATION_PASSES
+                else logger.warning
+            )
+            log(
+                "Not recording STOPPED enforcement: order(s) %s still pending_cancel "
+                "and may yet fill (pass %d). Retrying next tick",
+                sorted(cancelled.pending_cancel),
+                passes,
+                extra={
+                    "data": {
+                        "deployment_id": deployment_id,
+                        "account_id": deployment.account_id,
+                        "pending_cancel": sorted(cancelled.pending_cancel),
+                        "passes": passes,
+                    }
+                },
+            )
+            continue
+        _PENDING_CANCEL_PASSES.pop(deployment_id, None)
         if not orphan_sweep_unsupported and (
             orphaned is None or not orphaned.complete
         ):
@@ -3673,6 +3790,22 @@ async def _load_db_accounts_and_deployments(
     accounts_task = asyncio.to_thread(list_live_accounts)
     deployments_task = asyncio.to_thread(list_live_deployments)
     accounts, deployments = await asyncio.gather(accounts_task, deployments_task)
+    # #150: a stored deployment whose trailing override live cannot run is still
+    # loaded (so it stays listed, stoppable and enforceable), but every signal
+    # it produces is refused by the live gates. Say so loudly at load time.
+    for deployment in deployments:
+        try:
+            validate_live_deployment_trailing_override(
+                deployment.signal_config,
+                context=f"live deployment '{deployment.strategy_name}' ({deployment.id})",
+            )
+        except ValueError as exc:
+            logger.error(
+                "Stored live deployment has an unsupported trailing mode; its entry "
+                "signals will be refused: %s",
+                exc,
+                extra={"data": {"deployment_id": str(deployment.id)}},
+            )
     return accounts, deployments
 
 
@@ -4096,8 +4229,13 @@ async def run_daemon(
         ),
         name="trailing-stops-loop",
     )
+    commission_task = asyncio.create_task(
+        _backfill_commissions_loop(active_adapters), name="commission-backfill"
+    )
     try:
-        await asyncio.gather(sync_task, service_sync_task, balance_task, trailing_task)
+        await asyncio.gather(
+            sync_task, service_sync_task, balance_task, trailing_task, commission_task
+        )
     except asyncio.CancelledError:
         logger.info("Live daemon cancelled")
         raise
@@ -4114,7 +4252,13 @@ async def run_daemon(
         # B2: cancel EVERYTHING (sync + balance loops leaked before) and
         # await the cancels — fire-and-forget cancel() leaves pending tasks
         # and "Task was destroyed" warnings behind.
-        for task in (sync_task, service_sync_task, balance_task, trailing_task):
+        for task in (
+            sync_task,
+            service_sync_task,
+            balance_task,
+            trailing_task,
+            commission_task,
+        ):
             if not task.done():
                 task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -4123,6 +4267,7 @@ async def run_daemon(
                 service_sync_task,
                 balance_task,
                 trailing_task,
+                commission_task,
                 return_exceptions=True,
             )
         for task in list(active_listener_tasks.values()):

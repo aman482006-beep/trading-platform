@@ -62,10 +62,12 @@ def test_signal_replay_adapter_updates_trailing_stop_and_exits() -> None:
     assert trade.meta["fill_delay_seconds"] == 0
 
 
-def _trailing_replay_signal(mode_config: dict) -> ReplaySignal:
+def _trailing_replay_signal(
+    mode_config: dict, timestamp: str = "2026-01-01T00:00:00Z"
+) -> ReplaySignal:
     return ReplaySignal.from_payload(
         {
-            "timestamp": "2026-01-01T00:00:00Z",
+            "timestamp": timestamp,
             "symbol": "AAPL",
             "action": "buy",
             "entry_price": 100.0,
@@ -92,6 +94,17 @@ def _one_bar_frame() -> pd.DataFrame:
     )
 
 
+def _run_replay(signals: list[ReplaySignal]):
+    adapter = SignalReplayAdapter(fee_params={"fees": "zero"}, default_timeframe="1m")
+    return adapter.run(
+        signals=signals,
+        ohlcv_by_symbol={"AAPL": _one_bar_frame()},
+        timeframe="1m",
+        backtest_start="2026-01-01",
+        backtest_end="2026-01-01",
+    )
+
+
 def test_replay_rejects_unsupported_trailing_mode_supertrend_flip() -> None:
     """#150: supertrend_flip is known but replay cannot execute it (#168).
 
@@ -99,27 +112,29 @@ def test_replay_rejects_unsupported_trailing_mode_supertrend_flip() -> None:
     the run aborts instead of silently returning a result that differs from
     the strategy's intent.
     """
-    adapter = SignalReplayAdapter(fee_params={"fees": "zero"}, default_timeframe="1m")
+    signals = [_trailing_replay_signal({"mode": "supertrend_flip"})]
     with pytest.raises(ValueError, match="supertrend_flip"):
-        adapter.run(
-            signals=[_trailing_replay_signal({"mode": "supertrend_flip"})],
-            ohlcv_by_symbol={"AAPL": _one_bar_frame()},
-            timeframe="1m",
-            backtest_start="2026-01-01",
-            backtest_end="2026-01-01",
-        )
+        _run_replay(signals)
+
+
+def test_replay_rejects_a_signal_at_signal_time_before_the_engine_backstop() -> None:
+    """Review survivor: the replay gate itself (not the engine backstop) must refuse.
+
+    The engine backstop raises a different message, so `match="signal replay"`
+    only passes if the signal-time gate in the adapter rejected the signal.
+    """
+    signals = [
+        _trailing_replay_signal({"mode": "none"}),
+        _trailing_replay_signal({"mode": "supertrend_flip"}, timestamp="2026-01-01T00:01:00Z"),
+    ]
+    with pytest.raises(ValueError, match="signal replay"):
+        _run_replay(signals)
 
 
 def test_replay_rejects_unknown_trailing_mode() -> None:
-    adapter = SignalReplayAdapter(fee_params={"fees": "zero"}, default_timeframe="1m")
+    signals = [_trailing_replay_signal({"mode": "martingale_trail"})]
     with pytest.raises(ValueError, match="Unknown trailing stop mode"):
-        adapter.run(
-            signals=[_trailing_replay_signal({"mode": "martingale_trail"})],
-            ohlcv_by_symbol={"AAPL": _one_bar_frame()},
-            timeframe="1m",
-            backtest_start="2026-01-01",
-            backtest_end="2026-01-01",
-        )
+        _run_replay(signals)
 
 
 def test_replay_mode_none_trades_with_initial_stop_only() -> None:
