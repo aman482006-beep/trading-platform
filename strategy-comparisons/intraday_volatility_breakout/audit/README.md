@@ -50,8 +50,8 @@ SL-Exits centgenau, Lots exakt, Time-Exits = 22:55-Open (+Spread bei SHORT).
 
 ## Gefundene Abweichungen (alle belegt, Fixes im Branch)
 
-1. **ATR-Historie** (kein Codefehler): CSV-Wilder (6 Wochen) vs. MT5-Wilder
-   (8 Jahre) → median ~5 % Level-Diff. Neu: `warmup_start` (Adapter/Engine).
+1. **ATR-Historie** (kein Codefehler): CSV-Wilder (6 Wochen) vs. MT5-SMA
+   (8 Jahre; die Wilder-Annahme war falsch, siehe Abschnitt „Volle Historie“) → median ~5 % Level-Diff. Neu: `warmup_start` (Adapter/Engine).
 2. **`entry_open` bei Lücken**: MT5-`iBarShift` nimmt nächste Bar (28.04. USATECH:
    16:29 statt 16:32) → Fix in Strategie + Tests.
 3. **`trade_direction` vor Reverse-Swap** erlaubte falsche Seiten

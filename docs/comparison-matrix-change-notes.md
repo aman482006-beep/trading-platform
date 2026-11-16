@@ -6,6 +6,37 @@ whenever a protected baseline file changes parity-sensitive behavior. Each entry
 records the old and new `deltas[]` values of the comparison matrix for the
 committed comparison cases, plus the remaining limitations.
 
+## #186 — MT5 parity: server-clock D1 bars and explicit broker clocks
+
+- Changed behavior, protected files:
+  - `scripts/regenerate_mt5_parity_artifacts.py`: every comparison case now runs
+    on an explicit `broker_clock` (`dukascopy_mt5_forex` for EURUSD,
+    `dukascopy_mt5_index` for NAS100/SP500). EURUSD builds its D1 bars from the
+    M1 bars on the broker's server clock (`use_native_daily_ohlcv: False`) instead
+    of the UTC-day `1d` parquet.
+  - `tests/validation/test_cross_platform_metrics.py`: the MT5 first-entry
+    timestamp assertion is skipped with a reason when the locally generated
+    artifact is absent (the artifacts are not committed; see the reference
+    artifact contract).
+  - `tests/test_mt5_parity_artifact_loader.py`: new tests for the regenerate
+    script's case selection, EUR-account conversion gate and clock plumbing.
+- Why: the MT5 tester history builds D1 bars and the weekend/holiday rows on the
+  broker's server clock; the UTC-day bars put the day boundaries in other places.
+  Evidence: `strategy-comparisons/intraday_volatility_breakout/audit/README.md`.
+- Before/after matrix: **not produced in this change.** The platform artifacts in
+  `data/backtests/` are generated locally (multi-GB data run) and are not
+  committed, so the `build_comparison_matrix()` deltas cannot be recomputed from
+  the repository alone. The reported before/after numbers (for example SP500 net
+  PnL 71,758.82 -> 32,633.26 for the strategy itself) are in the audit README.
+  Recomputing the matrix deltas needs the local regenerated artifacts.
+- Remaining limitations:
+  - The matrix still reads MT5 XLSX times as `Europe/Athens`
+    (`validation/statistics/cross_platform.py`). That is 1 h off for the index
+    history in summer 2018–2023 and in US-only DST weeks from 2024-04; it affects
+    day boundaries in the matrix, not the trade counts. Follow-up.
+  - The artifact-dependent guards skip, with a reason, when the artifacts are
+    absent. This is by design: no CI download of multi-GB data.
+
 ## #128 / PR #136 — relative deviation measured against the reference
 
 - Changed behavior: `validation/statistics/cross_platform.py::_metric_delta`.
