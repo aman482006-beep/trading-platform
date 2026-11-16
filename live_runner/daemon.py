@@ -1831,8 +1831,9 @@ def _deployment_accepts_signal_author(
     resolver fell back to `os.environ` - and `.accounts.env` is never installed
     there, only read into a mapping. The allowlist therefore resolved empty, the
     empty case was treated as "no restriction", and this gate was **inert**: it
-    accepted every author. An empty allowlist now rejects every author. The one defence against a deployment trading on another bot's author
-    was not running, silently, in the documented production config.
+    accepted every author. An empty allowlist now rejects every author. The one
+    defence against a deployment trading on another bot's author was not running,
+    silently, in the documented production config.
     """
     allowlist = _deployment_trusted_author_ids(
         deployment, accounts_env_values=accounts_env_values
@@ -3389,8 +3390,13 @@ async def _enforce_stopped_deployments(
         if deployment_id not in stopped_ids
     }
     already_enforced.difference_update(left_stopped)
-    for deployment_id in left_stopped:
-        _PENDING_CANCEL_PASSES.pop(deployment_id, None)
+    # The pending_cancel escalation count belongs to one STOPPED episode. Drop it for
+    # any deployment that is no longer STOPPED or was deleted - including one that
+    # never got stamped, which the ledger above does not track - so the count cannot
+    # grow without bound or carry over into a later STOPPED episode.
+    for deployment_id in list(_PENDING_CANCEL_PASSES):
+        if deployment_id not in stopped_ids:
+            del _PENDING_CANCEL_PASSES[deployment_id]
     # The persisted stamp is authoritative, not this process's ledger: a deployment
     # that was resumed and stopped again between two ticks was never observed
     # leaving STOPPED, so the ledger still lists it while its stamp (cleared by the

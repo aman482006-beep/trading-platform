@@ -1751,14 +1751,14 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         # and the flatten handles a fill. Only ids this sweep cancelled count; an
         # order that was never ours to cancel and sits in ``pending_cancel`` is not
         # vouched for.
+        def accepted_pending_cancel(order_id: str | None, order: Any) -> bool:
+            return order_id in cancel_accepted and _order_status(order) == "pending_cancel"
+
         still_working = {
-            _control_order_id(_order_attr(order, "id"))
+            order_id
             for order in remaining
-            if _control_order_id(_order_attr(order, "id")) not in protected
-            and not (
-                _control_order_id(_order_attr(order, "id")) in cancel_accepted
-                and _order_status(order) == "pending_cancel"
-            )
+            if (order_id := _control_order_id(_order_attr(order, "id"))) not in protected
+            and not accepted_pending_cancel(order_id, order)
         }
         still_working.discard(None)
         failed.extend(sorted(still_working))
@@ -1768,9 +1768,8 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 for order in remaining
                 if (order_id := _control_order_id(_order_attr(order, "id")))
                 is not None
-                and order_id in cancel_accepted
                 and order_id not in protected
-                and _order_status(order) == "pending_cancel"
+                and accepted_pending_cancel(order_id, order)
             }
         )
         return ControlOutcome(
