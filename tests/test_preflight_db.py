@@ -541,3 +541,19 @@ def test_cosmetic_spelling_is_not_drift(isolated_db) -> None:
     assert report.errors == []
     assert report.warnings == [], report.warnings
     assert len(report.matched) == 1
+
+
+def test_a_lock_timeout_is_not_blamed_on_the_wal(isolated_db, monkeypatch) -> None:
+    """Only the write-refusal form carries the WAL hint; a lock is a lock."""
+    database = isolated_db[0]
+    _seed(database)
+
+    def refuse(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(preflight_db, "read_active_db_deployments", refuse)
+
+    report = run_db_preflight([], db_path=_db_path(database))
+
+    assert any("database is locked" in e for e in report.errors), report.errors
+    assert not any("WAL" in e for e in report.errors), report.errors

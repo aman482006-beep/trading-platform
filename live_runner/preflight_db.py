@@ -323,14 +323,14 @@ def run_db_preflight(
     except sqlite3.OperationalError as exc:
         # A mode=ro connection cannot run WAL recovery: SQLite has to create or write the -shm
         # index, so a WAL database that needs recovery (after an unclean stop) - or that merely
-        # lives in a directory this process cannot write - reports "attempt to write a readonly
-        # database" or "unable to open database file" even though the file itself is intact.
-        # Without the cause named, that reads as corruption and sends the operator chasing a
-        # damaged database instead of a checkpoint.
-        return DbPreflightReport(
-            db_path=str(path),
-            errors=[f"Cannot read deployments from {path}: {exc} {_WAL_READ_ONLY_HINT}"],
-        )
+        # lives in a directory this process cannot write - reports a write error even though the
+        # file itself is intact. Without the cause named that reads as corruption, and the
+        # operator goes hunting a damaged database instead of checkpointing one.
+        message = f"Cannot read deployments from {path}: {exc}"
+        if "readonly" in str(exc).lower():
+            # Only the write-refusal form, so a genuine lock timeout is not blamed on the WAL.
+            message = f"{message} {_WAL_READ_ONLY_HINT}"
+        return DbPreflightReport(db_path=str(path), errors=[message])
     except sqlite3.Error as exc:
         return DbPreflightReport(
             db_path=str(path), errors=[f"Cannot read deployments from {path}: {exc}"]
