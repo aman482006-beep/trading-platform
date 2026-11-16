@@ -54,26 +54,52 @@ _PROTO_OA_CTID_TRADER_ACCOUNT_REQ: Any = None
 _PROTO_OA_CTID_TRADER_ACCOUNT_RES: Any = None
 
 
+# Reactor implementation modules Twisted can install as an import side effect of
+# ``twisted.internet.reactor``. ``twisted.internet.default._getInstallFunction`` picks one
+# per platform (epollreactor on Linux, pollreactor on other POSIX, selectreactor on
+# Windows and macOS, iocp/kqueue/cf reactors only on request), so the sweep below must not
+# name a single platform. ``twisted.internet.asyncioreactor`` is deliberately absent:
+# importing it installs nothing, and it is the reactor the live adapter installs itself.
+_PLATFORM_REACTOR_MODULE_PREFIX = "twisted.internet."
+_PLATFORM_REACTOR_MODULE_SUFFIX = "reactor"
+_KEPT_REACTOR_MODULES = frozenset({"twisted.internet.asyncioreactor"})
+
+
+def _is_platform_reactor_module(name: str) -> bool:
+    """True for a module that installs the platform default Twisted reactor."""
+    return (
+        name.startswith(_PLATFORM_REACTOR_MODULE_PREFIX)
+        and name.endswith(_PLATFORM_REACTOR_MODULE_SUFFIX)
+        and name not in _KEPT_REACTOR_MODULES
+    )
+
+
 @contextlib.contextmanager
 def _without_installed_reactor():
     """Import ``ctrader_open_api`` without leaving a Twisted reactor installed.
 
-    The package ``__init__`` imports ``twisted.internet.reactor``, which installs
-    the platform default (epoll) reactor as an import side effect. Discovery only
-    needs the protobuf messages, and a pre-installed epoll reactor makes a later
-    ``CTraderLiveAdapter.connect`` in the same process fail. If no reactor was
-    installed before the import, remove the one the import installed.
+    The package ``__init__`` imports ``twisted.internet.reactor``, which installs the
+    platform default reactor (epoll on Linux, poll on other POSIX, select on Windows and
+    macOS) as an import side effect. Discovery only needs the protobuf messages, and a
+    pre-installed reactor makes a later ``CTraderLiveAdapter.connect`` in the same process
+    fail. If no reactor was installed before the import, remove the one the import
+    installed -- the platform reactor module it added, the reactor entry it put in
+    ``sys.modules`` and the ``twisted.internet.reactor`` attribute it set, because
+    ``from twisted.internet import reactor`` falls back to that attribute.
     """
     had_reactor = "twisted.internet.reactor" in sys.modules
+    before = frozenset(sys.modules)
     try:
         yield
     finally:
-        if not had_reactor:
-            for name in ("twisted.internet.reactor", "twisted.internet.epollreactor"):
-                sys.modules.pop(name, None)
-            twisted_internet = sys.modules.get("twisted.internet")
-            if twisted_internet is not None and hasattr(twisted_internet, "reactor"):
-                delattr(twisted_internet, "reactor")
+        if had_reactor:
+            return
+        for name in sorted(sys.modules):
+            if name not in before and _is_platform_reactor_module(name):
+                del sys.modules[name]
+        twisted_internet = sys.modules.get("twisted.internet")
+        if twisted_internet is not None and hasattr(twisted_internet, "reactor"):
+            delattr(twisted_internet, "reactor")
 
 
 def _load_ctrader_protocol() -> None:
