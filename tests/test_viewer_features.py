@@ -3633,10 +3633,19 @@ def test_optimizations_list_and_detail_with_three_way_split(viewer_client, tmp_p
         "three_way": {
             "segments": {
                 "train": {"start": "2024-01-01T00:00:00+00:00", "end": "2024-05-31T23:59:59+00:00"},
-                "validation": {"start": "2024-06-01T00:00:00+00:00", "end": "2024-08-31T23:59:59+00:00"},
+                "validation": {
+                    "start": "2024-06-01T00:00:00+00:00",
+                    "end": "2024-08-31T23:59:59+00:00",
+                },
                 "test": {"start": "2024-09-01T00:00:00+00:00", "end": "2024-11-30T23:59:59+00:00"},
-                "embargo_train_val": {"start": "2024-05-31T23:59:59+00:00", "end": "2024-06-01T00:00:00+00:00"},
-                "embargo_val_test": {"start": "2024-08-31T23:59:59+00:00", "end": "2024-09-01T00:00:00+00:00"},
+                "embargo_train_val": {
+                    "start": "2024-05-31T23:59:59+00:00",
+                    "end": "2024-06-01T00:00:00+00:00",
+                },
+                "embargo_val_test": {
+                    "start": "2024-08-31T23:59:59+00:00",
+                    "end": "2024-09-01T00:00:00+00:00",
+                },
             },
             "winner": {
                 "trial_number": 5,
@@ -3655,7 +3664,14 @@ def test_optimizations_list_and_detail_with_three_way_split(viewer_client, tmp_p
                 "n_unselectable_trials": 5,
                 "tie_break": "trial_number",
                 "ranked_top_set": [
-                    {"rank": 1, "trial_number": 5, "validation_score": 1.2, "validation_metric_value": 1.2, "params": {"window": 10}, "is_winner": True}
+                    {
+                        "rank": 1,
+                        "trial_number": 5,
+                        "validation_score": 1.2,
+                        "validation_metric_value": 1.2,
+                        "params": {"window": 10},
+                        "is_winner": True,
+                    }
                 ],
             },
             "test_distribution": {
@@ -3670,10 +3686,23 @@ def test_optimizations_list_and_detail_with_three_way_split(viewer_client, tmp_p
             "overfitting": {
                 "passed": True,
                 "checks": {
-                    "degradation": {"value": 0.2, "threshold": 0.5, "passed": True, "computable": True},
-                    "deflated_sharpe": {"value": 0.97, "threshold": 0.95, "passed": True, "computable": True},
+                    "degradation": {
+                        "value": 0.2,
+                        "threshold": 0.5,
+                        "passed": True,
+                        "computable": True,
+                    },
+                    "deflated_sharpe": {
+                        "value": 0.97,
+                        "threshold": 0.95,
+                        "passed": True,
+                        "computable": True,
+                    },
                 },
-                "thresholds": {"max_train_validation_degradation": 0.5, "min_deflated_sharpe": 0.95},
+                "thresholds": {
+                    "max_train_validation_degradation": 0.5,
+                    "min_deflated_sharpe": 0.95,
+                },
                 "reasons": [],
                 "degradation": 0.2,
                 "deflated_sharpe": 0.97,
