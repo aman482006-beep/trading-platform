@@ -803,7 +803,8 @@ def run_optimization(
     ]
     if not selectable_rows:
         reasons = "; ".join(
-            f"trial {row['number']}: {row.get('unselectable_reason') or 'non-finite validation score'}"
+            f"trial {row['number']}: "
+            f"{row.get('unselectable_reason') or 'non-finite validation score'}"
             for row in validation_rows
         )
         raise RuntimeError(

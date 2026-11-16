@@ -720,7 +720,9 @@ def test_the_optimization_artifact_carries_provenance_survivorship_and_stability
                 if pnl
             ]
             if is_train
-            else []
+            # Out-of-sample windows must trade: a trial that does nothing on
+            # validation is (correctly) unselectable.
+            else [(config.end_date, 1.0)]
         )
         return _trial(config, metric=sharpe_by_window[window], exits=exits)
 
