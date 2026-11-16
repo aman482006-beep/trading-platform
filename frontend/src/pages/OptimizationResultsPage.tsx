@@ -239,6 +239,19 @@ function renderOverfittingVerdict(overfitting: ThreeWayPayload["overfitting"]) {
         )}
       </div>
 
+      <p
+        style={{
+          margin: "0 0 12px",
+          fontSize: "0.8rem",
+          color: "var(--color-text-muted)",
+          lineHeight: 1.5,
+        }}
+      >
+        These checks are overfitting hints only: the deflated Sharpe asks whether
+        the winner may be selection luck across many trials. A flag is not a
+        judgement of the strategy's quality.
+      </p>
+
       <div
         style={{
           display: "grid",
@@ -253,7 +266,7 @@ function renderOverfittingVerdict(overfitting: ThreeWayPayload["overfitting"]) {
             check: checks.degradation,
           },
           {
-            label: "Deflated Sharpe ratio",
+            label: "Deflated Sharpe (selection-luck hint)",
             check: checks.deflated_sharpe,
           },
         ].map((item) => (
