@@ -355,12 +355,27 @@ def run_live_preflight(
             "Live deployment config invalid",
             extra={"data": {"config_path": str(config), "error": str(exc)}},
         )
+        db_report: dict[str, Any] | None = None
+        if check_db:
+            # The YAML is unparseable, so there is nothing to diff the ACTIVE rows against.
+            # Report the miss rather than leaving db_deployments None, which has to keep
+            # meaning "not requested": an inspection that never ran is not a clean one.
+            from live_runner.preflight_db import db_check_skipped_report
+
+            db_report = asdict(
+                db_check_skipped_report(
+                    "The deployment config is invalid, so the ACTIVE DB deployments were "
+                    "not checked.",
+                    db_path=db_path,
+                )
+            )
         return LivePreflightResult(
             ok=False,
             config_path=str(config),
             accounts_env_path=str(accounts_env),
             accounts=[],
             deployment_errors=[str(exc)],
+            db_deployments=db_report,
         )
     logger.info(
         "Running live preflight",

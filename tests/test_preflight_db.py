@@ -138,7 +138,8 @@ def test_matching_active_deployment_is_clean(isolated_db) -> None:
         db_path=_db_path(database),
     )
 
-    assert report.errors == [] and report.warnings == []
+    assert report.errors == []
+    assert report.warnings == []
     assert report.active_count == 1
     assert len(report.matched) == 1
 
@@ -149,7 +150,8 @@ def test_active_db_deployment_missing_from_yaml_is_an_error(isolated_db) -> None
 
     report = run_db_preflight([], db_path=_db_path(database))
 
-    assert report.only_in_db and "risk_parity" in report.only_in_db[0]
+    assert report.only_in_db
+    assert "risk_parity" in report.only_in_db[0]
     assert any("absent from the YAML" in e for e in report.errors)
 
 
@@ -301,7 +303,8 @@ def test_missing_database_is_an_error_and_is_not_created(tmp_path: Path) -> None
     report = run_db_preflight([], db_path=missing)
 
     assert any("not found" in e for e in report.errors)
-    assert not missing.exists() and not missing.parent.exists()
+    assert not missing.exists()
+    assert not missing.parent.exists()
 
 
 def test_check_is_read_only(isolated_db) -> None:
@@ -335,9 +338,9 @@ def test_run_live_preflight_fails_on_db_only_active_deployment(tmp_path: Path, i
         _yaml(tmp_path, _YAML_ONE), env=_ENV, check_db=True, db_path=_db_path(database)
     )
 
-    assert result.ok is False
-    assert result.db_deployments is not None
-    assert any("surprise" in e for e in result.db_deployments["errors"])
+    assert result.ok is False, "an ACTIVE DB row absent from the YAML must fail the preflight"
+    assert result.db_deployments is not None, "the --check-db report is missing from the result"
+    assert any("surprise" in e for e in result.db_deployments["errors"]), result.db_deployments
 
 
 def test_a_read_only_open_failure_names_the_wal_cause(isolated_db, monkeypatch) -> None:
@@ -374,14 +377,14 @@ def test_run_live_preflight_fails_on_duplicate_active_db_deployment(
     )
 
     assert result.ok is False, "a duplicate ACTIVE row must fail the preflight"
-    assert result.db_deployments is not None
+    assert result.db_deployments is not None, "the --check-db report is missing from the result"
     assert any("duplicate" in e for e in result.db_deployments["errors"]), result.db_deployments
 
 
 def test_db_check_is_opt_in(tmp_path: Path) -> None:
     result = run_live_preflight(_yaml(tmp_path, _YAML_ONE), env=_ENV)
 
-    assert result.db_deployments is None
+    assert result.db_deployments is None, "no --check-db must mean no DB report at all"
 
 
 def test_cli_flag_prints_the_diff(tmp_path: Path, isolated_db, capsys) -> None:
@@ -479,3 +482,40 @@ def test_an_in_memory_database_url_fails_the_check(monkeypatch) -> None:
 
     assert any("in-memory" in e for e in report.errors), report.errors
     assert "not found" not in report.errors[0]
+
+
+def test_a_duplicated_yaml_deployment_is_reported(isolated_db) -> None:
+    """A YAML that lists one (strategy, account) twice compares only one of the two entries."""
+    database = isolated_db[0]
+    _seed(database)
+
+    report = run_db_preflight([_yaml_one(), _yaml_one()], db_path=_db_path(database))
+
+    assert any("listed twice" in w for w in report.warnings), report.warnings
+
+
+def test_a_paused_yaml_deployment_is_not_duplicated(isolated_db) -> None:
+    """Two entries with different statuses are two deployments, not a duplicate."""
+    database = isolated_db[0]
+    paused = _yaml_one().model_copy(update={"status": "PAUSED"})
+
+    report = run_db_preflight([_yaml_one(), paused], db_path=_db_path(database))
+
+    assert not any("listed twice" in w for w in report.warnings), report.warnings
+    assert any("will not trade it" in w for w in report.warnings), report.warnings
+
+
+def test_db_check_reports_when_the_config_never_let_it_run(tmp_path: Path, isolated_db) -> None:
+    """An invalid YAML fails preflight either way; the DB report must not look like a pass."""
+    database = isolated_db[0]
+    _seed(database)
+    broken = tmp_path / "broken.yaml"
+    broken.write_text("- not\n- a mapping\n", encoding="utf-8")
+
+    result = run_live_preflight(broken, env=_ENV, check_db=True, db_path=_db_path(database))
+
+    assert result.ok is False, "an unparseable config must fail the preflight"
+    assert result.db_deployments is not None, "a requested but unrun check must not read as clean"
+    assert any(
+        "not checked" in e for e in result.db_deployments["errors"]
+    ), result.db_deployments

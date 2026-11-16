@@ -4,6 +4,11 @@
 ``live_runner.preflight`` validates, so a clean YAML preflight says nothing about what runs. This
 module reads the ACTIVE rows straight from SQLite in read-only mode (``mode=ro``: no ``init_db``,
 no migration, no lock-taking write) and diffs them against the YAML.
+
+A row is matched to a deployment by ``(strategy_name, account_id)`` and compared on the fields the
+daemon actually trades: symbols, timeframe, and the signal source that gates which deployments
+receive a Discord signal and which credential they are dispatched with. Where they differ the DB
+value is what runs, so the difference is reported rather than silently reconciled.
 """
 
 from __future__ import annotations
@@ -91,14 +96,6 @@ def resolve_db_path(explicit: str | Path | None = None) -> Path:
     from shared import constants
 
     return Path(constants.DATA_DIR) / "backtests.db"
-
-
-#: Appended to a read-only open failure that SQLite reports as a write error.
-_WAL_READ_ONLY_HINT = (
-    "A WAL-mode database can only be read read-only when SQLite may write its -shm index, and a "
-    "read-only connection cannot run WAL recovery; open it once with a writer (any daemon start, "
-    "or sqlite3) to checkpoint it."
-)
 
 
 def _load_symbols(raw: Any) -> tuple[str, ...]:
@@ -284,6 +281,26 @@ def diff_db_and_yaml(
         errors=errors,
         warnings=warnings,
     )
+
+
+def db_check_skipped_report(
+    reason: str, db_path: str | Path | None = None
+) -> DbPreflightReport:
+    """A report for a ``--check-db`` run that never inspected the database.
+
+    ``db_deployments is None`` has to keep meaning exactly "not requested", so a run that was
+    asked for and did not happen reports the reason instead of leaving the field empty: a caller
+    deciding from it whether the DB was inspected must not read "never ran" as "no problems".
+    """
+    return DbPreflightReport(db_path=str(db_path or ""), errors=[reason])
+
+
+#: Appended to a read-only open failure that SQLite reports as a write error.
+_WAL_READ_ONLY_HINT = (
+    "A WAL-mode database can only be read read-only when SQLite may write its -shm index, and a "
+    "read-only connection cannot run WAL recovery; open it once with a writer (any daemon start, "
+    "or sqlite3) to checkpoint it."
+)
 
 
 def run_db_preflight(
