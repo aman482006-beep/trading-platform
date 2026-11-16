@@ -9,6 +9,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from pydantic import ValidationError
+
 from live_runner.account_routing import ctrader_account_identifier
 from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
 from live_runner.config_parser import parse_live_deployments_config
@@ -336,6 +338,42 @@ def _validate_deployments(
     return errors, warnings
 
 
+# A resolved value this short is treated as a non-secret: redacting it would mangle
+# unrelated words in the message far more often than it would protect anything.
+_MIN_REDACTABLE_VALUE_LENGTH = 3
+
+
+def _config_error_message(exc: ValueError, *, env_values: Mapping[str, str]) -> str:
+    """Value-free text for a deployment-config parse failure.
+
+    ``${VAR}`` references expand before validation, so ``str(exc)`` can quote a
+    value that only lives in the accounts env file or an explicit ``env``
+    mapping: pydantic echoes the offending input, and for a missing field it
+    echoes the whole input mapping. That text is printed as JSON by ``main()``
+    and written to the warning log below, so a config error would leak a
+    credential into operator output. Report the message type and the field
+    instead, and rewrite any raw value that still slipped through back to the
+    ``${KEY}`` reference - the same name-only reporting
+    ``assert_no_unexpanded_env`` uses, so the operator learns which reference
+    to fix rather than being shown the secret.
+    """
+    if isinstance(exc, ValidationError):
+        details: list[str] = []
+        for error in exc.errors():
+            location = ".".join(str(part) for part in error.get("loc") or ())
+            detail = str(error.get("msg") or error.get("type") or "invalid")
+            details.append(f"{location}: {detail}" if location else detail)
+        count = len(details)
+        plural = "" if count == 1 else "s"
+        message = f"{exc.title} ({count} validation error{plural}): " + "; ".join(details)
+    else:
+        message = str(exc)
+    for key, value in env_values.items():
+        if len(value) >= _MIN_REDACTABLE_VALUE_LENGTH and value in message:
+            message = message.replace(value, f"${{{key}}}")
+    return message
+
+
 def run_live_preflight(
     config_path: str | Path,
     *,
@@ -360,17 +398,19 @@ def run_live_preflight(
         )
     except ValueError as exc:
         # B3: invalid account definitions (e.g. non-routable ctrader ids)
-        # report as a failed preflight, never as an unhandled crash.
+        # report as a failed preflight, never as an unhandled crash. The text is
+        # value-free: expanded values can be credentials (#199).
+        message = _config_error_message(exc, env_values=env_values)
         logger.warning(
             "Live deployment config invalid",
-            extra={"data": {"config_path": str(config), "error": str(exc)}},
+            extra={"data": {"config_path": str(config), "error": message}},
         )
         return LivePreflightResult(
             ok=False,
             config_path=str(config),
             accounts_env_path=str(accounts_env),
             accounts=[],
-            deployment_errors=[str(exc)],
+            deployment_errors=[message],
         )
     logger.info(
         "Running live preflight",

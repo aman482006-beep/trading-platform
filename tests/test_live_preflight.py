@@ -538,3 +538,79 @@ def test_live_preflight_unreadable_accounts_env_reports_failure_not_crash(
 
     assert result.ok is False
     assert any("Missing Alpaca credentials" in e for e in result.accounts[0].errors)
+
+
+_SECRET_REF_VALUE = "file-secret-value-0123456789"
+
+
+def _secret_ref_accounts_env(tmp_path: Path) -> Path:
+    accounts_env = tmp_path / ".accounts.env"
+    accounts_env.write_text(
+        f"PREFLIGHT_TEST_SECRET_REF={_SECRET_REF_VALUE}\n", encoding="utf-8"
+    )
+    return accounts_env
+
+
+def test_live_preflight_config_error_never_echoes_expanded_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A validation failure must not print an expanded value into the result.
+
+    ${VAR} refs now expand before validation, so pydantic's default text would
+    echo the offending input - and, for missing fields, the whole input mapping
+    - into ``deployment_errors``, which ``main()`` prints as JSON. The operator
+    still gets the field and the expectation, just never the value.
+    """
+    monkeypatch.delenv("PREFLIGHT_TEST_SECRET_REF", raising=False)
+    config_path = _write_config(
+        tmp_path / "live_deployments.yaml",
+        """
+        accounts:
+          - id: alpaca-paper
+            broker: alpaca
+
+        deployments:
+          - strategy_name: discord_follow
+            account_id: alpaca-paper
+            symbols: "${PREFLIGHT_TEST_SECRET_REF}"
+            timeframe: 1h
+        """,
+    )
+    accounts_env = _secret_ref_accounts_env(tmp_path)
+
+    result = run_live_preflight(config_path, accounts_env_path=accounts_env)
+
+    assert result.ok is False
+    assert not any(_SECRET_REF_VALUE in err for err in result.deployment_errors)
+    # The operator can still tell which field failed and why.
+    assert any("symbols" in err for err in result.deployment_errors)
+
+
+def test_live_preflight_config_error_rewrites_file_values_to_their_ref(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same holds for a value echoed by a hand-raised config error:
+    report the reference the operator has to fix, not its expanded value."""
+    monkeypatch.delenv("PREFLIGHT_TEST_SECRET_REF", raising=False)
+    config_path = _write_config(
+        tmp_path / "live_deployments.yaml",
+        """
+        accounts:
+          - id: ctrader-demo
+            broker: ctrader
+            broker_login: "${PREFLIGHT_TEST_SECRET_REF}"
+
+        deployments:
+          - strategy_name: fx_breakout
+            account_id: ctrader-demo
+            symbols: [EURUSD]
+            timeframe: 15m
+        """,
+    )
+    accounts_env = _secret_ref_accounts_env(tmp_path)
+
+    result = run_live_preflight(config_path, accounts_env_path=accounts_env)
+
+    assert result.ok is False
+    assert not any(_SECRET_REF_VALUE in err for err in result.deployment_errors)
+    assert any("PREFLIGHT_TEST_SECRET_REF" in err for err in result.deployment_errors)
