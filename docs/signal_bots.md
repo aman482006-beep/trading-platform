@@ -209,10 +209,16 @@ Bedingung nennt, erzeugt eine neue Entry-Order.
   Unverändert: Seiten-Konflikt (eigene Seite ≠ Broker-Seite oder ≠ Nachricht)
   → abgelehnt; keine eigene Menge → ignoriert + `WARNING`; auf 0 gedeckelt bzw.
   abgerundet → ignoriert + `WARNING`.
-- **Ein Exit nach dem anderen:** Solange ein früherer Exit desselben
-  Deployments und Symbols beim Broker noch arbeitet (nicht voll gefüllt und in
-  den offenen Orders des Brokers, per Broker- oder Client-Order-ID), wird ein
-  neuer Exit abgelehnt (`WARNING`, nicht gequeued). Kann der Adapter seine
+- **Ein Exit nach dem anderen (pro Account und Symbol):** Solange ein früherer
+  Exit **irgendeines Deployments desselben Accounts** für dasselbe Symbol beim
+  Broker noch arbeitet (nicht voll gefüllt und in den offenen Orders des
+  Brokers, per Broker- oder Client-Order-ID), wird ein neuer Exit abgelehnt
+  (`WARNING`, nicht gequeued): Deployments eines Accounts teilen sich die
+  genettete Broker-Position, ein zweiter Exit würde sonst gegen eine Position
+  ohne den ersten gedeckelt. Innerhalb des Prozesses laufen Exits derselben
+  Account/Symbol-Kombination zudem strikt nacheinander (Lock von der
+  Größenbestimmung bis zur gespeicherten Order); die Broker-Position wird erst
+  danach gelesen. Kann der Adapter seine
   offenen Orders nicht auflisten, gilt das als „nicht bewiesen beendet“ → ebenfalls
   abgelehnt.
 - **Jeder Exit schließt nur die eigene Menge:** Ein einfaches `SELL …` oder ein

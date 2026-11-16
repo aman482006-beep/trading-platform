@@ -1582,3 +1582,20 @@ def test_own_ledger_exceeds_broker_alerts_even_when_the_ledger_total_matches(
     assert alerts[0].data["own_ledger_qty"] == pytest.approx(10.0)
     assert alerts[0].data["broker_qty"] == pytest.approx(6.0)
     assert "own ledger quantity exceeds the broker position" in alerts[0].data["reason"]
+
+
+def test_the_submitted_log_records_the_order_actually_sent(monkeypatch, caplog) -> None:
+    """An exit of a short is a BUY at the broker whatever the parser's
+    placeholder action says; the log must show the order, and that it is an exit."""
+    deployment = _deployment(allow_short=True)
+    _patch_ledger(monkeypatch, deployment, -10.0)
+    adapter = _Adapter([{"symbol": "AAPL", "qty": -10.0}])
+
+    with caplog.at_level(logging.INFO):
+        _run_submit(adapter, deployment, _exit_trade_signal(side="short"))
+
+    assert adapter.submitted[0][0].action == "buy"
+    submitted = _records_at(caplog, logging.INFO, "Discord signal submitted")
+    assert len(submitted) == 1
+    assert submitted[0].data["action"] == "buy"
+    assert submitted[0].data["exit"] is True
