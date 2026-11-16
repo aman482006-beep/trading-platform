@@ -23,7 +23,7 @@ committed comparison cases, plus the remaining limitations.
 ### Before/after matrix
 
 Method: `build_comparison_matrix()` over the committed references in
-`strategy-comparisons/` and the platform artifacts in `data/backtests/`, run
+`strategy-comparisons/` and the locally generated platform artifacts in `data/backtests/` (not committed), run
 once on the pre-change `cross_platform.py` and once on the change. Every key of
 the payload except `generated_at` and the values below is identical between the
 two runs: reference/platform stats, `absolute_delta`, paths, notes, missing

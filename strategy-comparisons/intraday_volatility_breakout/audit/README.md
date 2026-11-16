@@ -155,3 +155,8 @@ lesen die MT5-XLSX-Zeiten als `Europe/Athens`. Für diese Broker-Historie ist
 das 2018–2023 für Indizes im Sommer und ab 2024-04 in den US-only-DST-Wochen
 falsch (1 h). Betrifft Zeitstempel/Tagesgrenzen der Vergleichsmatrix, nicht die
 Trade-Anzahl; Follow-up.
+
+## Plattform-Artefakte
+`score_parity.py` liest die Plattform-Artefakte aus `data/backtests/`. Diese sind nicht im Repo
+(zu gross, `data/` ist gitignored) und werden lokal mit `scripts/regenerate_mt5_parity_artifacts.py`
+erzeugt; fehlt eines, bricht `score_parity.py` mit einer klaren Meldung ab. Alternativ `--artifact <symbol>=<pfad>`.
