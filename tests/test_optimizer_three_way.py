@@ -592,7 +592,7 @@ def test_verdict_reports_degradation_and_deflated_sharpe(
     assert overfitting["var_sharpe_per_obs"] is not None
     assert overfitting["thresholds"] == {
         "max_train_validation_degradation": 0.5,
-        "min_deflated_sharpe": 0.95,
+        "min_deflated_sharpe": 0.90,
     }
     assert "checks" in overfitting and "reasons" in overfitting
 
