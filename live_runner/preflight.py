@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import contextlib
 import json
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -13,7 +14,7 @@ from pydantic import ValidationError
 
 from live_runner.account_routing import ctrader_account_identifier
 from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
-from live_runner.config_parser import parse_live_deployments_config
+from live_runner.config_parser import env_reference_names, parse_live_deployments_config
 from live_runner.credential_env import load_accounts_env_values
 from live_runner.ctrader_adapter import DEFAULT_ACCOUNTS_ENV, CTraderLiveAdapter
 from shared.logging import get_logger
@@ -343,19 +344,67 @@ def _validate_deployments(
 _MIN_REDACTABLE_VALUE_LENGTH = 3
 
 
-def _config_error_message(exc: ValueError, *, env_values: Mapping[str, str]) -> str:
+def _redaction_values(
+    config: Path,
+    *,
+    env_values: Mapping[str, str],
+    expansion_env: Mapping[str, str],
+) -> dict[str, str]:
+    """Values a config error message must never print, keyed by their name.
+
+    That is every accounts-file value (as before) plus the expansion value of
+    each key the config references. Process-env keys the config never names are
+    left out: they cannot reach the message through the config, and redacting
+    the whole environment would mangle unrelated text.
+    """
+    values = dict(env_values)
+    try:
+        text = config.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        # The parse read this file moments ago. If it cannot be read now, its
+        # references are unknown, so every expansion value counts as referenced
+        # rather than risk printing one.
+        values.update(expansion_env)
+        return values
+    for key in env_reference_names(text):
+        if key in expansion_env:
+            values[key] = expansion_env[key]
+    return values
+
+
+def _redact_values(message: str, values: Mapping[str, str]) -> str:
+    """Rewrite each redactable value in *message* back to its ``${KEY}`` reference.
+
+    One pass over a longest-first alternation: a value that prefixes a longer
+    redacted value cannot cut it short, and inserted references are never
+    rescanned.
+    """
+    by_value: dict[str, str] = {}
+    for key, value in values.items():
+        if len(value) >= _MIN_REDACTABLE_VALUE_LENGTH:
+            by_value.setdefault(value, key)
+    if not by_value:
+        return message
+    pattern = re.compile(
+        "|".join(re.escape(value) for value in sorted(by_value, key=len, reverse=True))
+    )
+    return pattern.sub(lambda match: f"${{{by_value[match.group(0)]}}}", message)
+
+
+def _config_error_message(exc: ValueError, *, redact: Mapping[str, str]) -> str:
     """Value-free text for a deployment-config parse failure.
 
     ``${VAR}`` references expand before validation, so ``str(exc)`` can quote a
-    value that only lives in the accounts env file or an explicit ``env``
-    mapping: pydantic echoes the offending input, and for a missing field it
-    echoes the whole input mapping. That text is printed as JSON by ``main()``
-    and written to the warning log below, so a config error would leak a
-    credential into operator output. Report the message type and the field
-    instead, and rewrite any raw value that still slipped through back to the
-    ``${KEY}`` reference - the same name-only reporting
+    value that only lives in the accounts env file or the process environment,
+    or an explicit ``env`` mapping: pydantic echoes the offending input, and the
+    cTrader routing check names the resolved identifier. That text is printed as
+    JSON by ``main()`` and written to the warning log below, so a config error
+    would leak a credential into operator output. Report the message type and
+    the field instead, and rewrite any raw value that still slipped through back
+    to the ``${KEY}`` reference - the same name-only reporting
     ``assert_no_unexpanded_env`` uses, so the operator learns which reference
-    to fix rather than being shown the secret.
+    to fix rather than being shown the secret. ``redact`` maps each key to the
+    value that must not be printed (see ``_redaction_values``).
     """
     if isinstance(exc, ValidationError):
         details: list[str] = []
@@ -368,10 +417,7 @@ def _config_error_message(exc: ValueError, *, env_values: Mapping[str, str]) -> 
         message = f"{exc.title} ({count} validation error{plural}): " + "; ".join(details)
     else:
         message = str(exc)
-    for key, value in env_values.items():
-        if len(value) >= _MIN_REDACTABLE_VALUE_LENGTH and value in message:
-            message = message.replace(value, f"${{{key}}}")
-    return message
+    return _redact_values(message, redact)
 
 
 def run_live_preflight(
@@ -400,7 +446,12 @@ def run_live_preflight(
         # B3: invalid account definitions (e.g. non-routable ctrader ids)
         # report as a failed preflight, never as an unhandled crash. The text is
         # value-free: expanded values can be credentials (#199).
-        message = _config_error_message(exc, env_values=env_values)
+        message = _config_error_message(
+            exc,
+            redact=_redaction_values(
+                config, env_values=env_values, expansion_env=expansion_env
+            ),
+        )
         logger.warning(
             "Live deployment config invalid",
             extra={"data": {"config_path": str(config), "error": message}},

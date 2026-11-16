@@ -15,17 +15,29 @@ from shared.models import LiveAccountConfig, LiveDeploymentConfig
 logger = get_logger("live-runner")
 
 _UNEXPANDED_ENV_PATTERN = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}")
+# One reference: ``${NAME}`` or ``$NAME``. Group 1 or group 2 holds the name.
+_ENV_REFERENCE_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def env_reference_names(text: str) -> frozenset[str]:
+    """Names of every ``${NAME}``/``$NAME`` reference in raw config *text*.
+
+    Scans the text with the same pattern expansion uses, so it names exactly the
+    keys an expansion of that text would look up.
+    """
+    return frozenset(
+        match.group(1) or match.group(2) for match in _ENV_REFERENCE_PATTERN.finditer(text)
+    )
 
 
 def _expand_env_value(value: str, env: Mapping[str, str]) -> str:
     """Expand ``$VAR``/``${VAR}`` in *value* using *env* (no silent mute)."""
-    pattern = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
 
     def _replace(match: re.Match[str]) -> str:
         key = match.group(1) or match.group(2)
         return str(env.get(key, match.group(0)))
 
-    return pattern.sub(_replace, value)
+    return _ENV_REFERENCE_PATTERN.sub(_replace, value)
 
 
 def expand_env_mapping(payload: Any, env: Mapping[str, str] | None = None) -> Any:
