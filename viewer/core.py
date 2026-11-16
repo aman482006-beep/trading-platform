@@ -290,7 +290,8 @@ def _optimization_summary_payload(payload: dict[str, Any], path: Path) -> dict[s
         "train_stats": payload.get("train_stats", {}),
         "test_stats": payload.get("test_stats", {}),
     }
-    # New three-way split keys (issue #164)
+    # New three-way split keys (issue #164). The list carries only the small
+    # keys; the full `three_way` section is served by the detail endpoint.
     for key in (
         "validation_split_pct",
         "test_split_pct",
@@ -298,7 +299,6 @@ def _optimization_summary_payload(payload: dict[str, Any], path: Path) -> dict[s
         "validation_stats",
         "final_test_period",
         "final_test_stats",
-        "three_way",
     ):
         if key in payload:
             summary[key] = payload.get(key)

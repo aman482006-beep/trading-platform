@@ -3706,7 +3706,8 @@ def test_optimizations_list_and_detail_with_three_way_split(viewer_client, tmp_p
     assert summary["validation_stats"] == payload["validation_stats"]
     assert summary["final_test_period"] == payload["final_test_period"]
     assert summary["final_test_stats"] == payload["final_test_stats"]
-    assert summary["three_way"] == payload["three_way"]
+    # The list item stays small: the full three-way section is detail-only.
+    assert "three_way" not in summary
     # Old keys still present
     assert summary["train_split_pct"] == 0.6
     assert summary["test_period"] == payload["test_period"]
