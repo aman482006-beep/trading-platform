@@ -33,6 +33,23 @@ uv run python -m live_runner.preflight --config live_deployments.yaml --accounts
 uv run python scripts/live_smoke.py --mode discord-replay --reports-dir docs/reports
 ```
 
+`${VAR}` references in the deployment file expand here with the precedence every
+other live_runner component resolves configuration with: a key defined in
+`--accounts-env` wins - and a key present there but empty stays empty, so
+blanking it disables it - while the process environment fills only keys the file
+does not define. A reference that resolves nowhere fails the preflight and names
+the variable, so a literal `${...}` never reaches the daemon. Credentials
+themselves resolve from the file only, so a credential that exists only in the
+process environment is reported as missing rather than borrowed; aligning that
+with the daemon's env-filled credential resolution is an open decision, not a
+bug.
+
+Both failure modes report instead of crashing: an accounts env file that exists
+but cannot be read logs a warning and fails the preflight with missing
+credentials, and a config parse error reports the message type and the offending
+field, never an expanded value - that value can be a credential, and
+`deployment_errors` is printed as JSON.
+
 ## Paper Broker Smoke
 
 For Alpaca smoke, first verify every Alpaca account resolves with `paper=True`.
