@@ -1,8 +1,8 @@
 """Guard: the locally generated MT5-parity artifacts must match the current strategy code.
 
-The artifacts under data/backtests/ are generated locally by hand (a multi-GB data
-run; not committed, `data/` is ignored), so nothing else notices when a later change to the strategy defaults
-leaves them stale.
+The artifacts under data/backtests/ are generated locally by hand (a multi-GB
+data run; not committed, `data/` is gitignored), so nothing else notices when a
+later change to the strategy defaults leaves them stale.
 This cheap check fails on parameter drift and on internally inconsistent stats,
 without re-running the data pipeline.
 """
