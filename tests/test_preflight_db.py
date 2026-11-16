@@ -519,3 +519,25 @@ def test_db_check_reports_when_the_config_never_let_it_run(tmp_path: Path, isola
     assert any(
         "not checked" in e for e in result.db_deployments["errors"]
     ), result.db_deployments
+
+
+def test_cosmetic_spelling_is_not_drift(isolated_db) -> None:
+    """Both sides are normalized the way the writers normalize them before they are compared."""
+    database = isolated_db[0]
+    _seed(database)
+
+    report = run_db_preflight(
+        [
+            LiveDeploymentConfig(
+                strategy_name="equity_momentum",
+                account_id="alpaca-paper",
+                symbols=[" aapl "],
+                timeframe="H1",
+            )
+        ],
+        db_path=_db_path(database),
+    )
+
+    assert report.errors == []
+    assert report.warnings == [], report.warnings
+    assert len(report.matched) == 1

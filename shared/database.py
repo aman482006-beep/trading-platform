@@ -923,11 +923,7 @@ class LiveDeploymentModel(SQLModel, table=True):
             source_type = "discord"
         source_name = source_name if source_name in {"internal", "discord"} else source_type
         source_id = str(deployment.signal_source_id or "").strip()
-        symbol_filter = [
-            str(symbol).strip().upper()
-            for symbol in (deployment.symbol_filter or [])
-            if str(symbol).strip()
-        ]
+        symbol_filter = normalize_symbols(deployment.symbol_filter)
         return cls(
             id=str(deployment.id),
             strategy_name=deployment.strategy_name,
@@ -962,11 +958,7 @@ class LiveDeploymentModel(SQLModel, table=True):
             stopped_enforced_at=self.stopped_enforced_at,
             signal_source_type=source_type if source_type in {"internal", "discord"} else "internal",
             signal_source_id=str(self.signal_source_id or "").strip() or None,
-            symbol_filter=[
-                str(symbol).strip().upper()
-                for symbol in (self.symbol_filter_json or [])
-                if str(symbol).strip()
-            ],
+            symbol_filter=normalize_symbols(self.symbol_filter_json),
             signal_source=source_name if source_name in {"internal", "discord"} else "internal",
             signal_config=self.signal_config_json or {},
             settings=self.settings_json or {},
