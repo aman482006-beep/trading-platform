@@ -79,6 +79,12 @@ from shared.models import (
     ServiceType,
 )
 from shared.sentry import capture_exception, initialize_sentry
+from shared.trailing import (
+    LIVE_SUPPORTED_TRAILING_MODES,
+    TRAILING_SL_CONFIG_METADATA_KEY,
+    validate_live_deployment_trailing_override,
+    validate_trailing_sl_config,
+)
 from signal_bots.registry import get_signal_processor
 
 initialize_sentry("live-runner")
@@ -740,6 +746,19 @@ def _apply_signal_processor(
         "metadata": dict(signal.metadata or {}),
     }
     processed = processor.process_signal(raw_signal=raw_signal, market_data=market_data)
+    # #150 fail closed at signal time: a processed signal that asks for a
+    # trailing mode the live path cannot execute (live trailing does not
+    # exist yet, #167) is rejected here — the signal is not traded, instead
+    # of running with the requested trailing silently dropped. The caller
+    # logs the refusal and skips the signal.
+    validate_trailing_sl_config(
+        (processed.metadata or {}).get(TRAILING_SL_CONFIG_METADATA_KEY),
+        supported=LIVE_SUPPORTED_TRAILING_MODES,
+        context=(
+            f"live deployment '{deployment.strategy_name}' ({deployment.id}) "
+            f"signal processor '{processor_name}'"
+        ),
+    )
     metadata = dict(signal.metadata or {})
     metadata.update(dict(processed.metadata or {}))
     metadata["signal_processor"] = processor_name
@@ -1025,6 +1044,16 @@ async def prepare_order_with_risk(
         # C1/B2: the broker-resolved flatten qty is binding — pass it
         # explicitly so the adapter never re-sizes.
         return signal.model_copy(update=update), float(metadata["explicit_qty"])
+    # #150 fail closed at the last chokepoint before the broker: the live path
+    # never trails (#167), so an entry signal carrying a trailing config its
+    # mode cannot satisfy here is refused — never submitted untrailed. This
+    # gate also covers signals that reach submission without a signal
+    # processor (the processor path is gated in _apply_signal_processor).
+    validate_trailing_sl_config(
+        metadata.get(TRAILING_SL_CONFIG_METADATA_KEY),
+        supported=LIVE_SUPPORTED_TRAILING_MODES,
+        context=f"live deployment '{deployment.strategy_name}' ({deployment.id}) order submission",
+    )
     # Feed broker truth into sizing so max_positions / max_total_exposure actually
     # bind. Without this, every signal is sized as if the account were flat.
     open_positions_count, broker_exposure = await _broker_exposure_estimate(
@@ -3732,6 +3761,22 @@ async def _load_db_accounts_and_deployments(
     accounts_task = asyncio.to_thread(list_live_accounts)
     deployments_task = asyncio.to_thread(list_live_deployments)
     accounts, deployments = await asyncio.gather(accounts_task, deployments_task)
+    # #150: a stored deployment whose trailing override live cannot run is still
+    # loaded (so it stays listed, stoppable and enforceable), but every signal
+    # it produces is refused by the live gates. Say so loudly at load time.
+    for deployment in deployments:
+        try:
+            validate_live_deployment_trailing_override(
+                deployment.signal_config,
+                context=f"live deployment '{deployment.strategy_name}' ({deployment.id})",
+            )
+        except ValueError as exc:
+            logger.error(
+                "Stored live deployment has an unsupported trailing mode; its entry "
+                "signals will be refused: %s",
+                exc,
+                extra={"data": {"deployment_id": str(deployment.id)}},
+            )
     return accounts, deployments
 
 

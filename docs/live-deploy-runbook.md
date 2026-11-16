@@ -8,6 +8,12 @@ Status: credential-gated as of 2026-07-13.
 - Alpaca account blocks `ACC1..3` (Nitro, RamJet, RocketFuel) contain paper endpoints only; IDs werden aus `.accounts.env` aufgeloest, nicht hier dokumentiert.
 - Discord bot tokens and channel IDs are set for Nitro, RamJet, and RocketFuel.
 - cTrader credentials are demo credentials if the cTrader smoke is run.
+- Trailing stops are not executed live yet (#167). A deployment whose
+  `signal_config.signal_processor_config.trailing_mode` is anything other than `none` is rejected
+  when it is created or parsed from YAML. A stored deployment that already has such a value still
+  loads (so it stays listed and can be stopped), the daemon logs an error for it at load, and each
+  of its signals is refused before it reaches the broker. See `shared/trailing.py` and
+  `docs/signal_bots.md`.
 
 ## Provisioning and Rotation
 
