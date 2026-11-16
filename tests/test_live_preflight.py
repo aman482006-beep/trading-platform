@@ -452,3 +452,47 @@ def test_live_preflight_unset_config_ref_is_still_a_failure(
 
     assert result.ok is False
     assert any("PREFLIGHT_TEST_CHANNEL_ID" in err for err in result.deployment_errors)
+
+
+def test_live_preflight_explicit_env_mapping_is_not_merged_with_process_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An explicit ``env=`` mapping is used as-is: a hermetic caller passing
+    ``env={}`` to prove an unset reference fails must not have that reference
+    silently expanded from whatever the runner's process environment happens to
+    define - the preflight is the gate before live orders are enabled."""
+    monkeypatch.setenv("PREFLIGHT_TEST_CHANNEL_ID", "from-process")
+    config_path = _write_config(tmp_path / "live_deployments.yaml", _ENV_REF_CONFIG)
+
+    result = run_live_preflight(config_path, env={})
+
+    assert result.ok is False
+    assert any("PREFLIGHT_TEST_CHANNEL_ID" in err for err in result.deployment_errors)
+
+
+def test_live_preflight_empty_file_value_wins_over_process_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A present-but-empty file key shadows the process environment during
+    ${VAR} expansion, exactly like ``resolve_env_value`` does for credentials:
+    a key an operator blanked to disable/invalidate it must not silently fall
+    back to a stale process-env value."""
+    monkeypatch.setenv("PREFLIGHT_TEST_CHANNEL_ID", "from-process")
+    config_path = _write_config(tmp_path / "live_deployments.yaml", _ENV_REF_CONFIG)
+    accounts_env = tmp_path / ".accounts.env"
+    accounts_env.write_text("PREFLIGHT_TEST_CHANNEL_ID=\n", encoding="utf-8")
+    seen: dict[str, object] = {}
+
+    import live_runner.preflight as preflight
+
+    real = preflight.parse_live_deployments_config
+
+    def spy(path, *, env_values=None):
+        accounts, deployments = real(path, env_values=env_values)
+        seen["channel"] = deployments[0].signal_config["channel_id"]
+        return accounts, deployments
+
+    monkeypatch.setattr(preflight, "parse_live_deployments_config", spy)
+    run_live_preflight(config_path, accounts_env_path=accounts_env)
+
+    assert seen["channel"] == ""
