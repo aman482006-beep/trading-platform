@@ -12,10 +12,12 @@ the same rule:
 * An exit closes **only the deployment's own quantity**: its net persisted fills
   for the symbol (the ledger). Another deployment's share of the same netted
   broker position stays open.
-* The ledgers of every deployment on the account must add up to the broker
-  position (:func:`ensure_ledgers_match_broker`), or the exit is refused: a
-  close none of them saw makes every own quantity untrustworthy. The close is
-  still capped at the broker position as a last line of defence.
+* The close is capped at the broker position. When the ledgers of the
+  deployments on the account do not add up to the broker position
+  (:func:`ensure_ledgers_match_broker`), the capped exit is still sent and the
+  caller raises an operator alert (#121 decision 2). Remaining risk: a
+  broker-side close made for another deployment lowers the broker position, and
+  the cap then closes part of that deployment's share.
 * A partial exit closes that fraction of the own (capped) quantity. A fraction
   that rounds a whole-unit position down to nothing is refused, never rounded up.
 * No position to close -> :class:`NothingToExitError`: the caller ignores the
@@ -69,7 +71,8 @@ class LedgerMismatchError(ValueError):
     """The account's ledgers do not add up to the broker position.
 
     A close happened that no ledger saw (a bracket's stop or target leg, a
-    flatten, a manual close), so no deployment's own quantity can be trusted.
+    flatten, a manual close), so no deployment's own quantity can be fully
+    trusted. The caller alerts and still sends the exit, capped at the broker.
     """
 
     def __init__(
@@ -362,14 +365,14 @@ def ensure_ledgers_match_broker(
     broker_qty: float,
     tolerance: float,
 ) -> None:
-    """Refuse when the account's ledgers do not explain the broker position.
+    """Raise when the account's ledgers do not explain the broker position.
 
     ``ledgers`` maps every deployment on the account to its signed net filled
     quantity for ``symbol``. Their sum must equal the signed broker position
     within ``tolerance`` (the instrument's quantity precision). Only then is a
     deployment's own quantity evidence of what it holds; otherwise a close the
-    ledgers never saw has happened, and an exit sized off them could close
-    another deployment's shares. Raises :class:`LedgerMismatchError`.
+    ledgers never saw has happened. Raises :class:`LedgerMismatchError`; the
+    daemon turns it into an alert and still submits the capped exit.
     """
     total = math.fsum(float(value) for value in ledgers.values())
     if (
@@ -383,11 +386,11 @@ def ensure_ledgers_match_broker(
             f"{deployment_id}={float(value):g}" for deployment_id, value in sorted(ledgers.items())
         ) or "none"
         raise LedgerMismatchError(
-            f"Refusing exit for {symbol}: the ledgers of the deployments on this "
+            f"Exit for {symbol}: the ledgers of the deployments on this "
             f"account add up to {total:g} ({listing}), but the broker position is "
             f"{broker_qty:g} (tolerance {tolerance:g}). A close the ledgers never saw "
-            "(a stop or target leg, a flatten, a manual close) would make this exit "
-            "close another deployment's shares; reconcile before exiting.",
+            "(a stop or target leg, a flatten, a manual close) happened; the exit is "
+            "capped at the broker position, reconcile the ledgers.",
             ledgers=ledgers,
             broker_qty=broker_qty,
             tolerance=tolerance,

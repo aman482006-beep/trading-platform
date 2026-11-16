@@ -581,10 +581,11 @@ def test_a_sell_exit_without_own_quantity_is_ignored(
     assert not any(record.levelno >= logging.ERROR for record in caplog.records)
 
 
-def test_a_sell_exit_whose_ledger_exceeds_the_broker_is_refused(monkeypatch, caplog) -> None:
-    """Review finding 2: a ledger above the broker position means a close the
-    ledger never saw (a stop leg, a manual close). Capping used to close the
-    broker quantity anyway; now the ledgers must reconcile first."""
+def test_a_sell_exit_whose_ledger_exceeds_the_broker_is_capped_and_alerts(
+    monkeypatch, caplog
+) -> None:
+    """#121 decision 2: a ledger above the broker position closes at most the
+    broker quantity, and the mismatch raises an operator alert."""
     deployment = _deployment(allow_short=False)
     _patch_ledger(monkeypatch, deployment, 30.0)
     adapter = _Adapter([{"symbol": "AAPL", "qty": 12.0}])
@@ -592,8 +593,65 @@ def test_a_sell_exit_whose_ledger_exceeds_the_broker_is_refused(monkeypatch, cap
     with caplog.at_level(logging.INFO):
         _run_submit(adapter, deployment, _sell_trade_signal())
 
+    assert [qty for _, qty in adapter.submitted] == [12.0]
+    alerts = _alerts(caplog)
+    assert len(alerts) == 1
+    assert alerts[0].data["own_ledger_qty"] == pytest.approx(30.0)
+    assert alerts[0].data["broker_qty"] == pytest.approx(12.0)
+    assert "another deployment" in alerts[0].getMessage()
+
+
+def test_a_partial_exit_of_an_overhanging_ledger_is_a_fraction_of_the_cap(
+    monkeypatch, caplog
+) -> None:
+    deployment = _deployment(allow_short=False)
+    _patch_ledger(monkeypatch, deployment, 30.0)
+    adapter = _Adapter([{"symbol": "AAPL", "qty": 12.0}])
+
+    with caplog.at_level(logging.INFO):
+        _run_submit(adapter, deployment, _exit_trade_signal(fraction=0.5))
+
+    assert [qty for _, qty in adapter.submitted] == [6.0]
+    assert len(_alerts(caplog)) == 1
+
+
+def test_matching_ledgers_raise_no_alert(monkeypatch, caplog) -> None:
+    deployment = _deployment(allow_short=False)
+    _patch_ledger(monkeypatch, deployment, 10.0, others={_OTHER: 5.0})
+    adapter = _Adapter([{"symbol": "AAPL", "qty": 15.0}])
+
+    with caplog.at_level(logging.INFO):
+        _run_submit(adapter, deployment, _sell_trade_signal())
+
+    assert [qty for _, qty in adapter.submitted] == [10.0]
+    assert _alerts(caplog) == []
+
+
+def test_an_exit_against_the_opposite_broker_side_is_still_refused(
+    monkeypatch, caplog
+) -> None:
+    deployment = _deployment(allow_short=False)
+    _patch_ledger(monkeypatch, deployment, 10.0)
+    adapter = _Adapter([{"symbol": "AAPL", "qty": -10.0}])
+
+    with caplog.at_level(logging.INFO):
+        _run_submit(adapter, deployment, _sell_trade_signal())
+
     assert adapter.submitted == []
     assert _records_at(caplog, logging.ERROR, "Exit signal refused before submission")
+
+
+def test_an_exit_capped_to_nothing_is_ignored_with_a_warning(monkeypatch, caplog) -> None:
+    """Own 10, broker 0.4 of a whole-unit step: nothing left after flooring."""
+    deployment = _deployment(allow_short=False)
+    _patch_ledger(monkeypatch, deployment, 10.0)
+    adapter = _SteppedAdapter([{"symbol": "AAPL", "qty": 0.4}], step=1.0)
+
+    with caplog.at_level(logging.INFO):
+        _run_submit(adapter, deployment, _sell_trade_signal())
+
+    assert adapter.submitted == []
+    assert _records_at(caplog, logging.WARNING, "Exit signal ignored")
 
 
 def test_a_sell_exit_of_an_own_short_buys_it_back(monkeypatch) -> None:
@@ -657,6 +715,16 @@ class _UnknownOutcomeAdapter(_Adapter):
     async def submit_order(self, signal, *, qty=None):
         self.submitted.append((signal, qty))
         raise RuntimeError("Order rejected (MARKET_CLOSED): market is closed")
+
+
+def _alerts(caplog):
+    """The operator alerts: ERROR records marked ``exit_ledger_mismatch``."""
+    return [
+        record
+        for record in caplog.records
+        if record.levelno == logging.ERROR
+        and getattr(record, "data", {}).get("alert") == "exit_ledger_mismatch"
+    ]
 
 
 def _records_at(caplog, level: int, text: str):
@@ -758,12 +826,12 @@ def test_a_sell_exit_records_no_side_it_did_not_execute(monkeypatch) -> None:
 # every deployment on the account must add up to the broker position.
 
 
-def test_an_exit_is_refused_when_a_stop_fill_never_reached_the_ledger(
+def test_a_stop_fill_missing_from_the_ledger_submits_the_capped_exit_and_alerts(
     monkeypatch, caplog
 ) -> None:
-    """The review's case: A's stop filled at the broker, so A's ledger still
-    says +10 while the broker holds only B's 5. Selling min(10, 5) = 5 would
-    close all of B. Refuse, and say what does not add up."""
+    """A's stop filled at the broker, so A's ledger still says +10 while the
+    broker holds only B's 5. A's exit is capped at 5 and the alert says what
+    does not add up (and that this 5 may be B's share)."""
     deployment = _deployment(allow_short=False)
     _patch_ledger(monkeypatch, deployment, 10.0, others={_OTHER: 5.0})
     adapter = _Adapter([{"symbol": "AAPL", "qty": 5.0}])
@@ -771,13 +839,14 @@ def test_an_exit_is_refused_when_a_stop_fill_never_reached_the_ledger(
     with caplog.at_level(logging.INFO):
         _run_submit(adapter, deployment, _exit_trade_signal())
 
-    assert adapter.submitted == []
-    errors = _records_at(caplog, logging.ERROR, "Exit signal refused before submission")
-    assert errors, [record.getMessage() for record in caplog.records]
-    data = errors[0].data
+    assert [qty for _, qty in adapter.submitted] == [5.0]
+    alerts = _alerts(caplog)
+    assert len(alerts) == 1, [record.getMessage() for record in caplog.records]
+    data = alerts[0].data
     assert data["ledger_qty_by_deployment"] == {str(deployment.id): 10.0, _OTHER: 5.0}
     assert data["ledger_qty_total"] == pytest.approx(15.0)
     assert data["broker_qty"] == pytest.approx(5.0)
+    assert "another deployment" in alerts[0].getMessage()
 
 
 @pytest.mark.parametrize(
@@ -785,7 +854,7 @@ def test_an_exit_is_refused_when_a_stop_fill_never_reached_the_ledger(
     [_exit_trade_signal(), _sell_trade_signal(), _reversal_trade_signal()],
     ids=["exit-message", "plain-sell", "momentum-reversal"],
 )
-def test_every_exit_kind_is_guarded(monkeypatch, caplog, trade_signal) -> None:
+def test_every_exit_kind_alerts_and_is_capped(monkeypatch, caplog, trade_signal) -> None:
     deployment = _deployment(allow_short=False)
     _patch_ledger(monkeypatch, deployment, 10.0, others={_OTHER: 5.0})
     adapter = _Adapter([{"symbol": "AAPL", "qty": 5.0}])
@@ -793,13 +862,14 @@ def test_every_exit_kind_is_guarded(monkeypatch, caplog, trade_signal) -> None:
     with caplog.at_level(logging.INFO):
         _run_submit(adapter, deployment, trade_signal)
 
-    assert adapter.submitted == []
-    assert _records_at(caplog, logging.ERROR, "Exit signal refused before submission")
+    assert [qty for _, qty in adapter.submitted] == [5.0]
+    assert len(_alerts(caplog)) == 1
 
 
-def test_a_ledger_short_of_the_broker_is_refused_too(monkeypatch, caplog) -> None:
-    """An unrecorded fill can go either way: ledgers below the broker position
-    are just as unexplained as ledgers above it."""
+def test_a_ledger_short_of_the_broker_closes_only_the_own_qty_and_alerts(
+    monkeypatch, caplog
+) -> None:
+    """Another deployment or a manual fill holds the rest: own quantity only."""
     deployment = _deployment(allow_short=False)
     _patch_ledger(monkeypatch, deployment, 10.0, others={_OTHER: 5.0})
     adapter = _Adapter([{"symbol": "AAPL", "qty": 20.0}])
@@ -807,8 +877,8 @@ def test_a_ledger_short_of_the_broker_is_refused_too(monkeypatch, caplog) -> Non
     with caplog.at_level(logging.INFO):
         _run_submit(adapter, deployment, _sell_trade_signal())
 
-    assert adapter.submitted == []
-    assert _records_at(caplog, logging.ERROR, "Exit signal refused before submission")
+    assert [qty for _, qty in adapter.submitted] == [10.0]
+    assert len(_alerts(caplog)) == 1
 
 
 class _ToleranceAdapter(_Adapter):
@@ -835,36 +905,42 @@ def test_ledgers_reconcile_within_the_instrument_precision(monkeypatch) -> None:
     assert len(adapter.submitted) == 1
 
 
-def test_ledgers_outside_the_instrument_precision_are_refused(monkeypatch) -> None:
+def test_ledgers_outside_the_instrument_precision_alert(monkeypatch, caplog) -> None:
     deployment = _deployment(allow_short=False)
     _patch_ledger(monkeypatch, deployment, 1.0006, others={_OTHER: 2.0})
     adapter = _ToleranceAdapter([{"symbol": "AAPL", "qty": 3.0}], tolerance=0.0005)
 
-    _run_submit(adapter, deployment, _sell_trade_signal())
+    with caplog.at_level(logging.INFO):
+        _run_submit(adapter, deployment, _sell_trade_signal())
 
-    assert adapter.submitted == []
+    assert [qty for _, qty in adapter.submitted] == [pytest.approx(1.0006)]
+    assert len(_alerts(caplog)) == 1
 
 
-def test_without_a_known_precision_the_match_is_strict(monkeypatch) -> None:
+def test_without_a_known_precision_the_match_is_strict(monkeypatch, caplog) -> None:
     """No precision from the adapter: fail closed on anything above 1e-9."""
     deployment = _deployment(allow_short=False)
     _patch_ledger(monkeypatch, deployment, 1.000001, others={_OTHER: 2.0})
     adapter = _Adapter([{"symbol": "AAPL", "qty": 3.0}])
 
-    _run_submit(adapter, deployment, _sell_trade_signal())
+    with caplog.at_level(logging.INFO):
+        _run_submit(adapter, deployment, _sell_trade_signal())
 
-    assert adapter.submitted == []
+    assert [qty for _, qty in adapter.submitted] == [pytest.approx(1.000001)]
+    assert len(_alerts(caplog)) == 1
 
 
 @pytest.mark.parametrize("tolerance", [float("nan"), float("inf"), -1.0, "x"])
-def test_an_unusable_precision_falls_back_to_strict(monkeypatch, tolerance) -> None:
+def test_an_unusable_precision_falls_back_to_strict(monkeypatch, caplog, tolerance) -> None:
     deployment = _deployment(allow_short=False)
     _patch_ledger(monkeypatch, deployment, 1.000001, others={_OTHER: 2.0})
     adapter = _ToleranceAdapter([{"symbol": "AAPL", "qty": 3.0}], tolerance=tolerance)
 
-    _run_submit(adapter, deployment, _sell_trade_signal())
+    with caplog.at_level(logging.INFO):
+        _run_submit(adapter, deployment, _sell_trade_signal())
 
-    assert adapter.submitted == []
+    assert len(adapter.submitted) == 1
+    assert len(_alerts(caplog)) == 1
 
 
 def test_ledgers_must_match_broker_pure() -> None:

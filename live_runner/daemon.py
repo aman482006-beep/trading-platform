@@ -992,6 +992,41 @@ async def _ensure_no_exit_in_flight(
         )
 
 
+def _alert_ledger_mismatch(
+    deployment: LiveDeploymentConfig,
+    symbol: str,
+    exc: LedgerMismatchError,
+    *,
+    own_qty: float,
+    exit_qty: float,
+) -> None:
+    """Operator alert (ERROR, which Sentry turns into an event) for a ledger gap.
+
+    The exit is still submitted, capped at the broker position (#121 decision 2).
+    The residual risk is stated in the alert: on a netted account, a broker-side
+    close made for another deployment lowers the broker position, and the cap
+    then closes part of that deployment's share.
+    """
+    logger.error(
+        "ALERT: deployment ledgers do not match the broker position; submitting "
+        "the exit capped at the broker position. If another deployment's "
+        "position was closed broker-side, this exit may close part of that "
+        "deployment's share; reconcile the ledgers",
+        extra={
+            "data": {
+                "alert": "exit_ledger_mismatch",
+                "account_id": deployment.account_id,
+                "deployment_id": str(deployment.id),
+                "symbol": symbol,
+                "own_ledger_qty": float(own_qty),
+                "exit_qty_before_step": float(exit_qty),
+                "reason": str(exc),
+                **exc.log_data(),
+            }
+        },
+    )
+
+
 async def prepare_exit_intent_order(
     adapter: BaseLiveAdapter,
     deployment: LiveDeploymentConfig,
@@ -1007,14 +1042,14 @@ async def prepare_exit_intent_order(
     deployment's net persisted fills for the symbol (the ledger), capped at the
     broker position, times the instruction's fraction, so another deployment's
     share of a netted position stays open. The close side comes from that
-    position, never from the message. Before an order follows, the ledgers of
-    every deployment on the account must add up to the broker position, and no
-    earlier exit of this deployment and symbol may still be working.
+    position, never from the message. No earlier exit of this deployment and
+    symbol may still be working. When the ledgers of the deployments on the
+    account do not add up to the broker position (or the own quantity exceeds
+    it), the capped exit still goes out and an ERROR alert is logged.
 
     Raises :class:`NothingToExitError` when there is nothing of this
     deployment's to close (the caller logs and ignores it),
-    :class:`ExitInFlightError` while an earlier exit may be working,
-    :class:`LedgerMismatchError` when the ledgers do not reconcile, and
+    :class:`ExitInFlightError` while an earlier exit may be working, and
     ``ValueError`` when a close would be ambiguous or would extend exposure.
     Nothing here places an order.
 
@@ -1041,17 +1076,40 @@ async def prepare_exit_intent_order(
         broker_positions=positions,
         instruction=instruction,
     )
-    # Only now does an order follow, so only now must the ledgers explain the
-    # broker position. A close none of them saw (a stop or target leg, a
-    # flatten, a manual close) makes every deployment's own quantity
-    # untrustworthy on a netted account: refuse rather than close someone
-    # else's shares (#121 review).
-    ensure_ledgers_match_broker(
-        symbol=signal.symbol,
-        ledgers=ledgers,
-        broker_qty=broker_position_qty(positions, signal.symbol),
-        tolerance=_position_qty_tolerance(adapter, signal.symbol),
-    )
+    # An exit closes only the own ledger quantity, capped at the broker position
+    # (#121 decision 2). When the ledgers do not explain the broker position, or
+    # the own quantity exceeds it, the capped exit is still submitted, but an
+    # operator must hear about it: a close the ledgers never saw (a stop or
+    # target leg, a flatten, a manual close) happened.
+    broker_qty = broker_position_qty(positions, signal.symbol)
+    tolerance = _position_qty_tolerance(adapter, signal.symbol)
+    try:
+        ensure_ledgers_match_broker(
+            symbol=signal.symbol,
+            ledgers=ledgers,
+            broker_qty=broker_qty,
+            tolerance=tolerance,
+        )
+    except LedgerMismatchError as exc:
+        _alert_ledger_mismatch(
+            deployment, signal.symbol, exc, own_qty=ledger_qty, exit_qty=target_qty
+        )
+    else:
+        if abs(ledger_qty) > abs(broker_qty) + tolerance:
+            # Offsetting ledgers of other deployments hide the overhang from
+            # the total, but the own quantity still exceeds what the broker holds.
+            _alert_ledger_mismatch(
+                deployment,
+                signal.symbol,
+                LedgerMismatchError(
+                    "own ledger quantity exceeds the broker position",
+                    ledgers=ledgers,
+                    broker_qty=broker_qty,
+                    tolerance=tolerance,
+                ),
+                own_qty=ledger_qty,
+                exit_qty=target_qty,
+            )
     # Never round an exit up: a partial closes at most its fraction, a full exit
     # at most the own quantity (#121 review). Done here, before persistence, so
     # the stored qty is the one sent.
@@ -1925,11 +1983,6 @@ async def _submit_normalized_discord_signal(
                         "symbol": live_signal.symbol,
                         "action": live_signal.action,
                         "error": str(exc),
-                        **(
-                            exc.log_data()
-                            if isinstance(exc, LedgerMismatchError)
-                            else {}
-                        ),
                     }
                 },
             )

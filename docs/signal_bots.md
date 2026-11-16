@@ -187,19 +187,28 @@ Bedingung nennt, erzeugt eine neue Entry-Order.
   schließt so nie mehr als den verlangten Anteil bzw. die eigene Menge. Fällt
   er auf 0, wird er ignoriert und auf `WARNING` geloggt, mit `requested_qty`
   und `qty_step`. Entries runden wie bisher.
-- **Ledger-Abgleich vor jedem Exit:** Die Ledger aller Deployments auf demselben
-  Account und Symbol (jeder Status, `get_account_net_filled_qty_by_deployment`)
-  müssen vorzeichenrichtig summiert der Broker-Position entsprechen, innerhalb
-  der Mengenpräzision des Instruments (`position_qty_tolerance` des Adapters:
-  cTrader eine halbe Broker-Volumeneinheit, Alpaca 0,5e-9; unbekannt → strikt
-  1e-9). Sonst wird der Exit abgelehnt und auf `ERROR` geloggt, mit allen
-  Ledger-Mengen (`ledger_qty_by_deployment`, `ledger_qty_total`) und
-  `broker_qty`. Grund: Broker-seitige Schließungen (SL/TP-Legs, cTrader-SL/TP,
-  Flatten, manuelles Schließen) landen nicht im Ledger; ohne Abgleich könnte ein
-  Exit auf einem genetteten Account die Anteile eines anderen Deployments
-  schließen. Fills von Bracket-Legs gegen das Parent-Signal zu buchen ist die
-  eigentliche Lösung und ein eigenes Issue; bis dahin muss nach so einer
-  Schließung das Ledger abgeglichen werden, bevor Exits wieder laufen.
+- **Ledger-Überhang: Deckelung am Broker + Alert (#121, Entscheidung 2):** Ein
+  Exit schließt nur die eigene Ledger-Menge des Deployments, höchstens aber die
+  Broker-Position: `Menge = min(eigene Ledger-Menge, Broker-Menge)`, dann der
+  Anteil (Teil-Exit) und das Abrunden auf den Mengenschritt. Weichen die Ledger
+  aller Deployments auf demselben Account und Symbol (jeder Status,
+  `get_account_net_filled_qty_by_deployment`) vorzeichenrichtig summiert von der
+  Broker-Position ab (Toleranz: `position_qty_tolerance` des Adapters, cTrader
+  eine halbe Broker-Volumeneinheit, Alpaca 0,5e-9; unbekannt → strikt 1e-9),
+  oder übersteigt die eigene Menge die Broker-Position, wird der gedeckelte Exit
+  **trotzdem abgeschickt** und ein Alert ausgelöst: `ERROR`-Log mit
+  `alert=exit_ledger_mismatch` (Sentry macht daraus ein Event), allen
+  Ledger-Mengen (`ledger_qty_by_deployment`, `ledger_qty_total`), `broker_qty`
+  und `own_ledger_qty`. Grund der Abweichung sind meist Broker-seitige
+  Schließungen (SL/TP-Legs, cTrader-SL/TP, Flatten, manuelles Schließen), die
+  nicht im Ledger landen. **Restrisiko:** Auf einem genetteten Account senkt eine
+  Broker-seitige Schließung für ein anderes Deployment die Broker-Position; die
+  Deckelung schließt dann einen Teil von dessen Anteil mit. Der Alert nennt das,
+  das Ledger muss danach abgeglichen werden. Fills von Bracket-Legs gegen das
+  Parent-Signal zu buchen ist die eigentliche Lösung und ein eigenes Issue.
+  Unverändert: Seiten-Konflikt (eigene Seite ≠ Broker-Seite oder ≠ Nachricht)
+  → abgelehnt; keine eigene Menge → ignoriert + `WARNING`; auf 0 gedeckelt bzw.
+  abgerundet → ignoriert + `WARNING`.
 - **Ein Exit nach dem anderen:** Solange ein früherer Exit desselben
   Deployments und Symbols beim Broker noch arbeitet (nicht voll gefüllt und in
   den offenen Orders des Brokers, per Broker- oder Client-Order-ID), wird ein
