@@ -104,7 +104,7 @@ def _sweep_installed_reactor(before: frozenset[str]) -> None:
     """Undo the reactor installation a just-finished import caused."""
     for name in sorted(sys.modules):
         if name not in before and _is_platform_reactor_module(name):
-            del sys.modules[name]
+            sys.modules.pop(name, None)
     twisted_internet = sys.modules.get("twisted.internet")
     if twisted_internet is not None and hasattr(twisted_internet, "reactor"):
         delattr(twisted_internet, "reactor")
