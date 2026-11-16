@@ -913,8 +913,9 @@ def daily_returns_moments(equity_curve: list[EquityPoint]) -> dict[str, float] |
     so a deflated Sharpe built from these moments with a single trial equals
     the PSR reported in the stats.
 
-    Returns ``None`` when there are fewer than two daily returns or their
-    standard deviation is zero or undefined. Keys:
+    Returns ``None`` when the moments are undefined: fewer than four daily
+    returns (sample kurtosis needs four), or a standard deviation that is zero
+    or undefined. Keys:
 
     - ``count``: number of daily return observations
     - ``sharpe_per_obs``: per-observation Sharpe, NOT annualised

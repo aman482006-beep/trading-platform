@@ -667,6 +667,7 @@ An embargo gap is inserted between each pair of segments:
 The embargo size is `embargo_days` (fixed days) plus `embargo_pct` of the whole
 range (same semantics as the legacy two-way split). The gaps are taken **out of
 the train segment**, so validation and test keep their configured length.
+Whatever the configured embargo, consecutive segments are separated by at least 1 microsecond, because the date filter is inclusive on both ends and a bar on a shared boundary would otherwise be traded in two segments.
 
 ### Evaluation Flow
 
@@ -688,10 +689,10 @@ test is never read during search or selection.
 The optimization result JSON carries the following keys (legacy keys kept for
 backward compatibility):
 
-#### Legacy keys (unchanged)
+#### Legacy keys (kept; `test_*` changed meaning)
 - `train_split_pct` — the train fraction (0.6 by default)
 - `train_period`, `train_stats` — train window and winner's train metrics
-- `test_period`, `test_stats` — **CHANGED MEANING**: now carries the validation window
+- `test_period`, `test_stats` — **CHANGED MEANING** (parameter-search modes only; risk-parity keeps the holdout here, see below): now carries the validation window
   and the winner's validation metrics (the window the winner was selected on). Kept
   so existing readers keep comparing train against the held-out window used for
   selection.
@@ -705,7 +706,8 @@ backward compatibility):
 - `three_way` — structured object with:
   - `segments`: `{train, validation, test, embargo_train_val, embargo_val_test}` — date ranges
   - `winner`: `{trial_number, train_metrics, validation_metrics, test_metrics}` — per-segment metrics
-  - `selection`: `{winner_trial_number, score_source, target_metric, study_direction, top_fraction, top_set_size, n_selectable_trials, n_unselectable_trials, tie_break, ranked_top_set}`
+  - `selection`: `{winner_trial_number, score_source, target_metric, study_direction, top_fraction, top_set_size, n_selectable_trials, n_unselectable_trials, unselectable_trials, tie_break, ranked_top_set}`
+    A trial is unselectable (listed in `unselectable_trials` with its reason, and logged at INFO) when it was a no-trade/unrankable train trial, or on validation made no trades, was ruined, had an undefined target metric (even with a 0.0 placeholder), or failed to run. If every trial is unselectable the run fails with an error naming each reason.
   - `test_distribution`: `{count, share_profitable, median_target_metric, target_metric, spearman_validation_to_test, ranked_by_test, note}`
   - `overfitting`: `{passed, checks: {degradation, deflated_sharpe}, thresholds, reasons, degradation, deflated_sharpe, metric, train_metric_value, validation_metric_value, n_selectable_trials, var_sharpe_per_obs, note}`
 
@@ -737,7 +739,7 @@ The risk-parity covariance optimization mode has no trial search. Covariance is
 fitted on the train segment and the selected universe is reported on the test
 holdout. Its windows are cut from the same three-way split, so the validation
 segment is never read and both embargo gaps are skipped. It does not produce an
-overfitting verdict. Because the default `train_split_pct` moved from 0.7 to 0.6,
+overfitting verdict. **Exception: in this mode `test_period`/`test_stats` keep their old meaning and hold the untouched test holdout** (there is no validation window and no `final_test_*` key), so a mode-agnostic reader must not treat `test_*` as a validation window. Because the default `train_split_pct` moved from 0.7 to 0.6,
 its default test holdout is 0.2 of the range (it was 0.3 under the two-way split).
 
 ### Migration

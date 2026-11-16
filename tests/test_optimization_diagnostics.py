@@ -1571,6 +1571,24 @@ def test_overfitting_verdict_all_pass():
     assert verdict["reasons"] == []
 
 
+def test_overfitting_verdict_degradation_at_threshold_passes():
+    """The check is ``degradation <= max_degradation``: equality passes."""
+    verdict = overfitting_verdict(
+        degradation=0.5,
+        deflated_sharpe=0.97,
+        max_degradation=0.5,
+        min_deflated_sharpe=0.95,
+    )
+    assert verdict["checks"]["degradation"]["passed"] is True
+    just_over = overfitting_verdict(
+        degradation=0.5000001,
+        deflated_sharpe=0.97,
+        max_degradation=0.5,
+        min_deflated_sharpe=0.95,
+    )
+    assert just_over["checks"]["degradation"]["passed"] is False
+
+
 def test_overfitting_verdict_degradation_fail():
     """Degradation exceeds threshold -> passed=False."""
     verdict = overfitting_verdict(
