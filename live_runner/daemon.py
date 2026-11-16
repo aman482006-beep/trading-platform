@@ -1096,8 +1096,9 @@ async def prepare_exit_intent_order(
     ``ValueError`` when a close would be ambiguous or would extend exposure.
     Nothing here places an order.
 
-    Deliberately independent of the entry path (no risk sizing, no SL/TP guard,
-    no deployment-status check), so the exit can be dispatched on its own.
+    Deliberately independent of the entry path (no risk sizing, no SL/TP guard).
+    This function checks no deployment status itself, but its callers dispatch
+    only for ACTIVE deployments, so an exit on a PAUSED one never gets here.
     """
     metadata = dict(signal.metadata or {})
     if instruction is None:

@@ -194,7 +194,8 @@ Bedingung nennt, erzeugt eine neue Entry-Order.
   aller Deployments auf demselben Account und Symbol (jeder Status,
   `get_account_net_filled_qty_by_deployment`) vorzeichenrichtig summiert von der
   Broker-Position ab (Toleranz: `position_qty_tolerance` des Adapters, cTrader
-  eine halbe Broker-Volumeneinheit, Alpaca 0,5e-9; unbekannt → strikt 1e-9),
+  eine halbe Broker-Volumeneinheit, Alpaca 0,5e-9; unbekannt oder größer als
+  eine ganze Einheit → strikt 1e-9 + `WARNING`),
   oder übersteigt die eigene Menge die Broker-Position, wird der gedeckelte Exit
   **trotzdem abgeschickt** und ein Alert ausgelöst: `ERROR`-Log mit
   `alert=exit_ledger_mismatch` (Sentry macht daraus ein Event), allen
@@ -209,6 +210,11 @@ Bedingung nennt, erzeugt eine neue Entry-Order.
   Unverändert: Seiten-Konflikt (eigene Seite ≠ Broker-Seite oder ≠ Nachricht)
   → abgelehnt; keine eigene Menge → ignoriert + `WARNING`; auf 0 gedeckelt bzw.
   abgerundet → ignoriert + `WARNING`.
+- **Bekannte Einschränkung: Exits auf `PAUSED`-Deployments (#126).** Ein Exit
+  wird wie jede Order nur für `ACTIVE`-Deployments zugestellt (Fan-out und
+  Re-Check vor dem Absenden). Auf einem `PAUSED`-Deployment wird „Exit AAPL"
+  verworfen (INFO-Log), die Position bleibt offen. Das Gate ist in #121
+  unverändert; Exits trotz `PAUSED` anzunehmen ist offen (#126).
 - **Ein Exit nach dem anderen (pro Account und Symbol):** Solange ein früherer
   Exit **irgendeines Deployments desselben Accounts** für dasselbe Symbol beim
   Broker noch arbeitet (nicht voll gefüllt und in den offenen Orders des
