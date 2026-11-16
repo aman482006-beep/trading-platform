@@ -312,8 +312,10 @@ class OptimizationConfig(BaseModel):
     # fraction worse than train (relative drop). Default 0.5 = 50% degradation.
     max_train_validation_degradation: float = Field(default=0.5, ge=0.0)
     # min_deflated_sharpe: probability that the selected trial's Sharpe is not
-    # due to selection bias (Bailey & Lopez de Prado 2014). Default 0.95.
-    min_deflated_sharpe: float = Field(default=0.95, gt=0.0, le=1.0)
+    # due to selection bias (Bailey & Lopez de Prado 2014). Default 0.90.
+    # This is an overfitting / selection-luck hint, not a judgement of
+    # strategy quality: a low Sharpe can still be a useful portfolio component.
+    min_deflated_sharpe: float = Field(default=0.90, gt=0.0, le=1.0)
 
     @field_validator("base_backtest_id", "target_metric")
     @classmethod
@@ -1539,7 +1541,9 @@ def _overfitting_payload(
         "var_sharpe_per_obs": _safe_float_or_none(var_sr),
         "note": (
             "A failed verdict only flags this result: the winner and its "
-            "metrics are reported unchanged. Promotion decisions belong to the "
+            "metrics are reported unchanged. The deflated Sharpe check is an "
+            "overfitting / selection-luck hint (many trials were tried), not a "
+            "judgement of strategy quality. Promotion decisions belong to the "
             "promotion gate."
         ),
     }

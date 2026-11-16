@@ -1136,7 +1136,9 @@ def overfitting_verdict(
         degradation: Result from train_validation_degradation (None if uncomputable).
         deflated_sharpe: Result from deflated_sharpe_ratio (None if uncomputable).
         max_degradation: Threshold for max allowed degradation (e.g., 0.5 = 50%).
-        min_deflated_sharpe: Minimum acceptable deflated Sharpe probability (e.g., 0.95).
+        min_deflated_sharpe: Minimum deflated Sharpe probability before the
+            overfitting / selection-luck hint stops flagging (e.g., 0.90). It is
+            not a quality threshold for the strategy itself.
 
     Returns:
         Dict with:
