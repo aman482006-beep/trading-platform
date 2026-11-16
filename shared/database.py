@@ -37,6 +37,7 @@ from sqlmodel.sql.expression import SelectOfScalar
 
 from shared.alpaca_symbols import classify_alpaca_symbol
 from shared.constants import DATA_DIR as RESOLVED_DATA_DIR
+from shared.constants import normalize_symbols
 from shared.fill_keys import canonical_utc_timestamp
 from shared.logging import get_logger
 from shared.models import (
@@ -3540,15 +3541,6 @@ def _resolve_deployment_signal_source(deployment: LiveDeploymentConfig) -> tuple
     return signal_source_type, signal_source
 
 
-def _normalized_symbol_filter(symbols: list[str]) -> list[str]:
-    """Uppercase stripped symbol entries, dropping blanks."""
-    return [
-        str(symbol).strip().upper()
-        for symbol in (symbols or [])
-        if str(symbol).strip()
-    ]
-
-
 def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentConfig:
     from live_runner.stockkit_routing import validate_stockkit_deployment_route
 
@@ -3586,7 +3578,7 @@ def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentCo
             raise ValueError(f"Invalid deployment status '{deployment.status}'")
         signal_source_type, signal_source = _resolve_deployment_signal_source(deployment)
         signal_source_id = str(deployment.signal_source_id or "").strip()
-        symbol_filter = _normalized_symbol_filter(deployment.symbol_filter)
+        symbol_filter = normalize_symbols(deployment.symbol_filter)
         record = LiveDeploymentModel.from_live_deployment(deployment)
         record.status = deployment_status
         record.signal_source = signal_source
