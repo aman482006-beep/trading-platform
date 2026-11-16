@@ -860,6 +860,14 @@ def run_optimization(
     winner_test_row = next(
         row for row in test_rows if row["number"] == int(best_trial.number)
     )
+    if winner_test_row["test_failure_reason"]:
+        # The headline holdout result is the winner's own. Without it there is
+        # no honest result to write, so fail loudly and name the trial.
+        raise RuntimeError(
+            f"Holdout test evaluation failed for the selected winner (trial "
+            f"{int(best_trial.number)}); no optimization result was written. "
+            f"{winner_test_row['test_failure_reason']}"
+        )
     final_test_stats = dict(winner_test_row["test_stats"])
     validation_stats = dict(winner_row["validation_stats"])
     # Flags the winner's overfitting risk; it never changes the selection or
@@ -941,7 +949,6 @@ def run_optimization(
                 config=config,
             ),
             "test_distribution": _test_distribution_payload(
-                selection=selection,
                 test_rows=test_rows,
                 target_metric=config.target_metric,
             ),
@@ -1325,35 +1332,44 @@ def _evaluate_top_set_on_test(
     rows: list[dict[str, Any]] = []
     for selected in selection["top_set"]:
         trial = selected["trial"]
-        result = _run_period_backtest(
-            strategy_slug=strategy_slug,
-            strategy_path=strategy_path,
-            symbols=trial.user_attrs.get("symbols") or symbols,
-            timeframe=timeframe,
-            period=test_period,
-            initial_capital=initial_capital,
-            parameters=_trial_effective_parameters(trial, base_parameters),
-            base_runtime=base_runtime,
-        )
-        stats = _canonical_stats(result)
-        rows.append(
-            {
-                "number": int(trial.number),
-                "validation_rank": validation_rank[int(trial.number)],
-                "validation_score": float(selected["validation_score"]),
-                "validation_metric_value": _safe_float_or_none(
-                    selected.get("validation_metric_value")
-                ),
-                "test_metric_value": _metric_value(stats, config.target_metric),
-                "test_stats": _json_safe(stats),
-            }
-        )
+        number = int(trial.number)
+        row: dict[str, Any] = {
+            "number": number,
+            "validation_rank": validation_rank[number],
+            "validation_score": float(selected["validation_score"]),
+            "validation_metric_value": _safe_float_or_none(
+                selected.get("validation_metric_value")
+            ),
+            "test_metric_value": None,
+            "test_stats": {},
+            "test_failure_reason": None,
+        }
+        # Same isolation as the validation pass: one candidate whose holdout
+        # run fails is recorded, and the rest of the top set still reports.
+        try:
+            result = _run_period_backtest(
+                strategy_slug=strategy_slug,
+                strategy_path=strategy_path,
+                symbols=trial.user_attrs.get("symbols") or symbols,
+                timeframe=timeframe,
+                period=test_period,
+                initial_capital=initial_capital,
+                parameters=_trial_effective_parameters(trial, base_parameters),
+                base_runtime=base_runtime,
+            )
+            stats = _canonical_stats(result)
+            metric_value = _metric_value(stats, config.target_metric)
+        except (ValueError, RuntimeError, KeyError) as exc:
+            row["test_failure_reason"] = f"{type(exc).__name__}: {exc}"
+            rows.append(row)
+            continue
+        row.update({"test_metric_value": metric_value, "test_stats": _json_safe(stats)})
+        rows.append(row)
     return rows
 
 
 def _test_distribution_payload(
     *,
-    selection: Mapping[str, Any],
     test_rows: Sequence[Mapping[str, Any]],
     target_metric: str,
 ) -> dict[str, Any]:
@@ -1366,7 +1382,14 @@ def _test_distribution_payload(
     """
     from scipy.stats import spearmanr
 
-    rows = list(test_rows)
+    # A candidate whose holdout run failed has no result to summarise; it is
+    # reported under `failures` instead of silently shrinking the sample.
+    failures = [
+        {"trial_number": int(row["number"]), "reason": str(row["test_failure_reason"])}
+        for row in test_rows
+        if row.get("test_failure_reason")
+    ]
+    rows = [row for row in test_rows if not row.get("test_failure_reason")]
     direction = _study_direction(target_metric)
     sign = -1.0 if direction == "minimize" else 1.0
     metric_values = [
@@ -1406,6 +1429,7 @@ def _test_distribution_payload(
 
     return {
         "count": len(rows),
+        "failures": failures,
         "share_profitable": (
             round(profitable / len(rows), 6) if rows else None
         ),
