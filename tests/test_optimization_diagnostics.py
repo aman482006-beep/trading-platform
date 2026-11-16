@@ -740,8 +740,16 @@ def test_realized_pnl_is_attributed_to_the_subperiod_that_produced_it():
     """A trade opened in one sub-period and closed in the next belongs to the
     second: the result is what the period actually produced."""
     subperiods = [
-        {"label": "fold_0", "start": "2024-01-01T00:00:00+00:00", "end": "2024-02-01T00:00:00+00:00"},
-        {"label": "fold_1", "start": "2024-02-01T00:00:00+00:00", "end": "2024-03-01T00:00:00+00:00"},
+        {
+            "label": "fold_0",
+            "start": "2024-01-01T00:00:00+00:00",
+            "end": "2024-02-01T00:00:00+00:00",
+        },
+        {
+            "label": "fold_1",
+            "start": "2024-02-01T00:00:00+00:00",
+            "end": "2024-03-01T00:00:00+00:00",
+        },
     ]
 
     realized = realized_pnl_by_subperiod(
@@ -763,8 +771,16 @@ def test_realized_pnl_reports_every_subperiod_even_with_no_events():
     """"Nothing was realized here" and "this sub-period was never measured"
     must not look the same to a reader."""
     subperiods = [
-        {"label": "fold_0", "start": "2024-01-01T00:00:00+00:00", "end": "2024-02-01T00:00:00+00:00"},
-        {"label": "fold_1", "start": "2024-02-01T00:00:00+00:00", "end": "2024-03-01T00:00:00+00:00"},
+        {
+            "label": "fold_0",
+            "start": "2024-01-01T00:00:00+00:00",
+            "end": "2024-02-01T00:00:00+00:00",
+        },
+        {
+            "label": "fold_1",
+            "start": "2024-02-01T00:00:00+00:00",
+            "end": "2024-03-01T00:00:00+00:00",
+        },
     ]
 
     assert realized_pnl_by_subperiod([], subperiods) == {"fold_0": 0.0, "fold_1": 0.0}
@@ -775,7 +791,11 @@ def test_realized_pnl_is_never_counted_twice_when_subperiods_overlap():
     two periods: it is attributed to the first period that contains it."""
     subperiods = [
         {"label": "wide", "start": "2024-01-01T00:00:00+00:00", "end": "2024-03-01T00:00:00+00:00"},
-        {"label": "narrow", "start": "2024-02-01T00:00:00+00:00", "end": "2024-02-15T00:00:00+00:00"},
+        {
+            "label": "narrow",
+            "start": "2024-02-01T00:00:00+00:00",
+            "end": "2024-02-15T00:00:00+00:00",
+        },
     ]
 
     realized = realized_pnl_by_subperiod(
@@ -1042,7 +1062,11 @@ def test_an_unreadable_pnl_is_dropped_rather_than_charged_to_a_subperiod():
     from runner.optimizer import _trade_net_pnl
 
     subperiods = [
-        {"label": "fold_0", "start": "2024-01-01T00:00:00+00:00", "end": "2024-03-01T00:00:00+00:00"}
+        {
+            "label": "fold_0",
+            "start": "2024-01-01T00:00:00+00:00",
+            "end": "2024-03-01T00:00:00+00:00",
+        }
     ]
 
     realized = realized_pnl_by_subperiod(
@@ -1392,6 +1416,15 @@ def test_select_by_validation_top_fraction_at_least_one():
     assert len(result["top_set"]) == 1
 
 
+def test_select_by_validation_rounds_a_fractional_top_set_up():
+    """A fractional candidate count rounds UP, never down (ceil, not floor)."""
+    trials = [{"number": i, "validation_score": float(i)} for i in range(16)]
+    result = select_by_validation(trials, top_fraction=0.1)
+    # 16 * 0.1 = 1.6 -> ceil = 2. A floor would test only one candidate.
+    assert len(result["top_set"]) == 2
+    assert [t["number"] for t in result["top_set"]] == [15, 14]
+
+
 def test_select_by_validation_all_missing_scores():
     """All scores missing -> winner None, empty top_set."""
     trials = [
@@ -1634,6 +1667,9 @@ def test_deflated_sharpe_ratio_zero_trial_variance_has_no_hurdle():
     many = deflated_sharpe_ratio(sr=0.08, t=120, skew=0.0, kurt=3.0, n=500, var_sr=0.0)
     one = deflated_sharpe_ratio(sr=0.08, t=120, skew=0.0, kurt=3.0, n=1, var_sr=0.0)
     assert many == pytest.approx(one)
+    # Zero variance is a valid input (a zero hurdle), not an error: the DSR
+    # must still be computed. Rejecting var_sr == 0 would return None here.
+    assert deflated_sharpe_ratio(sr=0.08, t=120, skew=0.0, kurt=3.0, n=500, var_sr=0.0) is not None
 
 
 def test_walk_forward_folds_stop_where_three_way_validation_ends():

@@ -57,6 +57,9 @@ __all__ = [
 ]
 
 
+#: Shared by every split/fold function that takes an embargo fraction.
+_NEGATIVE_EMBARGO_MESSAGE = "embargo_pct must not be negative"
+
 def _as_timestamp(value: Any) -> pd.Timestamp:
     ts = pd.Timestamp(value)
     if ts.tzinfo is None:
@@ -126,7 +129,7 @@ def embargo_split(
     if not 0.0 < train_split_pct < 1.0:
         raise ValueError("train_split_pct must be strictly between 0 and 1")
     if embargo_pct < 0.0:
-        raise ValueError("embargo_pct must not be negative")
+        raise ValueError(_NEGATIVE_EMBARGO_MESSAGE)
     if holding_bars < 0:
         raise ValueError("holding_bars must not be negative")
 
@@ -222,7 +225,7 @@ def three_way_split(
     if embargo_days < 0:
         raise ValueError("embargo_days must not be negative")
     if embargo_pct < 0.0:
-        raise ValueError("embargo_pct must not be negative")
+        raise ValueError(_NEGATIVE_EMBARGO_MESSAGE)
 
     start_ts = _as_timestamp(start)
     end_ts = _as_timestamp(end)
@@ -300,7 +303,7 @@ def walk_forward_train_validation_folds(
     if embargo_days < 0:
         raise ValueError("embargo_days must not be negative")
     if embargo_pct < 0.0:
-        raise ValueError("embargo_pct must not be negative")
+        raise ValueError(_NEGATIVE_EMBARGO_MESSAGE)
 
     start_ts = _as_timestamp(start)
     end_ts = _as_timestamp(end)
@@ -1063,7 +1066,8 @@ def train_validation_degradation(
     """
     if not (math.isfinite(train_metric) and math.isfinite(validation_metric)):
         return None
-    if train_metric == 0.0:
+    # Only an exact zero is undefined; a tiny train metric is a large but valid ratio.
+    if abs(train_metric) <= 0.0:
         return None
     return (train_metric - validation_metric) / abs(train_metric)
 

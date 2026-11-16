@@ -925,7 +925,8 @@ def daily_returns_moments(equity_curve: list[EquityPoint]) -> dict[str, float] |
     if returns is None or len(returns) < 2:
         return None
     std_r = float(returns.std())
-    if not math.isfinite(std_r) or std_r == 0.0:
+    # A standard deviation is never negative, so "<= 0" is exactly "is zero".
+    if not math.isfinite(std_r) or std_r <= 0.0:
         return None
     skew = float(returns.skew())
     kurtosis = float(returns.kurtosis()) + 3.0
