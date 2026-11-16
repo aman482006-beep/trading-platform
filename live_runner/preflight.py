@@ -4,17 +4,15 @@ import argparse
 import asyncio
 import contextlib
 import json
-import os
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from dotenv import dotenv_values
-
 from live_runner.account_routing import ctrader_account_identifier
 from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
 from live_runner.config_parser import parse_live_deployments_config
+from live_runner.credential_env import load_accounts_env_values
 from live_runner.ctrader_adapter import DEFAULT_ACCOUNTS_ENV, CTraderLiveAdapter
 from shared.logging import get_logger
 from shared.models import LiveAccountConfig, LiveDeploymentConfig
@@ -48,14 +46,18 @@ class LivePreflightResult:
 
 
 def _load_env_file(path: Path) -> dict[str, str]:
-    if not path.exists():
-        return {}
-    values = dotenv_values(path)
-    return {
-        str(key): str(value).strip()
-        for key, value in values.items()
-        if key and isinstance(value, str)
-    }
+    """Accounts-env file values only: the credentials view, with no
+    process-environment fill.
+
+    A key the file does not define is "not configured" and must stay a failed
+    preflight rather than silently borrowing the process environment. A
+    present-but-empty value stays defined by the file, so a key an operator
+    blanked on purpose is never shadowed by a stale process-env value. Both
+    rules are the shared resolver's (``load_accounts_env_values``), so the file
+    is read through it - which also means an unreadable file warns and
+    continues instead of raising an unhandled OSError here.
+    """
+    return load_accounts_env_values(path, environ={})
 
 
 _TRUE_BOOL_TOKENS = frozenset({"1", "true", "yes", "y", "on"})
@@ -346,9 +348,11 @@ def run_live_preflight(
     env_values = dict(env) if env is not None else _load_env_file(accounts_env)
     # ${VAR} references in the YAML resolve exactly like credentials: the accounts
     # env file first, the process environment only for keys the file does not
-    # define. An explicit ``env`` mapping is used as-is (hermetic callers).
+    # define - through ``load_accounts_env_values``, the resolver every other
+    # live_runner entry point uses, rather than a private copy of its overlay.
+    # An explicit ``env`` mapping is used as-is (hermetic callers).
     expansion_env: Mapping[str, str] = (
-        env_values if env is not None else {**os.environ, **env_values}
+        env_values if env is not None else load_accounts_env_values(accounts_env)
     )
     try:
         accounts, deployments = parse_live_deployments_config(

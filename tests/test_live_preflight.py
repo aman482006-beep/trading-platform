@@ -496,3 +496,45 @@ def test_live_preflight_empty_file_value_wins_over_process_env(
     run_live_preflight(config_path, accounts_env_path=accounts_env)
 
     assert seen["channel"] == ""
+
+
+def test_live_preflight_unreadable_accounts_env_reports_failure_not_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A present-but-unreadable accounts env file is a config error, not a crash.
+
+    Every other accounts-env read in live_runner goes through
+    ``load_accounts_env_values``, which warns and continues with the process
+    environment; preflight must not raise an unhandled OSError traceback just
+    because the YAML parse now reads the same file.
+    """
+    import live_runner.credential_env as credential_env
+    import live_runner.preflight as preflight
+
+    config_path = _write_config(
+        tmp_path / "live_deployments.yaml",
+        """
+        accounts:
+          - id: alpaca-paper
+            broker: alpaca
+
+        deployments:
+          - strategy_name: equity_momentum
+            account_id: alpaca-paper
+            symbols: [AAPL]
+            timeframe: 1h
+        """,
+    )
+    accounts_env = tmp_path / ".accounts.env"
+    accounts_env.write_text("ALPACA_API_KEY=file-key\n", encoding="utf-8")
+
+    def _deny(_path: object) -> dict[str, str]:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(preflight, "dotenv_values", _deny, raising=False)
+    monkeypatch.setattr(credential_env, "dotenv_values", _deny)
+
+    result = run_live_preflight(config_path, accounts_env_path=accounts_env)
+
+    assert result.ok is False
+    assert any("Missing Alpaca credentials" in e for e in result.accounts[0].errors)
