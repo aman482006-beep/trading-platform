@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from scripts.regenerate_qc_risk_parity_artifact import _load_local_prices
 from scripts.run_risk_parity_backtest import TICKERS
@@ -63,3 +64,23 @@ def test_regenerate_offline_accepts_history_start_kwarg(tmp_path: Path):
     )
     assert output.exists()
     assert backtest.meta.id == "rp_offline"
+
+
+def test_regenerate_loads_prices_from_margined_history_start(monkeypatch, tmp_path: Path):
+    """Offline regeneration must keep the 200-day covariance margin (A-M6)."""
+    import scripts.regenerate_qc_risk_parity_artifact as regen
+    from scripts.run_risk_parity_backtest import price_history_start
+
+    seen: list[str] = []
+
+    def stop(data_dir, source, start, end):
+        seen.append(start)
+        raise RuntimeError("stop after load")
+
+    monkeypatch.setattr(regen, "_load_local_prices", stop)
+    with pytest.raises(RuntimeError, match="stop after load"):
+        regen.regenerate(
+            data_dir=tmp_path, source=Path("x"), output=tmp_path / "o.json",
+            start="2016-01-01", end="2016-06-30",
+        )
+    assert seen == [price_history_start("2016-01-01", "2015-08-04")] == ["2015-01-16"]

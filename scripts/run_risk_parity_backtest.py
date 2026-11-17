@@ -282,7 +282,7 @@ def weekly_correlation_regimes(returns: pd.DataFrame) -> dict[pd.Timestamp, str]
             # Fewer observations than the 30-day recent window plus one: the correlation
             # is undefined, and QC's History() always supplies a full window.
             # Logged so the missing state update is visible rather than silent.
-            logger.debug(
+            logger.warning(
                 "Weekly correlation regime for %s skipped: %d return bars precede it "
                 "(need 31); the previous regime stays active",
                 regime_date.date(),
@@ -530,7 +530,10 @@ def run_backtest(
         )
     if not 0 <= warm_up_days < len(prices):
         raise ValueError("warm_up_days must be non-negative and less than the number of price rows")
-    returns = prices.pct_change().dropna()
+    # ``fill_method=None``: a missing close drops that bar (and the next) from the return
+    # index instead of being forward-filled into a fake 0% return. pandas 3 behaves this way
+    # by default; pandas 2.x forward-fills, so pin it for both.
+    returns = prices.pct_change(fill_method=None).dropna()
     returns = returns[TICKERS]  # ensure column order
 
     lookback_corr = 120
@@ -653,11 +656,23 @@ def run_backtest(
         )
         spy_sma_ready = bars_since_data_start >= 200
         spy_window = prices["SPY"].iloc[max(0, spy_idx - 199) : spy_idx + 1]
-        spy_sma = spy_window.mean()
-        spy_price = prices["SPY"].iloc[spy_idx]
-        hedge_active = bool(
-            spy_sma_ready and len(spy_window) >= 200 and spy_price < spy_sma * 0.98
-        )
+        spy_price = float(prices["SPY"].iloc[spy_idx])
+        hedge_active = False
+        if spy_sma_ready:
+            # NaN comparisons are False and ``mean()`` skips NaNs, so a missing close would
+            # silently disable the hedge (or average fewer than 200 closes). The window is
+            # exactly 200 rows, so any NaN in it (including the last completed bar) fails
+            # this count: refuse visibly instead.
+            valid_closes = int(spy_window.notna().sum())
+            if valid_closes < 200:
+                logger.warning(
+                    "Rebalance %s: only %d valid SPY closes in the 200-bar window; "
+                    "tail-risk hedge not evaluated",
+                    reb_date.date(),
+                    valid_closes,
+                )
+            else:
+                hedge_active = bool(spy_price < float(spy_window.mean()) * 0.98)
         if hedge_active:
             weights = apply_tail_risk_hedge(weights)
 
@@ -703,6 +718,10 @@ def run_backtest(
                 )
                 rebalance_attribution_pnls.append(round(attribution_pnl, 2))
 
+            # Gate basis: the drifted weight marked through ``reb_date``'s close (same bar the
+            # MOC fill uses). QC evaluates HoldingsValue/TotalPortfolioValue at 10:00, i.e.
+            # through the previous close; the residual is documented in
+            # docs/comparison-matrix-change-notes.md (#188).
             delta = weights[ticker] - prev_weight
             if abs(delta) <= rebalance_threshold:
                 next_weights[ticker] = prev_weight  # position kept, weight carried as drifted

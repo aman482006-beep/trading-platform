@@ -513,6 +513,26 @@ def test_weekly_regime_window_ends_before_the_regime_date():
         assert regime == expected
 
 
+def test_weekly_regime_matrix_is_exactly_the_preceding_window(monkeypatch):
+    """The regime detector receives returns[loc-120:loc]: last column is the previous bar."""
+    import scripts.run_risk_parity_backtest as risk_parity
+
+    rng = np.random.default_rng(13)
+    dates = pd.bdate_range("2023-01-02", periods=200)
+    returns = pd.DataFrame(rng.normal(0, 0.01, (200, len(TICKERS))), index=dates, columns=TICKERS)
+    order: list[np.ndarray] = []
+    monkeypatch.setattr(
+        risk_parity, "detect_correlation_regime", lambda m: order.append(np.array(m)) or "normal"
+    )
+
+    regimes = weekly_correlation_regimes(returns)
+
+    assert len(order) == len(regimes) > 3
+    for (regime_date, _), matrix in zip(sorted(regimes.items()), order, strict=True):
+        loc = returns.index.get_loc(regime_date)
+        np.testing.assert_array_equal(matrix, returns.iloc[max(0, loc - 120) : loc].T.values)
+
+
 def test_rebalancing_starts_at_start_date_when_history_precedes_it(monkeypatch):
     """QC's SetWarmUp period precedes SetStartDate: first order on the first session of 2016.
 
@@ -685,21 +705,7 @@ def test_short_covariance_window_is_logged_and_recorded(caplog):
 
 
 def _patch_equal_weights(monkeypatch):
-    import scripts.run_risk_parity_backtest as risk_parity
-
-    baseline = {ticker: 1.0 / len(TICKERS) for ticker in TICKERS}
-    monkeypatch.setattr(risk_parity, "calculate_covariance", lambda *a, **k: np.eye(len(TICKERS)))
-    monkeypatch.setattr(
-        risk_parity, "calculate_risk_parity_weights", lambda *a, **k: dict(baseline)
-    )
-    monkeypatch.setattr(risk_parity, "adjust_for_regime", lambda weights, regime: dict(weights))
-    monkeypatch.setattr(
-        risk_parity,
-        "apply_volatility_scaling",
-        lambda weights, cov, target_vol, max_leverage, max_weight, tickers: dict(weights),
-    )
-    monkeypatch.setattr(risk_parity, "apply_tail_risk_hedge", lambda weights: dict(weights))
-    monkeypatch.setattr(risk_parity, "weekly_correlation_regimes", lambda returns: {})
+    _mock_flat_pipeline(monkeypatch, lambda: {t: 1.0 / len(TICKERS) for t in TICKERS})
 
 
 def test_attribution_baseline_is_the_last_executed_rebalance_not_a_skipped_date(monkeypatch):
@@ -762,3 +768,131 @@ def test_rebalance_with_a_single_prior_return_is_skipped_not_run_on_nan_weights(
     for signal in signals:
         assert all(np.isfinite(w) for w in signal["target_weights"].values())
     assert np.isfinite(result["portfolio_value"]).all()
+
+
+def test_covariance_window_ends_before_the_rebalance_date(monkeypatch):
+    """The risk-parity fit sees returns up to the PREVIOUS close, never the rebalance day's."""
+    import scripts.run_risk_parity_backtest as risk_parity
+
+    captured: list[np.ndarray] = []
+
+    def recorder(matrix, *args, **kwargs):
+        captured.append(np.array(matrix))
+        return np.eye(len(TICKERS))
+
+    _mock_flat_pipeline(monkeypatch, lambda: {t: 1.0 / len(TICKERS) for t in TICKERS})
+    monkeypatch.setattr(risk_parity, "calculate_covariance", recorder)
+    prices = _flat_prices("2023-06-01", "2024-02-15")
+    returns = prices.pct_change().dropna()
+
+    result = run_backtest(
+        start_date="2024-01-01",
+        end_date="2024-02-15",
+        prices=prices,
+        open_prices=prices,
+        warm_up_days=0,
+    )
+
+    stamps = [s["timestamp"][:10] for s in result["portfolio_target_signals"]]
+    assert stamps == ["2024-01-01", "2024-02-01"]
+    for stamp, matrix in zip(stamps, captured, strict=True):
+        loc = returns.index.get_loc(pd.Timestamp(stamp))
+        np.testing.assert_array_equal(matrix, returns.iloc[loc - 120 : loc].T.values)
+        assert matrix.shape == (len(TICKERS), 120)
+
+
+def test_trade_gate_does_not_trade_a_weight_exactly_at_the_threshold(monkeypatch):
+    """|target - current| == threshold is kept (the gate trades strictly above it).
+
+    Dyadic values keep the float arithmetic exact: 0.28125 - 0.25 == 0.03125 == threshold.
+    """
+    import scripts.run_risk_parity_backtest as risk_parity
+
+    prices = pd.DataFrame(
+        100.0, index=pd.bdate_range("2023-12-27", "2024-02-29"), columns=TICKERS
+    )
+    targets = iter([0.25, 0.28125])
+    _mock_flat_pipeline(monkeypatch, lambda: {})
+    monkeypatch.setattr(
+        risk_parity,
+        "calculate_risk_parity_weights",
+        lambda *a, **k: {t: (next_spy if t == "SPY" else 0.0) for t in TICKERS}
+        if (next_spy := next(targets))
+        else {},
+    )
+    result = run_backtest(
+        start_date="2023-12-27",
+        end_date="2024-02-29",
+        prices=prices,
+        open_prices=prices,
+        warm_up_days=0,
+        rebalance_threshold=0.03125,
+    )
+    spy_trades = [t for t in result["trades"] if t["symbol"] == "SPY"]
+    assert len(spy_trades) == 1, "0.25 -> 0.28125 is exactly at the gate and must not trade"
+    assert spy_trades[0]["meta"]["target_weight"] == pytest.approx(0.25)
+
+
+def test_hedge_needs_200_valid_spy_closes(monkeypatch, caplog):
+    """A window of 200 rows with NaN holes has fewer than 200 closes: no SMA, no hedge."""
+    dates = pd.bdate_range("2015-08-04", periods=330)
+    warm_up_days = 215
+    reb = _first_rebalance_after(dates, warm_up_days)
+    loc = dates.get_loc(reb)
+    prices = pd.DataFrame(100.0, index=dates, columns=TICKERS)
+    prices.loc[dates[loc - 1], "SPY"] = 50.0  # would hedge on a full window
+    prices.loc[dates[loc - 150], "SPY"] = np.nan
+    _mock_flat_pipeline(monkeypatch, lambda: {t: 1.0 / len(TICKERS) for t in TICKERS})
+
+    with caplog.at_level("WARNING"):
+        result = run_backtest(
+            start_date=str(dates[0].date()),
+            end_date=str(dates[-1].date()),
+            prices=prices,
+            open_prices=prices,
+            warm_up_days=warm_up_days,
+        )
+    assert result["portfolio_target_signals"][0]["metadata"]["hedge_active"] is False
+    assert any("SPY closes" in r.message for r in caplog.records)
+
+
+def test_weekly_regime_skip_is_logged_as_warning(caplog):
+    rng = np.random.default_rng(5)
+    dates = pd.bdate_range("2024-01-01", periods=60)
+    returns = pd.DataFrame(rng.normal(0, 0.01, (60, len(TICKERS))), index=dates, columns=TICKERS)
+    with caplog.at_level("WARNING"):
+        weekly_correlation_regimes(returns)
+    assert any(
+        r.levelname == "WARNING" and "Weekly correlation regime" in r.message
+        for r in caplog.records
+    )
+
+
+def test_rebalance_value_equals_the_equity_curve_at_every_rebalance(monkeypatch):
+    """Pre-mortem: the gate/sizing mark-to-market and the stats-bearing curve must agree."""
+    calls = {"n": 0}
+
+    def alternating():
+        calls["n"] += 1
+        spy = 0.1 if calls["n"] % 2 else 0.3
+        return {t: (spy if t == "SPY" else 0.0) for t in TICKERS}
+
+    _mock_flat_pipeline(monkeypatch, alternating)
+    prices = _flat_prices("2023-10-02", "2024-06-14")
+    # Pre-start margin: curve is trimmed to the bar before start; compare after it.
+    result = run_backtest(
+        start_date="2024-01-01",
+        end_date="2024-06-14",
+        prices=prices,
+        open_prices=prices,
+        warm_up_days=0,
+    )
+    curve = result["portfolio_value"]
+    by_day: dict[pd.Timestamp, float] = {}
+    for trade in result["trades"]:
+        day = pd.Timestamp(trade["exit_time"][:10])
+        # position_size = |target weight| * portfolio value at the rebalance
+        by_day[day] = trade["position_size"] / abs(trade["meta"]["target_weight"])
+    assert len(by_day) >= 3
+    for day, value in by_day.items():
+        assert value == pytest.approx(float(curve.loc[day]), rel=1e-6)
