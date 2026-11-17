@@ -928,6 +928,7 @@ def test_prepared_order_keeps_the_trailing_config_that_gets_persisted() -> None:
 
     class _SizingAdapter(_NoAmendAdapter):
         supports_stop_amendment = True  # type: ignore[assignment]
+        demo = True  # promotion gate (#165): provably demo, so the gate passes through
 
         async def get_balance(self) -> tuple[float, float]:
             return (100_000.0, 100_000.0)

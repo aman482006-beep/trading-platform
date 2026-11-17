@@ -53,6 +53,9 @@ def _quote(bid: float, ask: float, **kwargs: Any):
 @dataclass
 class _GateAdapter(BaseLiveAdapter):
     """Flat broker account with a configurable quote."""
+    # Provably demo: the promotion gate (#165) must pass through to the logic under test.
+    demo = True
+
 
     quote: Any = None
     quote_error: Exception | None = None
@@ -95,6 +98,9 @@ class _GateAdapter(BaseLiveAdapter):
 @dataclass
 class _QuotelessAdapter(BaseLiveAdapter):
     """An adapter that never implemented quotes (inherits the base default)."""
+    # Provably demo: the promotion gate (#165) must pass through to the logic under test.
+    demo = True
+
 
     submitted: list[LiveSignal] = field(default_factory=list)
 

@@ -60,6 +60,9 @@ def _quote(*, age: float | None = 1.0, bid: float = 99.99, ask: float = 100.0, *
 
 @dataclass
 class _Adapter(BaseLiveAdapter):
+    # Provably demo: the promotion gate (#165) must pass through to the logic under test.
+    demo = True
+
     quote: Any = None
     quote_calls: list[str] = field(default_factory=list)
     submitted: list[LiveSignal] = field(default_factory=list)
@@ -476,8 +479,16 @@ def test_api_refuses_invalid_gate_settings_before_storing(monkeypatch, settings)
 
 
 def test_api_accepts_valid_gate_settings(monkeypatch):
+    import viewer.main as viewer_main_module
+
     created: list = []
     client = _api_client(monkeypatch, created)
+    # The promotion gate (#165) reads the broker's demo verdict; report acc-gate as demo.
+    monkeypatch.setattr(
+        viewer_main_module,
+        "_cached_live_accounts_payload",
+        lambda **_: [{"id": "acc-gate", "is_demo": True, "is_demo_asserted": True}],
+    )
 
     response = client.post(
         "/api/live/deployments",

@@ -621,6 +621,9 @@ def test_ctrader_submit_refuses_a_malformed_sized_scale():
 
 class _Adapter(BaseLiveAdapter):
     """Generic adapter whose pip value a test sets; quotes are at 100."""
+    # Provably demo: the promotion gate (#165) must pass through to the logic under test.
+    demo = True
+
 
     def __init__(self, pip: Any = None, error: BaseException | None = None) -> None:
         self.pip = pip
@@ -683,6 +686,8 @@ def test_daemon_refuses_an_entry_when_the_adapter_has_no_pip_value(caplog):
 
 def test_daemon_refuses_an_adapter_without_the_method():
     class _NoMethod:
+        demo = True  # promotion gate (#165): provably demo, so the gate passes through
+
         async def get_balance(self) -> tuple[float, float]:
             return BALANCE, BALANCE
 
