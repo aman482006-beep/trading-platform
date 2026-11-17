@@ -160,6 +160,13 @@ def calculate_risk_parity_weights(
         weights = result.x
     else:
         vols = np.sqrt(np.diag(cov))
+        # A zero or non-finite volatility makes 1/vol inf or NaN: refuse rather
+        # than return NaN weights that do not sum to 1.
+        if not np.all(np.isfinite(vols)) or np.any(vols <= 0):
+            raise ValueError(
+                "cannot build the inverse-volatility fallback: every asset needs a "
+                "finite, positive volatility"
+            )
         inv_vols = 1.0 / vols
         weights = inv_vols / np.sum(inv_vols)
     # #129: the inverse-vol fallback ignores the bounds and SLSQP can overshoot
