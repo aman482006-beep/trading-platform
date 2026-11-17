@@ -286,6 +286,8 @@ def test_promotion_requires_a_named_reviewer(strategies_dir: Path, reviewer: str
         ({"paper_days": 59}, "paper trading: ran"),
         ({"paper_trades": 29}, "paper trading: 29 trades"),
         ({"deviations": {"total_return": 0.021}}, "parity: total_return"),
+        # Parity is a tolerance on the size of the gap, in either direction.
+        ({"deviations": {"total_return": -0.021}}, "parity: total_return"),
         ({"strategy_file": "other.py"}, "not for"),
         ({"parameters": {**DEFAULTS, "fast": 11}}, "effective_best_parameters"),
     ],
@@ -413,6 +415,19 @@ def test_malformed_ledger_is_experimental(strategies_dir: Path, ledger_text: str
         ledger_text, encoding="utf-8"
     )
     assert not _status(strategies_dir).is_production
+
+
+def test_ledger_with_an_unsupported_version_is_experimental(strategies_dir: Path) -> None:
+    # A complete, valid record is not trusted under a ledger version this reader does not know.
+    promote_strategy_file(strategies_dir)
+    ledger = ledger_path_for(strategies_dir / STRATEGY_NAME / f"{STRATEGY_NAME}.py")
+    data = json.loads(ledger.read_text(encoding="utf-8"))
+    assert _status(strategies_dir).is_production
+    data["version"] = LEDGER_VERSION + 1
+    ledger.write_text(json.dumps(data), encoding="utf-8")
+    status = _status(strategies_dir)
+    assert not status.is_production
+    assert "unsupported version" in status.reason
 
 
 def _rewrite_record(strategies_dir: Path, mutate) -> None:
