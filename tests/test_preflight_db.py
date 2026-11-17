@@ -665,6 +665,34 @@ def test_padded_stored_symbol_is_an_error_not_a_clean_match(isolated_db) -> None
     assert not any("has no symbols" in e for e in report.errors), report.errors
 
 
+def test_padded_stored_signal_source_is_an_error_not_a_clean_match(isolated_db) -> None:
+    """The daemon gates Discord dispatch on ``str(signal_source).lower() == "discord"``, no strip.
+
+    A stored `` discord`` is not Discord to the daemon, so a YAML that says ``discord`` would be
+    silently dead. Stripping it before comparing would call the row clean.
+    """
+    database = isolated_db[0]
+    _seed(database, signal_source="discord")
+    with sqlite3.connect(database.DB_PATH) as connection:
+        connection.execute("UPDATE live_deployments SET signal_source = ' discord'")
+
+    report = run_db_preflight(
+        [
+            LiveDeploymentConfig(
+                strategy_name="equity_momentum",
+                account_id="alpaca-paper",
+                symbols=["AAPL"],
+                timeframe="1h",
+                signal_source="discord",
+                signal_config={"channel_id": _DISCORD_CHANNEL},
+            )
+        ],
+        db_path=_db_path(database),
+    )
+
+    assert any("signal_source" in e and "' discord'" in e for e in report.errors), report.errors
+
+
 def test_non_string_stored_symbols_are_not_manufactured_into_symbols(isolated_db) -> None:
     """A foreign row with [null] is an error naming the item, not the symbol "NONE"."""
     database = isolated_db[0]

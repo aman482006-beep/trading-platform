@@ -159,8 +159,16 @@ def read_active_db_deployments(db_path: Path) -> tuple[list[DbDeploymentRow], se
 
 
 def _signal_source(raw: object) -> str:
-    """The form the daemon compares: lowercase, blank defaulting to ``internal``."""
-    return str(raw or "").strip().lower() or "internal"
+    """The form the daemon compares: ``str(raw or "internal").lower()``, with no strip.
+
+    The daemon does not strip the stored value, so `` discord`` is not Discord to it; stripping
+    here would report such a row as the clean match it is not.
+    """
+    return str(raw or "internal").lower()
+
+
+#: The signal sources the daemon routes on; anything else is a stored value it does not recognise.
+_KNOWN_SIGNAL_SOURCES = frozenset({"internal", "discord"})
 
 
 def _db_row_errors(row: DbDeploymentRow, db_account_ids: set[str]) -> list[str]:
@@ -178,6 +186,12 @@ def _db_row_errors(row: DbDeploymentRow, db_account_ids: set[str]) -> list[str]:
         )
     if not row.timeframe.strip():
         errors.append(f"DB deployment {row.label}: has no timeframe configured.")
+    if _signal_source(row.signal_source) not in _KNOWN_SIGNAL_SOURCES:
+        errors.append(
+            f"DB deployment {row.label}: signal_source {row.signal_source!r} is not 'internal' or "
+            "'discord'; the daemon compares the stored text verbatim, so this row does not route "
+            "as configured. Rewrite the row's signal_source."
+        )
     return errors
 
 

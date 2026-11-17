@@ -207,6 +207,8 @@ The daemon trades the ACTIVE rows of the `live_deployments` table, not the YAML.
   empty;
 - an ACTIVE row with a stored symbol that is padded, blank or not a string (`" AAPL"`, `null`): the
   daemon's Discord signal match compares a stored symbol verbatim, so that symbol never matches;
+- an ACTIVE row whose stored `signal_source` is neither `internal` nor `discord` (case aside, and
+  not blank): the daemon compares it verbatim, so the row does not route as configured;
 - two ACTIVE rows for the same `(strategy_name, account_id)` — the daemon dispatches every ACTIVE
   match, so the same strategy would submit a second order per signal;
 - a `DATABASE_URL` that points at an in-memory database, which no read-only check can inspect;
