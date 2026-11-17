@@ -49,8 +49,13 @@ position_size = risk_amount / (risk_distance * pip_value)
 Dabei ist:
 - `risk_amount = balance * risk_percent`
 - `risk_percent = min(max_risk_per_trade, max_total_exposure - current_exposure)`
-- `position_size = min(position_size, max_notional_per_trade * balance / entry_price)`
-  (Notional-Obergrenze, `max_notional_per_trade` als Bruchteil des Balances, Default 0.20)
+- `position_size = min(position_size, max_notional_per_trade * balance / (entry_price * pip_value))`
+  (Notional-Obergrenze, `max_notional_per_trade` als Bruchteil des Balances, Default 0.20).
+  Das Notional einer Position in Account-Währung ist `position_size * entry_price * pip_value`
+  (#146: ohne `* pip_value` war die Obergrenze für cTrader-FX 1000x zu locker).
+- `pip_value` ist der P&L **einer** `position_size`-Einheit pro Preisbewegung um 1.0, in
+  Account-Währung (nicht pro Pip). Aktien in USD auf einem USD-Konto: 1.0; cTrader EURUSD
+  auf einem USD-Konto: 1000 (eine qty = 0.01 Lot = 1.000 EUR).
 
 ## Einheiten-Contract (Cleanup 20-A)
 
@@ -68,13 +73,62 @@ nur Handels-Deskriptoren liefern (Entry-Price, Stop, Take-Profit, ATR, Timeframe
 Nie aus Metadata gelesen werden: `qty`/`explicit_qty` (Mengen-Override),
 `max_risk_per_trade`, `max_total_exposure`, `max_positions`, `current_positions`,
 `current_exposure`, `pip_value` (#125: ein Payload-Pip-Value skalierte die Menge
-direkt) und `max_entry_deviation_sl_fraction`. Der Pip-Value kommt nur vom
-vertrauten Aufrufer (Config/Broker), sonst gilt der Unit-Contract 1.0.
+direkt) und `max_entry_deviation_sl_fraction`. Der Pip-Value kommt vom Broker
+(`adapter.get_pip_value()`, #146) oder von einem vertrauten Aufrufer; ein implizites
+1.0 gibt es im Live-Pfad nicht mehr.
 Risk-Policy kommt ausschliesslich aus Deployment-/Runtime-Config
 (`RiskConfig`), State (`current_positions`, `current_exposure`) aus dem
 Portfolio-/Broker-Source-of-Truth. Der früher `qty`/`explicit_qty`-Bypass um die
 komplette Risk-Engine ist entfernt; `size_live_signal_for_submission` size't
 jedes Live-Signal durch `RiskEngine`.
+
+## Pip-Value aus dem Broker (#146)
+
+`prepare_order_with_risk()` holt vor dem Sizing `adapter.get_pip_value(symbol)`
+(`LivePipValue`: `value = units_per_qty * conversion_rate`):
+
+- **cTrader:** aus `ProtoOASymbol.lotSize` (in Cent der Basiswährung, EURUSD
+  10.000.000 = 100.000 EUR), also `units_per_qty = lotSize / 100 / 100`, und der
+  Umrechnung der Quote- in die Konto-Währung entlang der Broker-Kette
+  (`ProtoOASymbolsForConversionReq`) mit Live-Quotes. Pro Hop wird die Seite
+  genommen, die den Kurs **höher** macht (Ask beim Multiplizieren, Bid beim
+  Dividieren): ein höherer Pip-Value sized kleiner, der Spread kann den Verlust am
+  SL also nur unter das Budget drücken. Das gilt nur für den Umrechnungs-Quote zum
+  Sizing-Zeitpunkt: Cross-Währungs-Kurse können sich bis zum Stop bewegen, und der
+  Submit prüft nur die Symbol-Skala, nicht den Umrechnungskurs. Das SL-Budget ist
+  daher keine harte Verlustgrenze in Konto-Währung. Ein expliziter `pip_value`-Override
+  (`source="caller"`) trägt keine `units_per_qty`; cTrader verweigert ihn, weil die
+  Skala beim Submit nicht prüfbar wäre. Jede Nutzung des Overrides schreibt eine
+  Warnung ins Log (`Caller-supplied pip_value override in use`), da er den
+  Broker-Lookup samt Frische-Prüfung umgeht.
+  Der cTrader-Volumen-Divisor (`CTRADER_VOLUME_PER_BASE_UNIT = 100`) ist nur auf den
+  Demo-Symbolklassen geprüft, auf denen er verifiziert wurde (EURUSD/FX, XAUUSD,
+  US500); für andere Klassen ist er unverifiziert.
+  Nur ein vom Broker gesendetes `lotSize` zählt;
+  die statische Fallback-Tabelle (in Basis-Einheiten, für FX/XAU 100x unter den
+  Broker-Cent, #184) wird nie fürs Sizing benutzt. Ändert sich die Skala zwischen
+  Sizing und Submit (z. B. Reconnect mit fehlgeschlagenem Props-Fetch), verweigert
+  der Adapter die Order (`pip_value_units_per_qty`).
+- **Alpaca:** 1.0 (Shares/Coins in USD auf einem USD-Konto). Ein Nicht-USD-Konto oder
+  ein nicht in USD quotiertes Paar (`ETH/BTC`, `BTC/USDT`) wird abgelehnt.
+
+Fail closed (Eintrag abgelehnt, Grund im Log `Pip value unavailable`): Adapter ohne
+`get_pip_value`, Fehler oder Timeout (`PIP_VALUE_FETCH_TIMEOUT_SECONDS`), Wert nicht
+endlich und positiv, `value != units_per_qty * conversion_rate`, ein Kurs ungleich 1
+ohne Quotes, oder ein Umrechnungs-Quote, der die Frische-Regel des Entry-Gates
+verletzt (fehlende/ungültige Zeit, Zukunft, älter als `max_entry_quote_age_seconds`).
+Exit-only-Orders brauchen keinen Pip-Value.
+
+Persistiert am Signal: `pip_value`, `pip_value_source`, `pip_value_units_per_qty`,
+`pip_value_conversion_rate`, `pip_value_quote_asset`, `pip_value_account_asset`,
+`pip_value_conversion_symbols`, `pip_value_conversion_quote_times`,
+`pip_value_conversion_quote_ages_seconds`. Payload-Werte unter diesen Namen werden
+immer überschrieben.
+
+Folge der korrigierten Notional-Obergrenze: `RiskConfig` erlaubt
+`max_notional_per_trade <= 1` (keine Hebelwirkung). Auf einem 100-USD-Konto ist
+damit schon 0.01 Lot EURUSD (~1.100 USD Notional) über der Grenze, solche Einträge
+werden abgelehnt (unter `minVolume`).
 
 ## Einheitlicher Level-Resolver (#125)
 
@@ -170,6 +224,15 @@ Order): SL/TP auf der falschen Seite des Entry, SL/TP innerhalb eines Ticks vom 
 fehlende/ungültige SL/TP-Level, Extended-Hours-Brackets und Crypto-Symbole (Alpaca
 kennt keine Bracket-/OTO-Orders für Crypto).
 
+
+## Broker-Raster (cTrader)
+
+cTrader bekommt SL/TP als relative Distanzen in 1/100000 des Preises. Das Raster ist
+`10 ** max(0, 5 - price_digits)` des Symbols. Beide Distanzen werden **zum Entry hin
+abgerundet** (`floor`), damit das tatsächliche Risiko nie über dem gesizten Budget
+liegt: ein Stop von 1,6 Ticks geht als 1 Tick raus. Ein Stop unter einem Tick wird
+abgelehnt (ValueError vor dem Senden), ein Take-Profit unter einem Tick wird als ein
+Tick gesendet (nie 0).
 ## Implizite Divergenz
 
 Der Unterschied bei `enforce_stop_direction` führt dazu, dass:

@@ -25,6 +25,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from live_runner.base_adapter import LivePipValue
 from risk import TradeSignal
 from shared.models import LiveDeploymentConfig, LiveExecution, LiveSignal
 
@@ -281,6 +282,17 @@ class _Adapter:
 
     async def get_balance(self):
         return 100_000.0, 100_000.0
+
+    async def get_pip_value(self, symbol):
+        # Entries fail closed without a broker pip value (#146).
+        return LivePipValue(
+            value=1.0,
+            units_per_qty=1.0,
+            conversion_rate=1.0,
+            quote_asset="USD",
+            account_asset="USD",
+            source="test",
+        )
 
     async def submit_order(self, signal, *, qty=None):
         self.submitted.append((signal, qty))

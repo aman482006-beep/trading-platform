@@ -2925,7 +2925,7 @@ def test_create_rejects_unsupported_trailing_override_with_400(monkeypatch):
         "signal_source": "discord",
         "signal_config": {
             "channel_id": "100000000000000002",
-            "signal_processor_config": {"trailing_mode": "percent"},
+            "signal_processor_config": {"trailing_mode": "supertrend_flip"},
         },
     }
 
@@ -2940,7 +2940,7 @@ def test_create_rejects_unsupported_trailing_override_with_400(monkeypatch):
     response = client.post("/api/live/deployments", json=payload)
     assert response.status_code == 400
     assert "trailing" in response.json()["detail"]
-    assert "percent" in response.json()["detail"]
+    assert "supertrend_flip" in response.json()["detail"]
 
 
 def _store_backtest(database, backtest_id: str, *, stats: dict, equity_curve: list[dict]) -> None:
@@ -3052,6 +3052,8 @@ def test_legacy_curve_with_unreadable_point_fails_closed(isolated_db):
         ("text", "n/a"),
         ("nan", float("nan")),
         ("inf", float("inf")),
+        # Stored JSON, but outside float64 range: float() raises OverflowError.
+        ("overflow", 10**400),
     )
     for backtest_id, bad_equity in bad_points:
         _store_backtest(

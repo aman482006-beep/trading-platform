@@ -3423,6 +3423,23 @@ def _duplicate_portfolio_members() -> list[dict[str, Any]]:
     return members
 
 
+def _current_duplicate_member(
+    load_members: Callable[[], list[dict[str, Any]]], item_id: str
+) -> dict[str, Any] | None:
+    """Return ``item_id``'s member entry from a fresh duplicate-group read.
+
+    Used immediately before each confirmed delete. The confirm loop must not
+    act on the dry-run snapshot: if the other members of a group disappear in
+    between, the id may now be the last surviving entry, and deleting it would
+    destroy the group's only copy. ``None`` means it is no longer a duplicate
+    (or no longer exists).
+    """
+    for member in load_members():
+        if str(member["id"]) == item_id:
+            return member
+    return None
+
+
 def _current_backtest_store_mtime_ns() -> int:
     try:
         return int(BACKTEST_DB_PATH.stat().st_mtime_ns)
@@ -3730,6 +3747,12 @@ def _backtest_summary_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _magnitude_or_none(value: object) -> float | None:
+    """Absolute value of a measured metric; ``None`` when it was not measured."""
+    measured = _optional_float(value)
+    return None if measured is None else abs(measured)
+
+
 def _backtest_all_item_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
     win_rate = _normalize_win_rate(meta.get("win_rate"))
     tags = [
@@ -3749,12 +3772,12 @@ def _backtest_all_item_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
         "strategy_slug": str(meta.get("strategy_name") or "unknown"),
         "symbols": [str(item) for item in meta.get("symbols", []) if str(item).strip()],
         "timeframe": normalize_timeframe(str(meta.get("timeframe") or "")),
-        "total_return": _safe_float(meta.get("total_return"), 0.0),
+        "total_return": _optional_float(meta.get("total_return")),
         "sharpe_ratio": _optional_float(meta.get("sharpe_ratio")),
         "psr": _optional_float(meta.get("psr")),
         "p_value": _optional_float(meta.get("p_value")),
         "cagr": _optional_float(meta.get("cagr")),
-        "max_drawdown": abs(_safe_float(meta.get("max_drawdown"), 0.0)),
+        "max_drawdown": _magnitude_or_none(meta.get("max_drawdown")),
         "trade_count": max(int(meta.get("trade_count", 0) or 0), 0),
         "win_rate": win_rate,
         "start_date": str(meta.get("start_date") or ""),
@@ -9453,8 +9476,11 @@ async def deduplicate_backtests(
     phase 1. Only submitted ids are deleted, and each id is re-checked against
     the criterion first: a member that is no longer in a duplicate group, is
     now the kept newest entry, or no longer exists is reported per item with
-    status ``skipped`` and a ``reason`` and is not deleted. A phase-2 call
-    without ``ids`` deletes nothing and returns HTTP 400.
+    status ``skipped`` and a ``reason`` and is not deleted. If the re-check
+    itself raises, that id is skipped with reason ``recheck_failed`` and the
+    rest of the request continues. ``kept_ids`` is the group snapshot taken
+    when the request starts; the per-item reasons are authoritative. A
+    phase-2 call without ``ids`` deletes nothing and returns HTTP 400.
 
     Deletion is journaled per item, so a failure in the middle leaves earlier
     items deleted; ``items`` reports every item (``deleted`` / ``skipped`` /
@@ -9493,7 +9519,6 @@ async def deduplicate_backtests(
             detail="dry_run=false requires the id list returned by the dry run",
         )
 
-    member_by_id = {str(member["id"]): member for member in members}
     deleted_ids: list[str] = []
     skipped_ids: list[str] = []
     affected_fingerprints: set[str] = set()
@@ -9504,7 +9529,18 @@ async def deduplicate_backtests(
         if not backtest_id or backtest_id in seen:
             continue
         seen.add(backtest_id)
-        member = member_by_id.get(backtest_id)
+        try:
+            member = _current_duplicate_member(_duplicate_backtest_members, backtest_id)
+        except Exception:
+            # Fail closed for this id only: an unreadable re-check keeps it, and
+            # the items already deleted stay reported.
+            logger.exception(
+                "Backtest duplicate re-check failed",
+                extra={"data": {"backtest": _log_safe(backtest_id)}},
+            )
+            items.append(_bulk_delete_skipped_item(backtest_id, "recheck_failed"))
+            skipped_ids.append(backtest_id)
+            continue
         if member is None:
             items.append(_bulk_delete_skipped_item(backtest_id, "no_longer_duplicate"))
             skipped_ids.append(backtest_id)
@@ -12094,8 +12130,11 @@ async def deduplicate_portfolios(
     phase 1. Only submitted ids are deleted, and each id is re-checked against
     the criterion first: a portfolio that is no longer in a duplicate group,
     is now the kept newest entry, or no longer exists is reported per item
-    with status ``skipped`` and a ``reason`` and is not deleted. A phase-2
-    call without ``ids`` deletes nothing and returns HTTP 400.
+    with status ``skipped`` and a ``reason`` and is not deleted. If the
+    re-check itself raises, that id is skipped with reason ``recheck_failed``
+    and the rest of the request continues. ``kept_ids`` is the group snapshot
+    taken when the request starts; the per-item reasons are authoritative. A
+    phase-2 call without ``ids`` deletes nothing and returns HTTP 400.
 
     Deletion is journaled per item, so a failure in the middle leaves earlier
     items deleted; ``items`` reports every item (``deleted`` / ``skipped`` /
@@ -12134,7 +12173,6 @@ async def deduplicate_portfolios(
             detail="dry_run=false requires the id list returned by the dry run",
         )
 
-    member_by_id = {str(member["id"]): member for member in members}
     deleted_ids: list[str] = []
     skipped_ids: list[str] = []
     affected_fingerprints: set[str] = set()
@@ -12145,7 +12183,18 @@ async def deduplicate_portfolios(
         if not portfolio_id or portfolio_id in seen:
             continue
         seen.add(portfolio_id)
-        member = member_by_id.get(portfolio_id)
+        try:
+            member = _current_duplicate_member(_duplicate_portfolio_members, portfolio_id)
+        except Exception:
+            # Fail closed for this id only: an unreadable re-check keeps it, and
+            # the items already deleted stay reported.
+            logger.exception(
+                "Portfolio duplicate re-check failed",
+                extra={"data": {"portfolio": _log_safe(portfolio_id)}},
+            )
+            items.append(_bulk_delete_skipped_item(portfolio_id, "recheck_failed"))
+            skipped_ids.append(portfolio_id)
+            continue
         if member is None:
             items.append(_bulk_delete_skipped_item(portfolio_id, "no_longer_duplicate"))
             skipped_ids.append(portfolio_id)
