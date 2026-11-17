@@ -9,6 +9,8 @@ changed. These tests pin both halves.
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -93,3 +95,76 @@ def test_snapshot_of_an_unchanged_or_missing_tree_is_clean(tmp_path: Path) -> No
     (tmp_path / "f").write_text("a")
     assert diff_snapshots(snapshot_tree(tmp_path), snapshot_tree(tmp_path)) == []
     assert snapshot_tree(tmp_path / "missing") == {}
+
+
+# --- end-to-end: the real pytest process must exit non-zero ----------------------------------
+#
+# The unit test above asserts that ``pytest_sessionfinish`` mutates ``session.exitstatus`` on a fake
+# session. It does not prove pytest honours that mutation, which is what makes a leak fail CI. These
+# run a real pytest process in a throwaway project whose ``tests/conftest.py`` is this file's
+# conftest, so ``PROJECT_ROOT`` (and therefore the guarded ``data/``) is the throwaway tree.
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _run_throwaway_suite(
+    tmp_path: Path, test_source: str, extra_args: tuple[str, ...] = ()
+) -> subprocess.CompletedProcess[str]:
+    project = tmp_path / "project"
+    (project / "tests").mkdir(parents=True)
+    (project / "data").mkdir()
+    (project / "tests" / "conftest.py").write_text(
+        Path(suite_conftest.__file__).read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (project / "tests" / "test_throwaway.py").write_text(test_source, encoding="utf-8")
+    env = {**os.environ, "PYTHONPATH": str(_PROJECT_ROOT)}
+    return subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            *extra_args,
+            "tests/test_throwaway.py",
+        ],
+        cwd=project,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+
+
+@pytest.mark.parametrize("extra_args", [(), ("-n", "2")], ids=["serial", "xdist"])
+def test_real_pytest_process_exits_nonzero_when_a_test_writes_the_repo_data_dir(
+    tmp_path: Path, extra_args: tuple[str, ...]
+) -> None:
+    leak = (
+        "from pathlib import Path\n"
+        "def test_leaks():\n"
+        "    (Path(__file__).resolve().parents[1] / 'data' / 'backtests.db').write_text('x')\n"
+    )
+    result = _run_throwaway_suite(tmp_path, leak, extra_args)
+
+    assert result.returncode == pytest.ExitCode.TESTS_FAILED, result.stdout + result.stderr
+    assert "ERROR: the test session modified the repo data directory" in result.stderr
+    assert "created: backtests.db" in result.stderr
+
+
+@pytest.mark.parametrize("extra_args", [(), ("-n", "2")], ids=["serial", "xdist"])
+def test_real_pytest_process_exits_zero_when_nothing_touches_the_repo_data_dir(
+    tmp_path: Path, extra_args: tuple[str, ...]
+) -> None:
+    clean = (
+        "import os\n"
+        "from pathlib import Path\n"
+        "def test_writes_only_to_the_session_dir():\n"
+        "    (Path(os.environ['DATA_DIR']) / 'ok.txt').write_text('x')\n"
+    )
+    result = _run_throwaway_suite(tmp_path, clean, extra_args)
+
+    assert result.returncode == pytest.ExitCode.OK, result.stdout + result.stderr
+    assert "ERROR: the test session modified" not in result.stderr
