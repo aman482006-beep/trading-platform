@@ -296,7 +296,11 @@ class LiveTrailingStopManager:
                 if trailing_cfg is None:
                     self._trails.pop(key, None)
                     continue
-                assert entry is not None
+                if entry is None:
+                    # _trailing_config returns None without an entry signal, so
+                    # this is unreachable; kept explicit (no assert under -O).
+                    self._trails.pop(key, None)
+                    continue
                 if stops is None:
                     stops = list(await adapter.list_protective_stops())
                 needs_retry |= await self._trail_position(
