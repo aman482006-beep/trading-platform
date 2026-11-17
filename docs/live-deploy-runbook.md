@@ -194,6 +194,44 @@ must still be rotated when an account is retired or reassigned.
 ```bash
 uv sync --all-extras
 uv run python -m live_runner.preflight --config live_deployments.yaml --accounts-env .accounts.env
+```
+
+The daemon trades the ACTIVE rows of the `live_deployments` table, not the YAML. Add `--check-db`
+(read-only; `--db-path` overrides `DATABASE_URL` / `DATA_DIR/backtests.db` and implies
+`--check-db`) to validate those rows too. The JSON result gains `db_deployments` with `matched`, `only_in_db`, `only_in_yaml`,
+`active_count`, `errors` and `warnings`. It fails the preflight (`ok: false`, exit 1) for:
+
+- an ACTIVE DB deployment absent from the YAML (the daemon trades something the YAML preflight
+  never saw);
+- an ACTIVE row whose `account_id` is not in `live_accounts`, or whose symbols or timeframe are
+  empty;
+- an ACTIVE row with a stored symbol that is padded, blank or not a string (`" AAPL"`, `null`): the
+  daemon's Discord signal match compares a stored symbol verbatim, so that symbol never matches;
+- an ACTIVE row whose stored `signal_source` is neither `internal` nor `discord` (case aside, and
+  not blank): the daemon compares it verbatim, so the row does not route as configured;
+- two ACTIVE rows for the same `(strategy_name, account_id)` — the daemon dispatches every ACTIVE
+  match, so the same strategy would submit a second order per signal;
+- a `DATABASE_URL` that points at an in-memory database, which no read-only check can inspect;
+- a missing or unreadable database.
+
+Warnings (the preflight still exits 0): a YAML deployment with no ACTIVE DB row (the daemon will
+not trade it), a YAML deployment listed twice, and any field where the DB value and the YAML
+disagree — `symbols`, `timeframe`, `signal_source` (the flag that routes a deployment's Discord
+signals) and `signal_source_id` (which credential it is dispatched with). Symbols and timeframes are
+normalized on both sides before they are compared, so a case or alias difference (`aapl`, `1H`) is
+not reported as drift. Whitespace around a stored symbol is not normalized away: the row is an error
+above, because the daemon does not match it. The DB value is what runs, so a warning means the daemon is about to trade
+something other than what the YAML says.
+
+The read-only open cannot run WAL recovery. Against a WAL database left needing recovery (after an
+unclean stop) in a directory this process cannot write, the check fails with a message that says
+so; a plain open by any writer checkpoints it.
+
+```bash
+uv run python -m live_runner.preflight --config live_deployments.yaml --accounts-env .accounts.env --check-db
+```
+
+```bash
 # Also connect to every broker account and read balance/positions (still no orders):
 uv run python -m live_runner.preflight --config live_deployments.yaml --accounts-env .accounts.env --check-connectivity
 uv run python scripts/live_smoke.py --mode discord-replay --reports-dir docs/reports

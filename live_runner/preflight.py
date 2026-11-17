@@ -49,6 +49,8 @@ class LivePreflightResult:
     accounts: list[LivePreflightAccountResult]
     deployment_errors: list[str] = field(default_factory=list)
     deployment_warnings: list[str] = field(default_factory=list)
+    #: Read-only check of the ACTIVE DB deployments the daemon trades (None when not requested).
+    db_deployments: dict[str, Any] | None = None
 
 
 def _accounts_env_views(accounts_env: Path) -> tuple[dict[str, str], dict[str, str]]:
@@ -565,6 +567,8 @@ def run_live_preflight(
     accounts_env_path: str | Path = DEFAULT_ACCOUNTS_ENV,
     env: Mapping[str, str] | None = None,
     check_connectivity: bool = False,
+    check_db: bool = False,
+    db_path: str | Path | None = None,
 ) -> LivePreflightResult:
     config = Path(config_path)
     accounts_env = Path(accounts_env_path)
@@ -604,12 +608,27 @@ def run_live_preflight(
             "Live deployment config invalid",
             extra={"data": {"config_path": str(config), "error": message}},
         )
+        db_report: dict[str, Any] | None = None
+        if check_db:
+            # The YAML is unparseable, so there is nothing to diff the ACTIVE rows against.
+            # Report the miss rather than leaving db_deployments None, which has to keep
+            # meaning "not requested": an inspection that never ran is not a clean one.
+            from live_runner.preflight_db import db_check_skipped_report
+
+            db_report = asdict(
+                db_check_skipped_report(
+                    "The deployment config is invalid, so the ACTIVE DB deployments were "
+                    "not checked.",
+                    db_path=db_path,
+                )
+            )
         return LivePreflightResult(
             ok=False,
             config_path=str(config),
             accounts_env_path=str(accounts_env),
             accounts=[],
             deployment_errors=[message],
+            db_deployments=db_report,
         )
     logger.info(
         "Running live preflight",
@@ -635,7 +654,17 @@ def run_live_preflight(
         ]
     deployment_errors, deployment_warnings = _validate_deployments(accounts, deployments)
 
-    ok = all(result.ok for result in account_results) and not deployment_errors
+    db_report: dict[str, Any] | None = None
+    if check_db:
+        from live_runner.preflight_db import run_db_preflight
+
+        db_report = asdict(run_db_preflight(deployments, db_path=db_path))
+
+    ok = (
+        all(result.ok for result in account_results)
+        and not deployment_errors
+        and not (db_report and db_report["errors"])
+    )
     return LivePreflightResult(
         ok=ok,
         config_path=str(config),
@@ -643,6 +672,7 @@ def run_live_preflight(
         accounts=account_results,
         deployment_errors=deployment_errors,
         deployment_warnings=deployment_warnings,
+        db_deployments=db_report,
     )
 
 
@@ -703,7 +733,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="Connect to brokers and read balance/positions without placing orders.",
     )
+    parser.add_argument(
+        "--check-db",
+        action="store_true",
+        help=(
+            "Also validate the ACTIVE deployments in the daemon's database (read-only) and "
+            "report how they differ from the YAML."
+        ),
+    )
+    parser.add_argument(
+        "--db-path",
+        default=None,
+        help=(
+            "SQLite file to check (default: DATABASE_URL or DATA_DIR/backtests.db). Giving it "
+            "implies --check-db."
+        ),
+    )
     args = parser.parse_args(argv)
+    if args.db_path is not None:
+        # A named database is a request to validate it; ignoring the flag would print the same
+        # green document as a run that never looked at the DB.
+        args.check_db = True
 
     # stdout carries exactly one JSON result document; log lines go to stderr.
     route_console_logs_to_stderr()
@@ -712,6 +762,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.config,
             accounts_env_path=args.accounts_env,
             check_connectivity=args.check_connectivity,
+            check_db=args.check_db,
+            db_path=args.db_path,
         )
     except Exception as exc:
         # An unhandled failure (e.g. missing or malformed config) must still honour
@@ -727,12 +779,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             crash_log,
             extra={"data": {"config_path": str(args.config)}},
         )
+        db_report: dict[str, Any] | None = None
+        if args.check_db:
+            # The crash came before the DB was read: a requested check that never ran must say
+            # so, not leave db_deployments null (which means "not requested").
+            from live_runner.preflight_db import db_check_skipped_report
+
+            db_report = asdict(
+                db_check_skipped_report(
+                    "Live preflight crashed before the ACTIVE DB deployments were checked.",
+                    db_path=args.db_path,
+                )
+            )
         result = LivePreflightResult(
             ok=False,
             config_path=str(args.config),
             accounts_env_path=str(args.accounts_env),
             accounts=[],
             deployment_errors=[_crash_message(exc, redact=redact)],
+            db_deployments=db_report,
         )
     print(json.dumps(_result_to_jsonable(result), indent=2, sort_keys=True))
     return 0 if result.ok else 1

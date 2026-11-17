@@ -286,3 +286,39 @@ def pytest_runtest_setup(item: pytest.Item) -> None:
             "Playwright browser binaries not installed. "
             "Run: python -m playwright install firefox"
         )
+
+
+@pytest.fixture(autouse=True)
+def _restore_console_log_streams():
+    """Undo console-stream routing a test triggered (e.g. through a CLI ``main()``).
+
+    ``shared.logging.route_console_logs_to_stderr()`` rebinds the console handlers
+    of every cached logger to the ``sys.stderr`` in effect at the call. Under pytest
+    that is a per-test capture stream which is closed afterwards, so a later test
+    whose CLI reroutes again flushes a closed file (``ValueError: I/O operation on
+    closed file``). Restore the routing global and each console handler's stream
+    without flushing.
+    """
+    from shared import logging as shared_logging
+
+    stream_name = shared_logging._console_stream_name
+    saved = [
+        (handler, handler.stream)
+        for logger in list(shared_logging._loggers.values())
+        for handler in logger.handlers
+        if getattr(handler, "_trading_console", False)
+    ]
+    yield
+    import sys
+
+    shared_logging._console_stream_name = stream_name
+    restored = {id(handler) for handler, _ in saved}
+    for handler, stream in saved:
+        handler.stream = stream
+    # Loggers created during the test may be bound to its (now closed) capture
+    # stream; point them at the real process stream, which never closes.
+    real_stream = getattr(sys, f"__{stream_name}__")
+    for logger in list(shared_logging._loggers.values()):
+        for handler in logger.handlers:
+            if getattr(handler, "_trading_console", False) and id(handler) not in restored:
+                handler.stream = real_stream
