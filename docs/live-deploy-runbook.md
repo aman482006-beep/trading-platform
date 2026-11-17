@@ -64,7 +64,16 @@ byte or one parameter and the code is `experimental` again.
 | Deployment | Hashed file | Bound parameters |
 |---|---|---|
 | Strategy (no `signal_processor`) | `strategies/<strategy_name>/<strategy_name>.py` | `STRATEGY_META["parameters"]` defaults |
-| Signal bot (`signal_config.signal_processor` set) | `signal_bots/<bot>/processor.py` | processor id, `signal_config.signal_processor_config`, SHA256 of the bot's `config.yaml` |
+| Signal bot (`signal_config.signal_processor` set) | `signal_bots/<bot>/processor.py` | processor id, `signal_config.signal_processor_config`, SHA256 of the bot's `config.yaml`, SHA256 of every repository module the processor imports |
+
+A signal bot's import closure is the set of repository modules Python executes to
+load its processor: the modules it imports, the packages those modules live in
+(their `__init__.py` runs on import, and `signal_bots/__init__.py` imports every
+bot), transitively. Standard-library and third-party modules are not bound. A
+change to any bound module makes that bot `experimental` again, including a
+change to another bot's processor or to a shared model. Imports that are not
+static (`importlib`, `__import__`) are not visible to the gate and are a
+reviewer responsibility.
 
 No live code path applies per-deployment strategy parameters, so a strategy is
 promoted with its `STRATEGY_META` defaults: write optimised parameters into the

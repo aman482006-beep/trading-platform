@@ -15,10 +15,15 @@ What is hashed and which parameters are bound
 ---------------------------------------------
 * **Signal-bot deployment** (a ``signal_processor`` is configured): the bot's
   processor module (``signal_bots/<bot>/processor.py``, resolved through
-  :mod:`signal_bots.registry`). Bound parameters are everything that
-  parameterises the processor: the registered processor id (it selects the
-  variant), the deployment's ``signal_processor_config`` overrides, and the
-  SHA256 of the bot's ``config.yaml`` those overrides are merged into.
+  :mod:`signal_bots.registry`) is the promoted file. Every repository module
+  the processor imports, directly or through a package ``__init__`` it
+  executes, is bound as well (see :func:`repository_import_closure`): a bot
+  that imports another bot's processor, or a shared model, trades that code
+  too. Bound parameters are everything that parameterises the processor: the
+  registered processor id (it selects the variant), the deployment's
+  ``signal_processor_config`` overrides, the SHA256 of the bot's
+  ``config.yaml`` those overrides are merged into, and the SHA256 of each
+  imported repository module.
 * **Strategy deployment** (no signal processor): ``strategies/<name>/<name>.py``
   for the deployment's ``strategy_name``. Bound parameters are the file's
   ``STRATEGY_META["parameters"]`` defaults, and only those: no live code path
@@ -36,6 +41,8 @@ an unreadable ``STRATEGY_META``, an unknown processor, a malformed override.
 
 from __future__ import annotations
 
+import ast
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -46,6 +53,8 @@ from shared.models import LiveDeploymentConfig
 from shared.strategy_registry import DEFAULT_STRATEGIES_DIR, load_strategy_meta
 
 SIGNAL_BOTS_ROOT = Path(__file__).resolve().parent.parent / "signal_bots"
+#: Repository root that the import closure of a signal bot is resolved against.
+REPOSITORY_ROOT = SIGNAL_BOTS_ROOT.parent
 STRATEGY_PARAMETERS_KEY = "strategy_parameters"
 
 
@@ -71,6 +80,130 @@ def deployment_signal_processor_name(deployment: LiveDeploymentConfig) -> str:
     return str(
         configured.get("signal_processor") or settings.get("signal_processor") or ""
     ).strip().lower()
+
+
+def _module_file(name: str, repo_root: Path) -> Path | None:
+    """The repository file that defines dotted module ``name``, if there is one."""
+    parts = name.split(".")
+    if not all(parts):
+        return None
+    for candidate in (
+        repo_root.joinpath(*parts).with_suffix(".py"),
+        repo_root.joinpath(*parts, "__init__.py"),
+    ):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _parent_names(dotted: str) -> list[str]:
+    """``a.b.c`` -> ``["a", "a.b", "a.b.c"]``: every package Python executes to load it."""
+    parts = dotted.split(".")
+    return [".".join(parts[: index + 1]) for index in range(len(parts))]
+
+
+#: One import statement: (level, module, imported names, is_from_import).
+_ImportStatement = tuple[int, str, tuple[str, ...], bool]
+#: Parsed import statements keyed by the SHA256 of the source they came from.
+#: Imports depend only on the content, so a changed file is a new key.
+_IMPORTS_BY_DIGEST: dict[str, tuple[_ImportStatement, ...]] = {}
+_IMPORTS_CACHE_LIMIT = 1024
+
+
+def _import_statements(source: bytes, digest: str, filename: str) -> tuple[_ImportStatement, ...]:
+    cached = _IMPORTS_BY_DIGEST.get(digest)
+    if cached is not None:
+        return cached
+    tree = ast.parse(source.decode("utf-8"), filename=filename)
+    statements: list[_ImportStatement] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            statements.append((0, "", tuple(alias.name for alias in node.names), False))
+        elif isinstance(node, ast.ImportFrom):
+            statements.append(
+                (
+                    node.level,
+                    node.module or "",
+                    tuple(alias.name for alias in node.names),
+                    True,
+                )
+            )
+    if len(_IMPORTS_BY_DIGEST) >= _IMPORTS_CACHE_LIMIT:
+        _IMPORTS_BY_DIGEST.clear()
+    result = tuple(statements)
+    _IMPORTS_BY_DIGEST[digest] = result
+    return result
+
+
+def _imported_names(statement: _ImportStatement, *, package: str | None) -> set[str]:
+    """Dotted names one import statement may load. ``package`` is None outside the repo."""
+    level, module, names, is_from = statement
+    if not is_from:
+        return set(names)
+    if level:
+        if package is None:
+            raise PromotionTargetError("a relative import outside the repository cannot be bound")
+        parts = package.split(".") if package else []
+        if level - 1 > len(parts):
+            raise PromotionTargetError("a relative import reaches above the repository root")
+        base_parts = parts[: len(parts) - (level - 1)]
+    else:
+        base_parts = []
+    base = ".".join([*base_parts, *([module] if module else [])])
+    result = {base} if base else set()
+    for name in names:
+        if name != "*":
+            result.add(".".join(part for part in (base, name) if part))
+    return result
+
+
+def repository_import_closure(start: Path, *, repo_root: Path | None = None) -> dict[str, str]:
+    """SHA256 of every repository module that importing ``start`` executes.
+
+    Walks the static ``import`` / ``from ... import`` statements of ``start``
+    and of each repository module it reaches. A dotted name binds every file
+    Python would execute to load it: the module itself and each parent package
+    ``__init__.py``. Only files under ``repo_root`` are returned, keyed by their
+    POSIX path relative to it. ``start`` itself is not included: the promoted
+    file is bound by its own SHA256. Standard-library and third-party names
+    resolve to nothing under the repository and are skipped.
+
+    Dynamic imports (``importlib``, ``__import__``) are not visible to this walk.
+    """
+    root = (repo_root or REPOSITORY_ROOT).resolve()
+    start_resolved = start.resolve()
+    seen: set[Path] = {start_resolved}
+    todo: list[Path] = [start_resolved]
+    found: dict[str, str] = {}
+    resolved_names: dict[str, Path | None] = {}
+    while todo:
+        current = todo.pop()
+        try:
+            source = current.read_bytes()
+            statements = _import_statements(
+                source, hashlib.sha256(source).hexdigest(), str(current)
+            )
+        except (OSError, UnicodeError, SyntaxError) as exc:
+            raise PromotionTargetError(
+                f"imports of {current.name} cannot be read for promotion: {exc}"
+            ) from exc
+        package: str | None = None
+        if current.is_relative_to(root):
+            # The package a module's relative imports resolve against.
+            package = ".".join(current.relative_to(root).parent.parts)
+        for statement in statements:
+            for name in _imported_names(statement, package=package):
+                for dotted in _parent_names(name):
+                    if dotted not in resolved_names:
+                        module = _module_file(dotted, root)
+                        resolved_names[dotted] = module.resolve() if module else None
+                    resolved = resolved_names[dotted]
+                    if resolved is None or resolved in seen:
+                        continue
+                    seen.add(resolved)
+                    todo.append(resolved)
+                    found[resolved.relative_to(root).as_posix()] = _sha256_of(resolved)
+    return dict(sorted(found.items()))
 
 
 def signal_bot_target(
@@ -104,6 +237,7 @@ def signal_bot_target(
             "signal_processor": name,
             "signal_processor_config": dict(processor_config or {}),
             "bot_config_sha256": config_sha256,
+            "imported_modules_sha256": repository_import_closure(module_path),
         },
     )
 

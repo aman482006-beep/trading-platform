@@ -178,6 +178,8 @@ def bots_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
     root = make_signal_bots_root(tmp_path / "signal_bots")
     monkeypatch.setattr(registry, "_ROOT", root)
+    # The throwaway bot tree sits in a throwaway repository: imports resolve there.
+    monkeypatch.setattr(live_promotion, "REPOSITORY_ROOT", tmp_path)
     return root
 
 
@@ -651,6 +653,47 @@ def test_signal_bot_is_bound_to_processor_file_and_processor_config(bots_root: P
     processor.write_bytes(processor.read_bytes() + b"#")
     with pytest.raises(StrategyNotPromotedError, match="changed"):
         enforce_promotion_gate(ramjet_deployment({"min_rr": 2.0}), real_money=True)
+
+
+def test_editing_a_module_the_processor_imports_makes_the_bot_experimental(
+    bots_root: Path,
+) -> None:
+    """The bot trades the code it imports: a changed import is a changed promotion (#165)."""
+    shared = bots_root.parent / "shared"
+    shared.mkdir()
+    (shared / "__init__.py").write_text("", encoding="utf-8")
+    (shared / "helper.py").write_text("LIMIT = 1\n", encoding="utf-8")
+    processor = bots_root / "ramjet" / "processor.py"
+    processor.write_text(
+        "from shared.helper import LIMIT\n\nclass RamJetSignalProcessor:\n    pass\n",
+        encoding="utf-8",
+    )
+    target = deployment_promotion_target(ramjet_deployment())
+    assert set(target.parameters["imported_modules_sha256"]) == {
+        "shared/__init__.py",
+        "shared/helper.py",
+    }
+    promote(
+        target.path,
+        kind=target.kind,
+        parameters=target.parameters,
+        evidence=good_evidence(strategy_file="ramjet_strategy.py"),
+        promoted_by="Fred",
+        root=target.root,
+    )
+    enforce_promotion_gate(ramjet_deployment(), real_money=True)
+
+    (shared / "helper.py").write_text("LIMIT = 2\n", encoding="utf-8")
+    with pytest.raises(StrategyNotPromotedError, match="parameter set differs"):
+        enforce_promotion_gate(ramjet_deployment(), real_money=True)
+
+
+def test_nitro_is_bound_to_the_ramjet_processor_it_imports() -> None:
+    """Nitro imports ramjet's processor, so a ramjet edit must not leave nitro promoted."""
+    from live_runner.promotion import signal_bot_target
+
+    nitro = signal_bot_target("nitro")
+    assert "signal_bots/ramjet/processor.py" in nitro.parameters["imported_modules_sha256"]
 
 
 def test_signal_bot_variants_sharing_a_module_are_promoted_separately(bots_root: Path) -> None:
