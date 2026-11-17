@@ -1157,10 +1157,20 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         metadata = dict(signal.metadata or {})
         if str(metadata.get("risk_sizing_mode") or "") == EXIT_ONLY_RISK_SIZING_MODE:
             return signal, qty
-        if classify_alpaca_symbol(signal.symbol) == "crypto":
+        kind = classify_alpaca_symbol(signal.symbol)
+        if kind == "crypto":
             raise ValueError(
                 f"Alpaca does not support bracket/OTO orders for crypto ({signal.symbol}); "
                 f"refusing to submit before persistence (signal_id={signal.id})."
+            )
+        if kind != "us_equity":
+            # Fail closed: an unclassifiable symbol (a pair outside CRYPTO_QUOTES such as
+            # BTC-EUR, an option, a malformed symbol) could be a crypto/non-equity that Alpaca
+            # rejects only after the row is persisted (B-8).
+            raise ValueError(
+                f"Cannot verify {signal.symbol} is a US equity; Alpaca bracket/OTO orders are "
+                f"only supported for US equities, refusing to submit before persistence "
+                f"(signal_id={signal.id})."
             )
         if metadata.get("extended_hours"):
             raise ValueError(

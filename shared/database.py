@@ -1842,8 +1842,8 @@ def _make_live_executions_commission_nullable(connection: Connection) -> bool:
     the ``signal_id`` foreign key), copy, drop, rename, restore the indexes.
 
     The data step runs only together with the rebuild, so it happens once. It turns ``0.0`` into
-    NULL on every Alpaca row whose zero is not a provable known zero: crypto in either spelling
-    (``BTC/USD``, ``BTCUSD``), an orphan whose signal, deployment or account row is missing (its
+    NULL on every Alpaca row whose zero is not a provable known zero: crypto in any accepted spelling
+    (``BTC/USD``, ``BTC-USD``, ``BTCUSD``), an orphan whose signal, deployment or account row is missing (its
     broker is unknowable), and any symbol `shared.alpaca_symbols` cannot classify as an equity
     (an option, a malformed symbol) - fail closed. Before #124 both Alpaca paths hard-coded
     ``0.0`` - alpaca-py has no commission field - while crypto fills do carry a fee. Alpaca equity zeros are a known zero and

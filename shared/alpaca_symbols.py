@@ -43,7 +43,7 @@ def _normalize(symbol: Any) -> str:
 
 
 def split_crypto_pair(symbol: Any) -> tuple[str, str] | None:
-    """``(base, quote)`` for a crypto pair in either spelling, else ``None``."""
+    """``(base, quote)`` for a crypto pair in any accepted spelling, else ``None``."""
     text = _normalize(symbol)
     if "/" in text:
         parts = text.split("/")
