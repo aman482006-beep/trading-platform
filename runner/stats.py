@@ -343,11 +343,21 @@ def _truncate_at_ruin(
     A non-finite equity (NaN/inf) also counts as ruin and fails closed: it is
     not a tradeable account, and silently skipping it would let a corrupt
     curve publish measured-looking ratios and pass the live-deployment gate.
+    An unreadable equity (``None``, text) is treated the same way: legacy
+    artifacts store the raw value and must not crash the stats path.
     The test is ``not (equity > 0)``, which is true for NaN as well.
     """
     ordered = _equity_curve_in_time_order(equity_curve)
     for index, point in enumerate(ordered):
-        equity = float(point.equity)
+        try:
+            equity = float(point.equity)
+        except (TypeError, ValueError):
+            # Unreadable (None, text, empty): fail closed as ruin, never crash.
+            # Normalise the stored value to NaN so every downstream reader sees
+            # the same non-finite point a NaN curve would give.
+            truncated = ordered[: index + 1]
+            truncated[-1] = EquityPoint(time=point.time, equity=math.nan)
+            return truncated, True, point.time
         if not (math.isfinite(equity) and equity > 0):
             return ordered[: index + 1], True, point.time
     # Not ruined: hand back the curve exactly as given so a healthy run's

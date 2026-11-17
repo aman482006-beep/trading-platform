@@ -156,3 +156,21 @@ def test_degenerate_curves_name_return_and_drawdown_as_undefined() -> None:
 
         for metric in ("total_return", "max_drawdown_pct"):
             assert metric in stats["undefined_metrics"], (metric, equities)
+
+
+@pytest.mark.parametrize("bad", [None, "n/a", ""], ids=["none", "text", "empty"])
+def test_unreadable_equity_point_is_ruin_not_a_crash(quantstats_flag, bad) -> None:
+    """A legacy artifact with an unreadable equity point counts as ruined (fail closed).
+
+    `EquityPoint.from_dict` passes stored equity through uncoerced, so a
+    corrupt or legacy artifact can carry `None` or text. That must not raise.
+    """
+    curve = _curve(PRE_RUIN + [120_000.0])
+    curve[len(PRE_RUIN)] = EquityPoint(time=curve[len(PRE_RUIN)].time, equity=bad)
+    stats = compute_stats([], initial_capital=100_000.0, equity_curve=curve)
+
+    assert stats["ruined"] is True
+    assert stats["ruin_time"] == curve[len(PRE_RUIN)].time
+    for metric in RETURN_METRICS + ("cagr", "calmar_ratio"):
+        assert stats[metric] is None, metric
+        assert metric in stats["undefined_metrics"], metric
