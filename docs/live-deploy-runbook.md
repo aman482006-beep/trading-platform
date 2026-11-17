@@ -252,6 +252,11 @@ The gate sits in the daemon, the preflight and the viewer. The operator tools
 `live_runner/test_signal_trigger.py --live` and `scripts/live_smoke.py` do not
 go through it: they are explicit, human-driven commands and bypass the gate.
 
+A signal bot's binding covers every repository module its processor imports, which includes
+the adapters, `risk/` and `shared/`. Any change to those files invalidates every signal-bot
+promotion, so re-promote after such a change before trading real money. A module that resolves
+outside the repository (e.g. a symlink) is refused.
+
 The ledger is `<file>.promoted.json` next to the hashed file (for example
 `strategies/foo/foo.py.promoted.json`) and must be committed: the promotion is
 only in force where the ledger is. It follows `runner/approval_gate.py` and

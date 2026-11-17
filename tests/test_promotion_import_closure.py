@@ -107,3 +107,17 @@ def test_ramjet_closure_contains_its_package_inits() -> None:
     closure = repository_import_closure(get_signal_processor_module_path("ramjet"))
     assert "signal_bots/__init__.py" in closure
     assert "signal_bots/ramjet/__init__.py" in closure
+
+
+def test_a_module_symlinked_outside_the_repository_is_refused(tmp_path: Path) -> None:
+    """An imported module that resolves outside the repo cannot be bound: refuse, fail closed."""
+    repo = tmp_path / "repo"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "leaf.py").write_text("VALUE = 1\n", encoding="utf-8")
+    start = _write(repo, "pkg_a/processor.py", "from pkg_c.leaf import VALUE\n")
+    _write(repo, "pkg_c/__init__.py")
+    (repo / "pkg_c" / "leaf.py").symlink_to(outside / "leaf.py")
+
+    with pytest.raises(PromotionTargetError, match="outside the repository"):
+        repository_import_closure(start, repo_root=repo)

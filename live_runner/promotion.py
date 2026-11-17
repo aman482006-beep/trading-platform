@@ -187,7 +187,7 @@ def repository_import_closure(start: Path, *, repo_root: Path | None = None) -> 
                 resolved = init.resolve()
                 seen.add(resolved)
                 todo.append(resolved)
-                found[resolved.relative_to(root).as_posix()] = _sha256_of(resolved)
+                found[_repository_key(resolved, root)] = _sha256_of(resolved)
     while todo:
         current = todo.pop()
         try:
@@ -214,8 +214,22 @@ def repository_import_closure(start: Path, *, repo_root: Path | None = None) -> 
                         continue
                     seen.add(resolved)
                     todo.append(resolved)
-                    found[resolved.relative_to(root).as_posix()] = _sha256_of(resolved)
+                    found[_repository_key(resolved, root)] = _sha256_of(resolved)
     return dict(sorted(found.items()))
+
+
+def _repository_key(resolved: Path, root: Path) -> str:
+    """POSIX path of ``resolved`` relative to the repository, or refuse the promotion.
+
+    A module that resolves outside the repository (e.g. a symlink to an external file)
+    cannot be bound by the repository's hashes, so it is refused like any other
+    unpromotable target instead of escaping as a bare ``ValueError``.
+    """
+    if not resolved.is_relative_to(root):
+        raise PromotionTargetError(
+            f"{resolved} resolves outside the repository and cannot be bound for promotion"
+        )
+    return resolved.relative_to(root).as_posix()
 
 
 def signal_bot_target(
