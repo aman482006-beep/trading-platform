@@ -151,3 +151,39 @@ def test_bounds_that_cross_within_tolerance_raise() -> None:
         solve_risk_parity_weights(
             cov, min_weight=0.5 + 1e-13, max_weight=0.5 - 1e-13
         )
+
+
+@pytest.mark.parametrize(
+    ("min_weight", "max_weight"),
+    [
+        (0.0, float("nan")),
+        (float("nan"), 0.6),
+        (0.0, float("inf")),
+        (float("-inf"), 0.6),
+    ],
+)
+def test_non_finite_bounds_are_refused_not_clamped(min_weight: float, max_weight: float) -> None:
+    """A NaN cap must not become "no cap" (max(0.0, nan) -> 0.0, min(1.0, nan) -> 1.0).
+
+    Fail closed with a clear error instead of solving with silently rewritten bounds.
+    """
+    cov = np.eye(3) * 0.01
+
+    with pytest.raises(ValueError, match="finite"):
+        solve_risk_parity_weights(cov, min_weight=min_weight, max_weight=max_weight)
+
+
+def test_non_finite_covariance_is_refused() -> None:
+    cov = np.eye(3) * 0.01
+    cov[1, 1] = np.nan
+
+    with pytest.raises(ValueError, match="finite"):
+        solve_risk_parity_weights(cov, min_weight=0.0, max_weight=0.6)
+
+
+def test_projection_refuses_non_finite_weights() -> None:
+    """Bisection on NaN never converges: the projection must refuse, not return NaN."""
+    values = np.array([0.5, np.nan, 0.5])
+
+    with pytest.raises(ValueError, match="finite"):
+        _project_to_capped_simplex(values, lower=0.0, upper=1.0)

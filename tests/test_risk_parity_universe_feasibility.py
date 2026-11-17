@@ -170,3 +170,25 @@ def test_backtest_script_clamps_bounds_before_the_solver(monkeypatch) -> None:
     assert projections == [(0.0, 1.0)]
     assert sum(weights.values()) == pytest.approx(1.0)
     assert all(0.0 <= weight <= 1.0 for weight in weights.values())
+
+
+def test_backtest_script_fallback_refuses_zero_volatility(monkeypatch) -> None:
+    """Zero variance + solver failure: 1.0 / 0 = inf, inf / inf = NaN weights.
+
+    The script must refuse with a clear error instead of returning NaN weights
+    that do not sum to 1.
+    """
+    from types import SimpleNamespace
+
+    import numpy as np
+    import pytest
+
+    import scripts.run_risk_parity_backtest as script
+
+    monkeypatch.setattr(
+        script, "minimize", lambda *_a, **_k: SimpleNamespace(success=False, x=None)
+    )
+    cov = np.diag([0.0, 1.0, 1.0])
+
+    with pytest.raises(ValueError, match="volatility"):
+        script.calculate_risk_parity_weights(cov, 0.0, 0.6, ["A", "B", "C"])
