@@ -7860,7 +7860,12 @@ def test_deduplicate_backtests_confirm_rechecks_each_id_before_delete(
             alive.discard("backtest-a")
         alive.discard(backtest_id)
         deleted.append(backtest_id)
-        return {"id": backtest_id, "status": "deleted", "database": "deleted", "artifact": "deleted"}
+        return {
+            "id": backtest_id,
+            "status": "deleted",
+            "database": "deleted",
+            "artifact": "deleted",
+        }
 
     monkeypatch.setattr(viewer_app_module, "_delete_backtest_with_artifacts", fake_delete)
 
