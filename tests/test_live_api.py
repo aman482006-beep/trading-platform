@@ -3022,6 +3022,8 @@ def test_legacy_curve_with_unreadable_point_fails_closed(isolated_db):
         ("text", "n/a"),
         ("nan", float("nan")),
         ("inf", float("inf")),
+        # Stored JSON, but outside float64 range: float() raises OverflowError.
+        ("overflow", 10**400),
     )
     for backtest_id, bad_equity in bad_points:
         _store_backtest(
