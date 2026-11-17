@@ -82,6 +82,7 @@ from live_runner.ctrader_deployment import build_ctrader_deployment_plan
 from live_runner.promotion import enforce_promotion_gate, is_real_money
 from live_runner.stockkit_routing import validate_stockkit_deployment_route
 from risk.config import RiskConfig
+from risk.live import entry_gate_settings
 from runner.agent_process import build_backtest_child_env
 from runner.engines.signal_replay_adapter import ReplaySignal, SignalReplayAdapter
 from runner.grid_identity import data_staleness_reason, read_identity
@@ -13479,9 +13480,11 @@ async def create_live_deployment_endpoint(
             signal_config=signal_config_payload,
             settings=payload.settings or {},
         )
+        # #125: refuse invalid entry-gate settings before anything is stored.
+        entry_gate_settings(deployment.settings)
     except ValueError as exc:
-        # Model-level config rejections (e.g. #150 trailing override) are
-        # client errors, not a 500.
+        # Model-level config rejections (e.g. #150 trailing override) and
+        # invalid gate settings are client errors, not a 500.
         raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
     _validate_live_deployment_route(deployment, account_payload)
     # Promotion gate (#165). A deployment is created ACTIVE, so this is a
