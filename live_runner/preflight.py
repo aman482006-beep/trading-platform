@@ -143,6 +143,8 @@ def _release_twisted_reactor_threads() -> None:
     the reactor's shutdown event. Without this, a preflight that connected to
     cTrader printed its result and then hung forever in interpreter shutdown.
     """
+    # ``installReactor`` stores the reactor instance under this key, so membership
+    # means "a reactor was installed"; importing it here cannot install a new one.
     if "twisted.internet.reactor" not in sys.modules:
         return
     from twisted.internet import reactor
@@ -154,6 +156,11 @@ def _release_twisted_reactor_threads() -> None:
         # The reactor's own shutdown-trigger handler: removes its triggers and
         # joins the workers. Shutdown never fires here, so it is called directly.
         stop_thread_pool()
+    else:
+        logger.warning(
+            "Twisted reactor has a thread pool but no _stopThreadPool handler; "
+            "the process may hang at exit. The Twisted private API likely changed."
+        )
 
 
 @contextlib.contextmanager
@@ -172,8 +179,13 @@ def _connectivity_event_loop(enabled: bool) -> Iterator[asyncio.AbstractEventLoo
     try:
         yield loop
     finally:
-        with contextlib.suppress(Exception):
+        try:
             _release_twisted_reactor_threads()
+        except Exception:
+            logger.warning(
+                "Releasing Twisted reactor threads failed; the process may hang at exit",
+                exc_info=True,
+            )
         with contextlib.suppress(Exception):
             loop.run_until_complete(loop.shutdown_asyncgens())
         loop.close()
@@ -184,6 +196,7 @@ def _run_broker_connectivity_check(
     *,
     broker_label: str,
     errors: list[str],
+    env_values: Mapping[str, str],
     loop: asyncio.AbstractEventLoop | None = None,
 ) -> tuple[bool, float | None, float | None, int | None]:
     connected = False
@@ -209,7 +222,13 @@ def _run_broker_connectivity_check(
         else:
             balance, equity, positions_count = loop.run_until_complete(_check())
     except Exception as exc:
-        errors.append(f"{broker_label} connectivity check failed: {type(exc).__name__}: {exc}")
+        # Broker error text can quote credential values; redact like every other path.
+        errors.append(
+            _redact_values(
+                f"{broker_label} connectivity check failed: {type(exc).__name__}: {exc}",
+                env_values,
+            )
+        )
     return connected, balance, equity, positions_count
 
 
@@ -252,6 +271,7 @@ def _preflight_alpaca_account(
                 adapter,
                 broker_label="Alpaca",
                 errors=errors,
+                env_values=env_values,
                 loop=loop,
             )
     return paper, connected, balance, equity, positions_count
@@ -338,6 +358,7 @@ def _preflight_ctrader_account(
             adapter,
             broker_label="cTrader",
             errors=errors,
+            env_values=env_values,
             loop=loop,
         )
     return demo, connected, balance, equity, positions_count

@@ -511,6 +511,133 @@ def test_release_twisted_reactor_threads_is_a_noop_without_a_reactor(monkeypatch
     preflight._release_twisted_reactor_threads()
 
 
+def test_connectivity_loop_shuts_down_pending_async_generators(tmp_path: Path, monkeypatch) -> None:
+    """An adapter that leaks a suspended async generator must have it closed."""
+    config_path = _write_config(tmp_path / "live_deployments.yaml", _TWO_CTRADER_ACCOUNTS)
+    closed: list[bool] = []
+
+    async def _leaky():
+        try:
+            yield 1
+            yield 2
+        finally:
+            closed.append(True)
+
+    class _LeakyAdapter:
+        def __init__(self, **kwargs):
+            self._gen = None
+
+        async def connect(self):
+            self._gen = _leaky()
+            await self._gen.__anext__()  # left suspended, never exhausted
+
+        async def get_balance(self):
+            return 100.0, 100.0
+
+        async def get_positions(self):
+            return []
+
+        async def disconnect(self):
+            return None
+
+    from live_runner import preflight
+
+    monkeypatch.setattr(preflight, "CTraderLiveAdapter", _LeakyAdapter)
+    result = run_live_preflight(config_path, env=_CTRADER_ENV, check_connectivity=True)
+    assert result.ok is True
+    assert closed == [True, True]
+
+
+def test_connectivity_loop_warns_when_thread_release_fails(
+    tmp_path: Path, monkeypatch, caplog
+) -> None:
+    config_path = _write_config(tmp_path / "live_deployments.yaml", _TWO_CTRADER_ACCOUNTS)
+
+    class _Adapter:
+        def __init__(self, **kwargs):
+            pass
+
+        async def connect(self):
+            return None
+
+        async def get_balance(self):
+            return 100.0, 100.0
+
+        async def get_positions(self):
+            return []
+
+        async def disconnect(self):
+            return None
+
+    from live_runner import preflight
+
+    def _boom():
+        raise RuntimeError("release exploded")
+
+    monkeypatch.setattr(preflight, "CTraderLiveAdapter", _Adapter)
+    monkeypatch.setattr(preflight, "_release_twisted_reactor_threads", _boom)
+    monkeypatch.setattr(preflight.logger, "propagate", True)
+    with caplog.at_level("WARNING"):
+        result = run_live_preflight(config_path, env=_CTRADER_ENV, check_connectivity=True)
+    assert result.ok is True
+    assert any("release exploded" in (r.getMessage() + str(r.exc_info)) for r in caplog.records)
+
+
+def test_release_twisted_reactor_threads_warns_when_handler_missing(monkeypatch, caplog) -> None:
+    import sys
+    import types
+
+    from live_runner import preflight
+
+    class _Reactor:
+        threadpool = object()
+
+    fake_internet = types.ModuleType("twisted.internet")
+    fake_internet.reactor = _Reactor()
+    fake_twisted = types.ModuleType("twisted")
+    fake_twisted.internet = fake_internet
+    monkeypatch.setitem(sys.modules, "twisted", fake_twisted)
+    monkeypatch.setitem(sys.modules, "twisted.internet", fake_internet)
+    monkeypatch.setitem(sys.modules, "twisted.internet.reactor", fake_internet.reactor)
+    monkeypatch.setattr(preflight.logger, "propagate", True)
+    with caplog.at_level("WARNING"):
+        preflight._release_twisted_reactor_threads()
+    assert any("thread pool" in r.getMessage() for r in caplog.records)
+
+
+def test_connectivity_error_text_redacts_credential_values(tmp_path: Path, monkeypatch) -> None:
+    config_path = _write_config(
+        tmp_path / "live_deployments.yaml",
+        """
+        accounts:
+          - id: "10105152"
+            broker: ctrader
+
+        deployments: []
+        """,
+    )
+    secret_token = "super-secret-access-token-123"
+
+    class _Adapter:
+        def __init__(self, **kwargs):
+            pass
+
+        async def connect(self):
+            raise RuntimeError(f"auth rejected for token {secret_token}")
+
+        async def disconnect(self):
+            return None
+
+    from live_runner import preflight
+
+    monkeypatch.setattr(preflight, "CTraderLiveAdapter", _Adapter)
+    env = {**_CTRADER_ENV, "CTRADER_ACCESS_TOKEN": secret_token}
+    result = run_live_preflight(config_path, env=env, check_connectivity=True)
+    errors = " ".join(result.accounts[0].errors)
+    assert "cTrader connectivity check failed" in errors
+    assert secret_token not in errors
+
+
 # ─── ${VAR} expansion honours --accounts-env (#184 finding 6) ───────────────────
 
 
