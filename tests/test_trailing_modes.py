@@ -239,10 +239,11 @@ def test_repointing_a_percent_deployment_to_a_broker_without_support_is_refused(
         )
     )
 
+    deployment_id = str(deployment.id)
     with pytest.raises(ValueError, match="'percent' is not supported"):
-        database.update_live_deployment_account(str(deployment.id), "acct-ctrader")
+        database.update_live_deployment_account(deployment_id, "acct-ctrader")
 
-    assert database.get_live_deployment(str(deployment.id)).account_id == "acct-alpaca"
+    assert database.get_live_deployment(deployment_id).account_id == "acct-alpaca"
 
 
 @pytest.mark.parametrize(
@@ -470,8 +471,9 @@ def test_order_preparation_refuses_trailing_the_adapter_cannot_execute(
     monkeypatch.setattr(daemon, "_broker_exposure_estimate", _exposure)
     signal = _live_signal({"trailing_sl_config": trailing_cfg, "stop_loss": 95.0})
     deployment = _deployment()
+    preparation = daemon.prepare_order_with_risk(adapter, deployment, signal)
     with pytest.raises(ValueError, match="not supported"):
-        asyncio.run(daemon.prepare_order_with_risk(adapter, deployment, signal))
+        asyncio.run(preparation)
 
 
 def test_order_preparation_lets_percent_through_on_a_trailing_adapter(monkeypatch) -> None:
@@ -486,8 +488,9 @@ def test_order_preparation_lets_percent_through_on_a_trailing_adapter(monkeypatc
         {"trailing_sl_config": {"mode": "percent", "percent": 0.02}, "stop_loss": 95.0}
     )
     deployment = _deployment()
+    preparation = daemon.prepare_order_with_risk(_ALPACA_LIKE, deployment, signal)
     with pytest.raises(RuntimeError, match="stop after the gate"):
-        asyncio.run(daemon.prepare_order_with_risk(_ALPACA_LIKE, deployment, signal))
+        asyncio.run(preparation)
     assert reached.sizing
 
 # ── stored rows: a bad row must not break listing ────────────────────────────
@@ -658,8 +661,9 @@ def test_order_preparation_refuses_a_percent_entry_on_an_untrailable_timeframe(
     )
     deployment = _deployment()
     deployment.timeframe = timeframe
+    preparation = daemon.prepare_order_with_risk(_ALPACA_SERVING, deployment, signal)
     with pytest.raises(ValueError, match="cannot be executed live on timeframe"):
-        asyncio.run(daemon.prepare_order_with_risk(_ALPACA_SERVING, deployment, signal))
+        asyncio.run(preparation)
 
 
 # ── #168: a complete supertrend_flip config is still refused live ────────────
@@ -701,8 +705,9 @@ def test_order_preparation_refuses_a_complete_supertrend_flip_config(
         }
     )
     deployment = _deployment()
+    preparation = daemon.prepare_order_with_risk(adapter, deployment, signal)
     with pytest.raises(ValueError, match="'supertrend_flip' is not supported"):
-        asyncio.run(daemon.prepare_order_with_risk(adapter, deployment, signal))
+        asyncio.run(preparation)
 
 
 @pytest.mark.parametrize("broker", ["alpaca", "ctrader", None, "ibkr"])
