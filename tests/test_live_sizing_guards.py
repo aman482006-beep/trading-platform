@@ -46,6 +46,9 @@ def _signal(deployment: LiveDeploymentConfig, metadata: dict) -> LiveSignal:
 
 
 class _Adapter:
+    # Provably demo: the promotion gate (#165) must pass through to the logic under test.
+    demo = True
+
     def __init__(self, quote=None) -> None:
         self.quote = quote or LiveQuote(
             bid=100.0, ask=100.0, timestamp=datetime.now(timezone.utc)

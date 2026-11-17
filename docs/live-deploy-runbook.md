@@ -173,6 +173,137 @@ clean-up.
   `orders-still-working ... NO-STOP-RESTORED` (the sweep lists open orders only); the leg was
   cancelled by Alpaca's OCO handling and the position was closable afterwards. Tracked separately.
 
+## Strategy Promotion Gate (#165)
+
+Only code a named human reviewer promoted to `production` may trade on a
+**real-money** account. Paper/demo accounts run `experimental` code without
+promotion. There are only these two stages.
+
+### Relation to the demo-only block
+
+The platform already hard-blocks real money: the daemon refuses any broker
+adapter that is not provably demo/paper (`_adapter_is_demo`, "refusing
+continued use"), and the viewer refuses to activate a deployment unless the
+broker reports a demo account. **That block stays.** The promotion gate is an
+additional layer under it, not a replacement. Today a promoted strategy on a
+real-money account therefore still cannot trade: preflight passes the gate,
+but the daemon will not keep a non-demo adapter. The viewer's activate path
+re-verifies the account against broker discovery and will not arm the
+deployment. The cTrader top-N deploy with `activate` is different: it creates
+the deployments `ACTIVE` directly, without that re-verification, on any account
+the gate passes. Only the daemon's demo-only block stops their orders. Refusing
+`activate` on a non-demo account there is a maintainer decision, not yet made.
+Lifting the demo-only block is a separate, deliberate step.
+
+### Required evidence and thresholds
+
+| Evidence | Requirement | Default |
+|---|---|---|
+| Out of sample | Optimization result (#164) with `three_way.overfitting.passed == true`; untouched test segment length and trade count | ≥ 180 days, ≥ 50 trades |
+| Paper trading | Paper/demo run duration and trade count, with a report file | ≥ 60 days, ≥ 30 trades |
+| Parity | Cross-engine or reference parity: relative deviation of every compared metric | ≤ 2 % |
+
+No max-drawdown bound. Defaults live in
+`runner.promotion_gate.PromotionThresholds`; override them with a
+`promotion_thresholds.json` at the repository root (keys
+`min_test_segment_days`, `min_test_trade_count`, `min_paper_trading_days`,
+`min_paper_trade_count`, `max_parity_deviation`). An unknown key or a malformed
+file makes nothing `production`. The thresholds in force are applied when a
+promotion is recorded **and** every time it is checked, so raising a
+threshold demotes promotions that no longer meet it.
+
+For a strategy, the out-of-sample result must be for the same strategy file
+name, and its `effective_best_parameters` must equal the bound parameter set.
+A signal bot's processor is not what the optimizer runs, so for a bot only the
+verdict, window and trade count are checked; name the result that backs the
+bot's logic.
+
+### What a promotion is bound to
+
+A promotion is bound to the SHA256 of one file **and** the SHA256 of a
+canonical parameter set (JSON, sorted keys, `10` and `10.0` equal). Change one
+byte or one parameter and the code is `experimental` again.
+
+| Deployment | Hashed file | Bound parameters |
+|---|---|---|
+| Internal strategy (no `signal_processor`) | `strategies/<strategy_name>/<strategy_name>.py` | `STRATEGY_META["parameters"]` defaults |
+| Signal bot (`signal_config.signal_processor` set) | `signal_bots/<bot>/processor.py` | processor id, `signal_config.signal_processor_config`, SHA256 of the bot's `config.yaml`, SHA256 of every repository module the processor imports |
+
+A signal bot's import closure is the set of repository modules Python executes to
+load its processor: the modules it imports, the packages those modules live in
+(their `__init__.py` runs on import, and `signal_bots/__init__.py` imports every
+bot), transitively. Standard-library and third-party modules are not bound. A
+change to any bound module makes that bot `experimental` again, including a
+change to another bot's processor or to a shared model. Imports that are not
+static (`importlib`, `__import__`) are not visible to the gate and are a
+reviewer responsibility.
+
+No live code path applies per-deployment strategy parameters, so a strategy is
+promoted with its `STRATEGY_META` defaults: write optimised parameters into the
+file, then promote. A deployment that carries `settings.strategy_parameters` is
+refused on real money. Other `settings` keys (risk limits, selection metadata)
+are not strategy parameters and are not bound. A non-internal (Discord)
+deployment without a `signal_processor` trades the raw channel signal, so no
+strategy file runs and nothing can be hashed: it is refused on real money even
+if a strategy of the same name is promoted. Only internal deployments are
+checked against a strategy file.
+
+The gate sits in the daemon, the preflight and the viewer. The operator tools
+`live_runner/test_signal_trigger.py --live` and `scripts/live_smoke.py` do not
+go through it: they are explicit, human-driven commands and bypass the gate.
+
+A signal bot's binding covers every repository module its processor imports, which includes
+the adapters, `risk/` and `shared/`. Any change to those files invalidates every signal-bot
+promotion, so re-promote after such a change before trading real money. A module that resolves
+outside the repository (e.g. a symlink) is refused.
+
+The ledger is `<file>.promoted.json` next to the hashed file (for example
+`strategies/foo/foo.py.promoted.json`) and must be committed: the promotion is
+only in force where the ledger is. It follows `runner/approval_gate.py` and
+reuses its hashing and atomic-write helpers. A missing, unreadable or malformed
+ledger, a missing strategy file or unreadable `STRATEGY_META`, an unknown
+processor: all mean `experimental`, and the deployment is refused on real money.
+
+### Recording a promotion (CLI only)
+
+```bash
+uv run python -m runner.cli promote \
+    --strategy example_sma \
+    --promoted-by "Jane Doe" \
+    --optimization-result optimizations/opt-123.json \
+    --paper-account-id 10105152 --paper-broker ctrader \
+    --paper-start 2026-08-01 --paper-end 2026-10-15 --paper-trades 42 \
+    --paper-report docs/reports/paper_example_sma.csv \
+    --parity-reference lean \
+    --parity-deviation total_return=0.012 --parity-deviation sharpe_ratio=0.008 \
+    --parity-report docs/reports/parity_example_sma.json
+```
+
+For a signal bot use `--signal-processor ramjet` and pass the deployment's
+`signal_processor_config` as `--params '{...}'` (`--params` is refused for a
+strategy). The out-of-sample evidence is read from the result file, not typed
+in. Both report files must exist; their SHA256 is recorded. Every argument is
+mandatory, and the command exits non-zero without writing anything if any
+evidence is missing or below a threshold.
+
+### Enforcement points (fail closed)
+
+All of them call the one function `live_runner.promotion.enforce_promotion_gate`
+with the deployment and their own real-money verdict, taken from the same
+source the demo-only block uses there. Unknown means real money.
+
+| Point | Real-money verdict |
+|---|---|
+| `live_runner.preflight` (every configured deployment) | the paper/demo mode preflight resolved from the credentials |
+| Daemon, `prepare_order_with_risk` (every entry order, internal and Discord) | `_adapter_is_demo(adapter)` |
+| Viewer `POST /api/live/deployments` (created `ACTIVE`) | broker discovery `is_demo` (asserted) |
+| Viewer `PUT /api/live/deployments/{id}/status` → `ACTIVE` | the fresh broker re-verification |
+| Viewer `POST /api/live/deployments/ctrader/top5`, dry run included | broker discovery `is_demo` (asserted) |
+
+The viewer answers HTTP 409 with the reason. Exit-only orders are never blocked:
+closing a position must not depend on a promotion. The daemon check runs on
+every entry, so a deployment edited after activation is caught at order time.
+
 ## Provisioning and Rotation
 
 Provision the deployment file from `live_deployments.example.yaml` into the
