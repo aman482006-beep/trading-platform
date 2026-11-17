@@ -3385,44 +3385,50 @@ def find_latest_filled_live_entry_signals(
     found: dict[str, dict[str, Any]] = {}
     with get_session() as session:
         for symbol in normalized_symbols:
-            has_fill = (
-                select(LiveExecutionModel.id)
-                .where(LiveExecutionModel.signal_id == LiveSignalModel.id)
-                .where(LiveExecutionModel.filled_qty > 0)
-                .exists()
-            )
-            statement = (
-                select(LiveSignalModel)
-                .where(LiveSignalModel.deployment_id.in_(normalized_ids))
-                .where(func.upper(LiveSignalModel.symbol) == symbol)
-                .where(has_fill)
-                .order_by(LiveSignalModel.timestamp.desc(), LiveSignalModel.id.desc())
-            )
-            offset = 0
-            while symbol not in found:
-                rows = session.exec(
-                    statement.offset(offset).limit(_ENTRY_SIGNAL_SCAN_PAGE_SIZE)
-                ).all()
-                if not rows:
-                    break
-                for row in rows:
-                    metadata = dict(row.metadata_json or {})
-                    if _is_exit_only_signal_metadata(metadata):
-                        continue
-                    timestamp = row.timestamp
-                    if timestamp.tzinfo is None:
-                        timestamp = timestamp.replace(tzinfo=timezone.utc)
-                    found[symbol] = {
-                        "signal_id": str(row.id),
-                        "deployment_id": str(row.deployment_id),
-                        "symbol": symbol,
-                        "action": str(row.action or "").strip().lower(),
-                        "timestamp": timestamp.astimezone(timezone.utc),
-                        "metadata": metadata,
-                    }
-                    break
-                offset += len(rows)
+            entry = _newest_filled_entry_signal(session, normalized_ids, symbol)
+            if entry is not None:
+                found[symbol] = entry
     return found
+
+
+def _newest_filled_entry_signal(
+    session: Any, deployment_ids: list[str], symbol: str
+) -> dict[str, Any] | None:
+    has_fill = (
+        select(LiveExecutionModel.id)
+        .where(LiveExecutionModel.signal_id == LiveSignalModel.id)
+        .where(LiveExecutionModel.filled_qty > 0)
+        .exists()
+    )
+    statement = (
+        select(LiveSignalModel)
+        .where(LiveSignalModel.deployment_id.in_(deployment_ids))
+        .where(func.upper(LiveSignalModel.symbol) == symbol)
+        .where(has_fill)
+        .order_by(LiveSignalModel.timestamp.desc(), LiveSignalModel.id.desc())
+    )
+    offset = 0
+    while True:
+        rows = session.exec(statement.offset(offset).limit(_ENTRY_SIGNAL_SCAN_PAGE_SIZE)).all()
+        for row in rows:
+            metadata = dict(row.metadata_json or {})
+            if _is_exit_only_signal_metadata(metadata):
+                continue
+            timestamp = row.timestamp
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=timezone.utc)
+            return {
+                "signal_id": str(row.id),
+                "deployment_id": str(row.deployment_id),
+                "symbol": symbol,
+                "action": str(row.action or "").strip().lower(),
+                "timestamp": timestamp.astimezone(timezone.utc),
+                "metadata": metadata,
+            }
+        if not rows:
+            return None
+        offset += len(rows)
+
 
 def list_live_signal_broker_order_conflicts(limit: int = 200) -> list[dict[str, Any]]:
     """Signals whose duplicate delivery carried a different broker order id.

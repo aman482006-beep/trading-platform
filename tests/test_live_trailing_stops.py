@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -26,6 +27,7 @@ from live_runner.trailing_stops import (
     LiveTrailingStopManager,
     adapter_live_trailing_modes,
 )
+from risk import TradeSignal
 from risk.config import RiskConfig
 from runner.engines.signal_replay_adapter import ReplaySignal, SignalReplayAdapter
 from shared.models import LiveDeploymentConfig, LiveExecution, LiveSignal
@@ -135,7 +137,8 @@ class _Live:
 
         async def _market_data(symbol, *, timeframe, limit=200):
             self.market_data_calls += 1
-            assert symbol == "AAPL" and timeframe == "1m"
+            assert symbol == "AAPL"
+            assert timeframe == "1m"
             return _bars(self.closes)
 
         self.adapter.get_market_data = _market_data  # type: ignore[method-assign]
@@ -207,6 +210,7 @@ def surfaced(monkeypatch) -> list[tuple[str, dict]]:
 
     monkeypatch.setattr(trailing_stops, "capture_exception", _capture)
     monkeypatch.setattr(trailing_stops.logger, "error", _error)
+    monkeypatch.setattr(trailing_stops.logger, "critical", _error)
     return events
 
 
@@ -613,12 +617,14 @@ def test_base_adapter_refuses_stop_amendment_by_default() -> None:
     stop = ProtectiveStop(order_id="1", symbol="AAPL", side="sell", stop_price=1.0)
 
     assert adapter.supports_stop_amendment is False
+    listing = adapter.list_protective_stops()
     with pytest.raises(NotImplementedError):
-        asyncio.run(adapter.list_protective_stops())
+        asyncio.run(listing)
     with pytest.raises(NotImplementedError):
         adapter.round_stop_price(stop, 1.0)
+    amending = adapter.amend_protective_stop(stop, 2.0)
     with pytest.raises(NotImplementedError):
-        asyncio.run(adapter.amend_protective_stop(stop, 2.0))
+        asyncio.run(amending)
 
 
 def test_capability_and_central_broker_table_agree() -> None:
@@ -653,7 +659,8 @@ def test_alpaca_lists_only_reducing_side_plain_stops() -> None:
     client = _ReplacingClient(
         positions=[_FakePosition("AAPL", 10), _FakePosition("TSLA", -4)],
         orders=[
-            # A bracket parent still listed, with its legs nested.
+            # A bracket parent still listed with its legs nested: the parent has not
+            # filled, so its stop leg is a pending entry's, never the position's.
             _FakeOrder(
                 "parent",
                 "AAPL",
@@ -664,6 +671,7 @@ def test_alpaca_lists_only_reducing_side_plain_stops() -> None:
                     _FakeOrder("leg-sl", "AAPL", "sell", order_type="stop", stop_price=95.0),
                 ],
             ),
+            _FakeOrder("plain-sl", "AAPL", "sell", order_type="stop", stop_price=96.0),
             _FakeOrder("entry-stop", "AAPL", "buy", order_type="stop", stop_price=120.0),
             _FakeOrder("sl-limit", "AAPL", "sell", order_type="stop_limit", stop_price=94.0),
             _FakeOrder("native-trail", "AAPL", "sell", order_type="trailing_stop", stop_price=93.0),
@@ -676,7 +684,7 @@ def test_alpaca_lists_only_reducing_side_plain_stops() -> None:
     stops = asyncio.run(_adapter(client).list_protective_stops())
 
     assert sorted(stops, key=lambda stop: stop.order_id) == [
-        ProtectiveStop(order_id="leg-sl", symbol="AAPL", side="sell", stop_price=95.0),
+        ProtectiveStop(order_id="plain-sl", symbol="AAPL", side="sell", stop_price=96.0),
         ProtectiveStop(order_id="short-sl", symbol="TSLA", side="buy", stop_price=310.0),
     ]
 
@@ -764,7 +772,8 @@ def test_alpaca_amends_the_held_stop_leg_and_keeps_the_take_profit() -> None:
     assert client.cancelled == []
     assert [leg.id for leg in client.parent.legs] == ["tp-leg", "sl-leg+"]
     (again,) = asyncio.run(adapter.list_protective_stops())
-    assert again.order_id == "sl-leg+" and again.stop_price == 96.5
+    assert again.order_id == "sl-leg+"
+    assert again.stop_price == 96.5
 
 
 def test_alpaca_ignores_dead_legs_of_a_filled_bracket() -> None:
@@ -899,14 +908,13 @@ def test_trailing_loop_survives_a_failing_tick(monkeypatch, surfaced) -> None:
 
     monkeypatch.setattr(trailing_stops.asyncio, "sleep", _no_sleep)
 
+    loop = trailing_stops.run_trailing_stops_loop(
+        _Manager(),  # type: ignore[arg-type]
+        eligible_adapters=dict,
+        current_deployments=list,
+    )
     with pytest.raises(asyncio.CancelledError):
-        asyncio.run(
-            trailing_stops.run_trailing_stops_loop(
-                _Manager(),  # type: ignore[arg-type]
-                eligible_adapters=dict,
-                current_deployments=list,
-            )
-        )
+        asyncio.run(loop)
 
     assert ticks == [0, 1]
     assert "tick blew up" in surfaced[0][1]["error"]
@@ -958,3 +966,327 @@ def test_prepared_order_keeps_the_trailing_config_that_gets_persisted() -> None:
     assert qty > 0
     assert prepared.metadata["trailing_sl_config"] == trailing_cfg
     assert prepared.metadata["stop_loss"] == 98.0
+
+
+# ── review follow-ups (PR #174) ──────────────────────────────────────────────
+
+
+def test_alpaca_never_offers_the_stop_leg_of_an_unfilled_parent() -> None:
+    """A pending entry's stop leg protects nothing that is open yet."""
+    client = _ReplacingClient(
+        positions=[_FakePosition("AAPL", 10)],
+        orders=[
+            _FakeOrder(
+                "pending-parent",
+                "AAPL",
+                "buy",
+                order_type="market",
+                status="new",
+                legs=[
+                    _FakeOrder(
+                        "pending-sl", "AAPL", "sell", order_type="stop", status="held",
+                        stop_price=95.0,
+                    )
+                ],
+            ),
+        ],
+    )
+
+    assert asyncio.run(_adapter(client).list_protective_stops()) == []
+
+
+def test_alpaca_refuses_a_full_held_leg_page() -> None:
+    """A full page may have cut off the filled parent that owns the held stop leg."""
+    client = _HeldLegClient(positions=[_FakePosition("AAPL", 10)])
+    page = [
+        _FakeOrder(f"old-{index}", "AAPL", "buy", order_type="market", status="canceled")
+        for index in range(499)
+    ]
+    client.get_orders = lambda filter=None: (  # type: ignore[method-assign]
+        [] if str(filter.status.value).lower() == "open" else [*page, client.parent]
+    )
+
+    with pytest.raises(RuntimeError, match="refusing to treat the list as complete"):
+        asyncio.run(_adapter(client).list_protective_stops())
+
+
+def test_alpaca_accepts_a_held_leg_page_just_below_the_limit() -> None:
+    client = _HeldLegClient(positions=[_FakePosition("AAPL", 10)])
+    page = [
+        _FakeOrder(f"old-{index}", "AAPL", "buy", order_type="market", status="canceled")
+        for index in range(498)
+    ]
+    client.get_orders = lambda filter=None: (  # type: ignore[method-assign]
+        [] if str(filter.status.value).lower() == "open" else [*page, client.parent]
+    )
+
+    (stop,) = asyncio.run(_adapter(client).list_protective_stops())
+    assert stop.order_id == "sl-leg"
+
+
+def test_a_timeframe_the_broker_cannot_serve_is_given_up_on_once(live: _Live, surfaced) -> None:
+    """4h passes every validation stage but Alpaca market data cannot serve it."""
+    live.deployment.timeframe = "4h"
+
+    async def _unreachable(symbol, *, timeframe, limit=200):
+        raise AssertionError("market data must not be requested for an unservable timeframe")
+
+    live.adapter.get_market_data = _unreachable  # type: ignore[method-assign]
+    manager = LiveTrailingStopManager()
+
+    for hours in (4, 8, 12):
+        live.tick(manager, T0 + timedelta(hours=hours, seconds=2))
+
+    assert live.client.replace_calls == []
+    assert len(surfaced) == 1
+    assert "cannot serve '4h'" in surfaced[0][1]["error"]
+    assert manager._schedules[ACCOUNT].retry_at is None
+
+
+def test_alpaca_reports_which_timeframes_it_serves() -> None:
+    adapter = _adapter(_ReplacingClient())
+
+    assert [
+        adapter.supports_market_data_timeframe(value)
+        for value in ("1m", "5m", "15m", "30m", "1h", "1d", "4h", "1w", "s1", "tick", "")
+    ] == [True] * 6 + [False] * 5
+
+
+def test_a_repeating_failure_is_given_up_on_after_the_limit(live: _Live, surfaced) -> None:
+    live.client.orders.append(
+        _FakeOrder("stop-2", "AAPL", "sell", order_type="stop", qty=5, stop_price=97.0)
+    )
+    manager = LiveTrailingStopManager()
+    live.closes.append(103.0)
+    moment = T0 + MINUTE + timedelta(seconds=2)
+
+    for _ in range(trailing_stops.TRAILING_MAX_CONSECUTIVE_FAILURES + 5):
+        live.tick(manager, moment)
+        moment += timedelta(seconds=trailing_stops.TRAILING_RETRY_MAX_SECONDS)
+
+    limit = trailing_stops.TRAILING_MAX_CONSECUTIVE_FAILURES
+    assert len(surfaced) == limit
+    assert "given up" in surfaced[-1][0]
+    assert surfaced[-1][1]["consecutive_failures"] == limit
+    assert all("given up" not in message for message, _ in surfaced[:-1])
+    assert live.client.replace_calls == []
+    assert manager._schedules[ACCOUNT].retry_at is None
+
+    # A new entry signal is a new position to trail: the give-up does not carry over.
+    live.client.orders.pop()
+    live.add_signal("buy", {"mode": "percent", "percent": 0.01}, at=T0 + timedelta(seconds=1))
+    live.tick(manager, moment)
+    live.tick(manager, moment + timedelta(minutes=1))
+    assert live.client.replace_calls != []
+
+
+def test_a_success_resets_the_failure_count(live: _Live, surfaced) -> None:
+    manager = LiveTrailingStopManager()
+    live.client.replace_error = RuntimeError("422")
+    live.feed(manager, [103.0])
+    assert surfaced[-1][1]["consecutive_failures"] == 1
+
+    live.client.replace_error = None
+    live.tick(manager, T0 + MINUTE + timedelta(seconds=2 + TRAILING_RETRY_INITIAL_SECONDS * 3))
+    assert manager._trails[(ACCOUNT, "AAPL")].consecutive_failures == 0
+
+
+def test_a_missing_bar_is_retried_only_while_it_can_still_be_feed_delay(live: _Live) -> None:
+    live.deployment.timeframe = "1h"
+
+    async def _stale(symbol, *, timeframe, limit=200):
+        return _bars([100.0], start=T0 - timedelta(hours=3))  # closed before the entry
+
+    live.adapter.get_market_data = _stale  # type: ignore[method-assign]
+    manager = LiveTrailingStopManager()
+    boundary = T0 + timedelta(hours=2)
+
+    live.tick(manager, boundary + timedelta(seconds=2))
+    assert manager._schedules[ACCOUNT].retry_at is not None
+
+    manager = LiveTrailingStopManager()
+    live.tick(manager, boundary + timedelta(seconds=trailing_stops.TRAILING_BAR_GRACE_SECONDS))
+    assert manager._schedules[ACCOUNT].retry_at is None
+
+
+def test_a_stop_larger_than_the_position_is_warned_about_once(live: _Live, monkeypatch) -> None:
+    warnings: list[dict] = []
+    monkeypatch.setattr(
+        trailing_stops.logger,
+        "warning",
+        lambda message, *a, **kw: warnings.append(kw["extra"]["data"]),
+    )
+    live.client.positions = [_FakePosition("AAPL", 6)]
+    manager = LiveTrailingStopManager()
+
+    live.feed(manager, [100.0, 103.0])
+
+    assert len(warnings) == 1
+    assert warnings[0]["stop_qty"] == 10.0
+    assert warnings[0]["position_qty"] == 6.0
+    # The price is still trailed; the quantity is deliberately not touched.
+    assert live.client.stop_prices() == [101.97]
+
+
+def test_a_stop_matching_the_position_does_not_warn(live: _Live, monkeypatch) -> None:
+    warnings: list[object] = []
+    monkeypatch.setattr(trailing_stops.logger, "warning", lambda *a, **kw: warnings.append(a))
+
+    live.feed(LiveTrailingStopManager(), [100.0])
+
+    assert warnings == []
+
+
+def test_alpaca_reports_the_stop_quantity_and_keeps_it_through_an_amend() -> None:
+    client = _ReplacingClient(
+        positions=[_FakePosition("AAPL", 10)],
+        orders=[_FakeOrder("s", "AAPL", "sell", order_type="stop", qty=10, stop_price=95.0)],
+    )
+    adapter = _adapter(client)
+
+    (stop,) = asyncio.run(adapter.list_protective_stops())
+    amended = asyncio.run(adapter.amend_protective_stop(stop, 96.0))
+
+    assert stop.qty == 10.0
+    assert amended.qty == 10.0
+
+
+def test_an_entry_action_that_is_not_buy_or_sell_is_reported_not_skipped(
+    live: _Live, surfaced
+) -> None:
+    def _loader(_deployments, _symbols):
+        return {
+            "AAPL": {
+                "signal_id": "s1",
+                "deployment_id": str(live.deployment.id),
+                "symbol": "AAPL",
+                "action": "long",
+                "timestamp": T0,
+                "metadata": {"trailing_sl_config": {"mode": "percent", "percent": 0.01}},
+            }
+        }
+
+    live.closes.append(103.0)
+    asyncio.run(
+        LiveTrailingStopManager(load_entry_signals=_loader).run_once(
+            {ACCOUNT: live.adapter}, [live.deployment], now=T0 + MINUTE + timedelta(seconds=2)
+        )
+    )
+
+    assert live.client.replace_calls == []
+    assert "neither 'buy' nor 'sell'" in surfaced[0][1]["error"]
+
+
+def test_a_capability_that_is_not_literally_true_is_not_trail_eligible(live: _Live) -> None:
+    class _MaybeAdapter(_NoAmendAdapter):
+        supports_stop_amendment = None  # type: ignore[assignment]
+
+    adapter = _MaybeAdapter()
+
+    asyncio.run(
+        LiveTrailingStopManager().run_once(
+            {ACCOUNT: adapter}, [live.deployment], now=T0 + MINUTE
+        )
+    )
+
+    assert adapter.touched == []
+
+
+def test_sync_loop_publishes_the_shared_deployment_snapshot(monkeypatch) -> None:
+    deployments = [
+        LiveDeploymentConfig(
+            strategy_name="snap", account_id=ACCOUNT, symbols=["AAPL"], timeframe="1m"
+        )
+    ]
+
+    async def _load_state():
+        return [], deployments
+
+    async def _stop_after_iteration(_seconds: float) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(daemon, "_load_db_accounts_and_deployments", _load_state)
+    monkeypatch.setattr(daemon.asyncio, "sleep", _stop_after_iteration)
+    snapshot: list[LiveDeploymentConfig] = []
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            daemon.sync_deployments_loop(
+                {},
+                {},
+                {},
+                accounts_env=Path("/nonexistent/accounts.env"),
+                interval_seconds=0,
+                deployment_snapshot=snapshot,
+            )
+        )
+
+    assert snapshot == deployments
+
+
+def test_discord_dispatch_threads_the_adapter_into_the_processor_gate(monkeypatch) -> None:
+    seen: list[object] = []
+
+    def _processor(signal, deployment, *, adapter=None):
+        seen.append(adapter)
+        return signal
+
+    monkeypatch.setattr(daemon, "_apply_signal_processor", _processor)
+    monkeypatch.setattr(daemon, "_validate_signal_age_before_wait", lambda *a, **k: None)
+    monkeypatch.setattr(daemon, "signal_is_fresh", lambda *a, **k: True)
+    monkeypatch.setattr(daemon, "_deployment_is_currently_active", lambda _deployment: True)
+    adapter = _adapter(_ReplacingClient())
+    signal = TradeSignal(
+        action="buy",
+        symbol="AAPL",
+        entry_price=100.0,
+        stop_loss=98.0,
+        take_profit=None,
+        timeframe="1m",
+        metadata={"source": "discord"},
+    )
+
+    prepared = asyncio.run(
+        daemon._prepare_discord_signal_for_submission(
+            ACCOUNT,
+            live_deployment(),
+            signal,
+            signal_timeframe="1m",
+            wait_enabled=False,
+            adapter=adapter,
+        )
+    )
+
+    assert prepared is not None
+    assert seen == [adapter]
+
+
+def live_deployment() -> LiveDeploymentConfig:
+    return LiveDeploymentConfig(
+        strategy_name="discord-probe",
+        account_id=ACCOUNT,
+        symbols=["AAPL"],
+        timeframe="1m",
+        signal_source="discord",
+    )
+
+
+def test_entry_signal_lookup_ignores_zero_fill_executions(isolated_db) -> None:
+    database, _engine, _data_dir = isolated_db
+    probe = _Live(database)
+    probe.entry.timestamp = T0  # the genuinely filled, older entry
+    unfilled = probe.add_signal("buy", None, filled=False, at=T0 + 5 * MINUTE)
+    database.save_live_execution(
+        LiveExecution(
+            signal_id=unfilled.id,
+            actual_price=100.0,
+            filled_qty=0.0,
+            commission=0.0,
+            timestamp=T0 + 5 * MINUTE,
+            broker_order_id="zero-fill",
+        )
+    )
+
+    found = database.find_latest_filled_live_entry_signals([str(probe.deployment.id)], ["AAPL"])
+
+    assert found["AAPL"]["signal_id"] == str(probe.entry.id)

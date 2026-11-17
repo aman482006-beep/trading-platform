@@ -5,7 +5,7 @@ import inspect
 import math
 import os
 import re
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
 from typing import Any
@@ -223,9 +223,41 @@ def _order_type(order: Any) -> str:
     return text.rsplit(".", 1)[-1]
 
 
-#: Alpaca rejects sub-penny prices: two decimals at or above $1, four below.
-_ALPACA_TICK_AT_OR_ABOVE_ONE = Decimal("0.01")
-_ALPACA_TICK_BELOW_ONE = Decimal("0.0001")
+def _stop_candidates(order: Any) -> Iterator[Any]:
+    """Orders that may be a position's working stop: the order, and a filled parent's held legs.
+
+    A leg of a parent that has not filled belongs to a pending entry and protects nothing
+    that is open yet; amending it would leave the position unprotected while the log says
+    the stop was trailed. A dead (cancelled/filled/expired) leg is not a protection either.
+    """
+    yield order
+    if _order_status(order) != "filled":
+        return
+    for leg in _order_legs(order):
+        if _order_status(leg) == "held":
+            yield leg
+
+
+def _protective_stop_of(
+    candidate: Any, parent: Any, reducing_sides: Mapping[str, str]
+) -> ProtectiveStop | None:
+    symbol = _order_symbol(candidate) or _order_symbol(parent)
+    if not symbol or reducing_sides.get(symbol) != _order_side(candidate):
+        return None
+    if _order_type(candidate) != "stop":
+        return None
+    order_id = _control_order_id(_order_attr(candidate, "id"))
+    stop_price = _to_float(_order_attr(candidate, "stop_price", None), default=0.0)
+    if order_id is None or not math.isfinite(stop_price) or stop_price <= 0:
+        return None
+    qty = _to_float(_order_attr(candidate, "qty", None), default=0.0)
+    return ProtectiveStop(
+        order_id=order_id,
+        symbol=symbol,
+        side=_order_side(candidate),
+        stop_price=stop_price,
+        qty=qty if math.isfinite(qty) and qty > 0 else None,
+    )
 
 
 def _alpaca_timeframe(value: str):
@@ -2292,6 +2324,14 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
     def supports_stop_amendment(self) -> bool:
         return True
 
+    def supports_market_data_timeframe(self, timeframe: str) -> bool:
+        """Whether :meth:`get_market_data` can serve ``timeframe`` (no retry can change that)."""
+        try:
+            _alpaca_timeframe(timeframe)
+        except ValueError:
+            return False
+        return True
+
     async def list_protective_stops(self) -> list[ProtectiveStop]:
         """Working plain stop orders on the reducing side of each open position.
 
@@ -2307,25 +2347,10 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         orders.extend(await self._list_filled_parents_with_held_legs(client, set(reducing_sides)))
         stops: dict[str, ProtectiveStop] = {}
         for order in orders:
-            for candidate in (order, *_order_legs(order)):
-                if candidate is not order and _order_status(order) == "filled":
-                    # Only a filled parent's still-held stop leg is wanted from the
-                    # `status=all` listing; a dead leg is not a protection.
-                    if _order_status(candidate) != "held":
-                        continue
-                symbol = _order_symbol(candidate) or _order_symbol(order)
-                side = _order_side(candidate)
-                if not symbol or reducing_sides.get(symbol) != side:
-                    continue
-                if _order_type(candidate) != "stop":
-                    continue
-                order_id = _control_order_id(_order_attr(candidate, "id"))
-                stop_price = _to_float(_order_attr(candidate, "stop_price", None), default=0.0)
-                if order_id is None or not math.isfinite(stop_price) or stop_price <= 0:
-                    continue
-                stops[order_id] = ProtectiveStop(
-                    order_id=order_id, symbol=symbol, side=side, stop_price=stop_price
-                )
+            for candidate in _stop_candidates(order):
+                stop = _protective_stop_of(candidate, order, reducing_sides)
+                if stop is not None:
+                    stops[stop.order_id] = stop
         return list(stops.values())
 
     async def _list_filled_parents_with_held_legs(
@@ -2357,6 +2382,13 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             raise RuntimeError(
                 f"Alpaca order list has an unrecognised shape ({type(result).__name__}); "
                 "refusing to report a clean sweep"
+            )
+        if len(result) >= _ALPACA_HELD_LEG_LOOKUP_LIMIT:
+            # The listing is newest-first: a full page may have cut off the filled parent
+            # that owns the held stop leg, and "no stop" would then be a lie.
+            raise RuntimeError(
+                f"Alpaca returned {len(result)} orders, the page limit; "
+                "refusing to treat the list as complete"
             )
         return [
             order
@@ -2413,6 +2445,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             symbol=stop.symbol,
             side=stop.side,
             stop_price=confirmed_price,
+            qty=stop.qty,
         )
 
     async def get_positions(self) -> list[dict[str, Any]]:

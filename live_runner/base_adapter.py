@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Iterator
 
@@ -241,6 +241,10 @@ class ProtectiveStop:
     symbol: str
     side: str
     stop_price: float
+    #: Quantity the stop order covers, when the broker reports it. Informational
+    #: (excluded from equality): an amendment moves the price only, so the caller
+    #: can warn when it differs from the position, never correct it.
+    qty: float | None = field(default=None, compare=False)
 
 
 class BaseLiveAdapter(ABC):

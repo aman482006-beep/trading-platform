@@ -48,7 +48,11 @@ not declare the `supports_stop_amendment` capability. Unknown brokers get `none`
   the deployment timeframe). The loop wakes every 15 s but only compares timestamps; it reads
   positions, orders and bars (`AlpacaLiveAdapter.get_market_data`) when a bar boundary has passed
   or a retry is due. A bar that is not published yet is re-requested with backoff (15 s doubling
-  to 5 min).
+  to 5 min), but only for up to 15 minutes after the boundary (at most one bar): after that the
+  feed is treated as closed (night, weekend, holiday) and the next bar boundary tries again.
+- Timeframes: only the timeframes `AlpacaLiveAdapter.get_market_data` serves (`1m`, `5m`, `15m`,
+  `30m`, `1h`, `1d`) can be trailed. A `percent` deployment on any other timeframe (`4h`, `1w`,
+  ...) is given up on at the first pass with one CRITICAL alert; its stop stays where it is.
 - Amendment: the protective stop order is replaced in place (`PATCH /v2/orders/{id}`). The
   previous stop keeps working until the replacement is accepted and stays if it is refused; the
   stop is never cancelled in order to move it. The replace and the adapter's order sweeps (STOP
@@ -59,6 +63,11 @@ not declare the `supports_stop_amendment` capability. Unknown brokers get `none`
   stop order id, current and target stop, consecutive failure count) and sent to Sentry
   (`component=live_trailing_stops`). It is retried with the same backoff; the previous
   broker-side stop stays in force meanwhile.
+  A failure that repeats is not retried forever: after 12 consecutive failed passes for one
+  position (about 40 minutes at the backoff cap) the position is given up on with one CRITICAL
+  alert (`Live trailing stop given up on ...`), and nothing is amended or retried for it until
+  its entry signal or the position changes (a daemon restart also starts counting again). The
+  broker-side stop stays at its last level.
   This includes a trailed stop the market has already fallen through since the bar closed: the
   broker refuses it, the old stop keeps protecting the position, and the replay backtest would
   have exited on that bar instead.
@@ -69,6 +78,10 @@ not declare the `supports_stop_amendment` capability. Unknown brokers get `none`
 - Cleanup: in-memory progress is dropped as soon as the position is gone at the broker (stop or
   take profit hit, exit signal, manual close) or its deployment is no longer ACTIVE. A partial
   exit keeps the trail on the remaining quantity.
+- Stop quantity: an amendment moves the price only. After a partial exit a bracket stop leg can
+  still be sized to the original entry; the loop logs a WARNING once per position when the stop
+  covers more than the position holds, but does not resize it. What Alpaca does when such a stop
+  triggers (cap, oversell, reject) has **not** been verified on paper.
 
 **Limits to know when operating it**
 
