@@ -2437,6 +2437,37 @@ def test_stream_fill_keeps_its_own_timestamp_and_dedupe_key(monkeypatch):
     assert saved[0].dedupe_key == f"alpaca:exec:{update.execution_id}"
 
 
+def test_a_stamped_offset_is_stored_as_its_utc_instant(db):
+    # `live_executions.timestamp` is a naive SQLite wall time, so the broker stamp must be
+    # converted to UTC, not stored verbatim: a +02:00 fill written at 17:05 would be ordered
+    # two hours late in PnL, and one at 01:05+02:00 would land on the wrong day.
+    signal = _signal(db)
+    order = _order(
+        signal, filled_qty="5", filled_avg_price="101.5", order_id=_order_id("rec-offset")
+    )
+    order.filled_at = "2026-11-03T17:05:00+02:00"
+
+    assert asyncio.run(_adapter(order).reconcile_executions()) == 1
+
+    assert [row.timestamp for row in _rows(db, signal)] == [ORDER_FILLED_AT.replace(tzinfo=None)]
+
+
+def test_a_stream_fill_stamped_with_another_offset_is_converted_to_utc(monkeypatch):
+    saved = _stream_capture(monkeypatch)
+    update = _trade_update(
+        signal_id=str(uuid4()),
+        order_id=_order_id("ts-offset"),
+        asset_class="us_equity",
+        symbol="AAPL",
+    )
+    update.timestamp = "2026-11-03T17:05:00+02:00"
+
+    asyncio.run(_adapter(None)._on_trade_update(update))
+
+    assert len(saved) == 1
+    assert saved[0].timestamp == ORDER_FILLED_AT, "the event stamp wins, converted to UTC"
+
+
 def test_reconcile_uses_updated_at_when_the_order_has_no_filled_at(db):
     signal = _signal(db)
     order = _order(signal, filled_qty="5", filled_avg_price="101.5", order_id=_order_id("rec-upd"))
