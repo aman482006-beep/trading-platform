@@ -71,7 +71,8 @@ Signal durch `RiskEngine`.
 ## Commission-Vorzeichen (#184 Finding 14)
 
 `live_executions.commission` ist bei **allen** Brokern ein **positiver Kostenwert**
-(Gebühr = positiv, Rebate = negativ, bekannt-null = `0.0`). Net-PnL ist überall
+(Gebühr = positiv, Rebate = negativ, bekannt-null = `0.0`; ein Rebate kann nur der
+cTrader-Pfad speichern, `apply_live_execution_commissions` (Alpaca-CFEE) lehnt negative Werte ab). Net-PnL ist überall
 `gross - commission` (Viewer, `net_pnl`, Alpaca-CFEE-Backfill aus #143).
 Adapter normalisieren vor dem Speichern: cTrader meldet `ProtoOADeal.commission`
 als vorzeichenbehafteten Cashflow (Gebühr negativ) und wird über
@@ -85,6 +86,10 @@ bleiben. Die Migration ist in `schema_data_migrations` vermerkt und läuft genau
 ein erneutes `abs` würde einen vom korrigierten Adapter gespeicherten Rebate (negativ)
 in eine Gebühr verwandeln. Ein vor der Änderung gespeicherter cTrader-Rebate (roh positiv)
 ist von einer neuen Gebühr nicht unterscheidbar und bleibt positiv.
+`commission_cost` lehnt nicht-endliche Werte mit `ValueError` ab (kein stilles `0.0`).
+Deploy-Hinweis: Daemon vor dem ersten Start des neuen Builds stoppen (siehe
+`docs/live-deploy-runbook.md`); ein alter Build, der nach dem Migrationsvermerk noch eine
+rohe negative Gebühr schreibt, wird nicht mehr umgewandelt.
 
 ## Broker-Raster (Alpaca)
 

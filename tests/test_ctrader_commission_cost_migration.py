@@ -19,12 +19,18 @@ _ROWS = [
     ("alp-equity", "sig-alp", 0.0),
     ("alp-crypto-fee", "sig-alp", 0.4),
     ("alp-negative", "sig-alp", -0.3),
+    # A broker stored with a different case is still cTrader.
+    ("ct-mixed-case", "sig-ct-mixed", -0.04),
 ]
 
 
 def _seed(engine) -> None:
     with engine.begin() as connection:
-        for account_id, broker in (("acc-alp", "alpaca"), ("acc-ct", "ctrader")):
+        for account_id, broker in (
+            ("acc-alp", "alpaca"),
+            ("acc-ct", "ctrader"),
+            ("acc-ct-mixed", "CTrader"),
+        ):
             connection.execute(
                 text(
                     "INSERT INTO live_accounts (id, broker, name, is_demo) "
@@ -44,6 +50,7 @@ def _seed(engine) -> None:
         for signal_id, deployment_id in (
             ("sig-ct", "dep-acc-ct"),
             ("sig-alp", "dep-acc-alp"),
+            ("sig-ct-mixed", "dep-acc-ct-mixed"),
         ):
             connection.execute(
                 text(
@@ -87,6 +94,7 @@ def test_init_db_converts_existing_ctrader_commissions_to_a_positive_cost(
 
     commissions = _commissions(engine)
     assert commissions["ct-charge"] == pytest.approx(0.02)
+    assert commissions["ct-mixed-case"] == pytest.approx(0.04), "broker match ignores case"
     assert commissions["ct-positive"] == 1.5, "an already positive value is left as it is"
     assert commissions["ct-zero"] == 0.0
     assert str(commissions["ct-zero"]) == "0.0", "a known zero must never become -0.0"

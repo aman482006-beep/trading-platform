@@ -1985,6 +1985,8 @@ def _migrate_ctrader_commission_to_cost(connection: Connection) -> bool:
         return False
 
     converted = 0
+    # Recorded even when the table is absent: a table created later only ever holds rows from the
+    # fixed adapter, and a converting re-run would turn their rebates into charges.
     if _table_column_names(connection, "live_executions"):
         converted = int(
             connection.execute(
@@ -2431,7 +2433,8 @@ def _migrate_schema() -> None:
         _add_live_executions_actual_price_observed(connection)
         # Last: the rebuild copies every column, so the additive ones must already exist.
         _make_live_executions_commission_nullable(connection)
-        # After the rebuild: the rebuild must see (and copy) the rows exactly as they were.
+        # Independent of the rebuild (both run in one transaction); the rebuild copies whatever
+        # sign the rows hold, so the order is not load-bearing.
         _migrate_ctrader_commission_to_cost(connection)
 
 

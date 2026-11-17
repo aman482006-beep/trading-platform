@@ -1599,7 +1599,8 @@ def test_commission_scaling_uses_real_protobuf_presence() -> None:
     # A genuine moneyDigits of 0 is honoured, not replaced by the default.
     assert _deal_commission(ProtoOADeal(commission=-7, moneyDigits=0)) == pytest.approx(7.0)
     zero = _deal_commission(ProtoOADeal())
-    assert zero == 0.0 and str(zero) == "0.0"  # never -0.0
+    assert zero == 0.0
+    assert str(zero) == "0.0"  # never -0.0
 
 
 def test_money_digits_fallback_is_logged(caplog) -> None:

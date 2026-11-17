@@ -148,8 +148,14 @@ def commission_cost(signed_cash_flow: float) -> float:
     store what the fill cost as a positive number and a rebate as a negative one. A broker that
     reports a signed cash flow (cTrader: ``ProtoOADeal.commission`` is negative for a charge)
     is converted with this helper. ``0`` stays ``0.0`` (never ``-0.0``).
+
+    Raises ``ValueError`` on a non-finite value: ``0.0`` is a KNOWN zero fee, so garbage must not
+    be turned into one. A caller that wants "unknown" handles it before calling (cTrader stores
+    ``0.0`` for an unreadable deal commission and filters it itself).
     """
-    if not signed_cash_flow or not math.isfinite(signed_cash_flow):
+    if not math.isfinite(signed_cash_flow):
+        raise ValueError(f"commission must be finite, got {signed_cash_flow!r}")
+    if not signed_cash_flow:
         return 0.0
     return -float(signed_cash_flow)
 
