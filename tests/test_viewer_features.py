@@ -7730,3 +7730,148 @@ def test_viewer_routes_without_response_model_keep_object_schema(path, method):
         f"{method.upper()} {path} lost its object schema: {schema}"
     )
     assert schema.get("additionalProperties") is True
+
+
+def test_deduplicate_portfolios_confirm_rechecks_each_id_before_delete(
+    viewer_client, monkeypatch, tmp_path
+):
+    """Confirm must not delete the last surviving member of a duplicate group.
+
+    Group A (newest, kept) / B / C. Phase 1 proposes B and C. While B is being
+    deleted, the kept entry A disappears (another tab or maintenance run). By
+    the time C is reached, C is alone, so it is no longer a duplicate and must
+    be skipped, not deleted.
+    """
+    import viewer.main as viewer_app_module
+
+    monkeypatch.setattr(viewer_app_module, "list_portfolio_records", lambda: [])
+    monkeypatch.setattr(viewer_app_module, "delete_portfolio_record", lambda _portfolio_id: False)
+
+    portfolios_dir = tmp_path / "portfolios"
+    portfolios_dir.mkdir(parents=True, exist_ok=True)
+    for portfolio_id, created_at in (
+        ("portfolio-a", "2026-01-03T00:00:00Z"),
+        ("portfolio-b", "2026-01-02T00:00:00Z"),
+        ("portfolio-c", "2026-01-01T00:00:00Z"),
+    ):
+        (portfolios_dir / f"{portfolio_id}.json").write_text(
+            json.dumps(
+                {
+                    "id": portfolio_id,
+                    "name": "Duplicate Portfolio",
+                    "account_capital": 100000.0,
+                    "created_at": created_at,
+                    "components": [
+                        {
+                            "component_id": "component-001",
+                            "strategy_name": "Strategy A",
+                            "symbol": "AAPL",
+                            "timeframe": "1h",
+                            "weight": 1.0,
+                            "risk_config": {},
+                            "settings": {},
+                            "backtest_id": "",
+                        }
+                    ],
+                    "trades": [],
+                    "combined_stats": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    response = viewer_client.post("/api/portfolios/deduplicate")
+    assert response.status_code == 200
+    dry_run_payload = response.json()
+    assert dry_run_payload["kept_ids"] == ["portfolio-a"]
+    assert dry_run_payload["candidate_ids"] == ["portfolio-b", "portfolio-c"]
+
+    real_delete = viewer_app_module._delete_portfolio_with_artifacts
+    deleted: list[str] = []
+
+    def delete_and_remove_kept_on_first_call(portfolio_id):
+        if not deleted:
+            # Concurrent removal of the kept entry between snapshot and delete.
+            (portfolios_dir / "portfolio-a.json").unlink()
+        result = real_delete(portfolio_id)
+        deleted.append(portfolio_id)
+        return result
+
+    monkeypatch.setattr(
+        viewer_app_module, "_delete_portfolio_with_artifacts", delete_and_remove_kept_on_first_call
+    )
+
+    response = viewer_client.post(
+        "/api/portfolios/deduplicate",
+        json={"dry_run": False, "ids": ["portfolio-b", "portfolio-c"]},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert deleted == ["portfolio-b"]
+    assert payload["deleted_ids"] == ["portfolio-b"]
+    assert payload["skipped_ids"] == ["portfolio-c"]
+    assert [item["status"] for item in payload["items"]] == ["deleted", "skipped"]
+    assert payload["items"][1]["reason"] == "no_longer_duplicate"
+    assert (portfolios_dir / "portfolio-c.json").exists()
+
+
+def test_deduplicate_backtests_confirm_rechecks_each_id_before_delete(
+    viewer_client, monkeypatch, tmp_path
+):
+    """Backtest twin of the portfolio re-check test.
+
+    Group A (newest, kept) / B / C. Deleting B also removes A. C is then the
+    only remaining entry and must be skipped, not deleted.
+    """
+    import viewer.main as viewer_app_module
+
+    monkeypatch.setattr(viewer_app_module, "list_portfolio_records", lambda: [])
+    monkeypatch.setattr(viewer_app_module, "delete_portfolio_record", lambda _portfolio_id: False)
+
+    alive = {"backtest-a", "backtest-b", "backtest-c"}
+    created = {"backtest-a": "2026-01-03", "backtest-b": "2026-01-02", "backtest-c": "2026-01-01"}
+
+    def fake_members():
+        ordered = sorted(alive, key=lambda item_id: created[item_id], reverse=True)
+        if len(ordered) < 2:
+            return []
+        return [
+            {
+                "id": item_id,
+                "display_name": "Duplicate Backtest",
+                "strategy_name": "Test",
+                "symbols": ["AAPL"],
+                "timeframe": "1d",
+                "trade_count": 1,
+                "created_at": created[item_id] + "T00:00:00Z",
+                "fingerprint": "fp1",
+                "kept_id": ordered[0],
+                "is_kept": item_id == ordered[0],
+            }
+            for item_id in ordered
+        ]
+
+    monkeypatch.setattr(viewer_app_module, "_duplicate_backtest_members", fake_members)
+    deleted: list[str] = []
+
+    def fake_delete(backtest_id):
+        if not deleted:
+            # Concurrent removal of the kept entry between snapshot and delete.
+            alive.discard("backtest-a")
+        alive.discard(backtest_id)
+        deleted.append(backtest_id)
+        return {"id": backtest_id, "status": "deleted", "database": "deleted", "artifact": "deleted"}
+
+    monkeypatch.setattr(viewer_app_module, "_delete_backtest_with_artifacts", fake_delete)
+
+    response = viewer_client.post(
+        "/api/backtests/deduplicate",
+        json={"dry_run": False, "ids": ["backtest-b", "backtest-c"]},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert deleted == ["backtest-b"]
+    assert payload["deleted_ids"] == ["backtest-b"]
+    assert payload["skipped_ids"] == ["backtest-c"]
+    assert payload["items"][1]["reason"] == "no_longer_duplicate"
+    assert "backtest-c" in alive
