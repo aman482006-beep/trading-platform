@@ -63,13 +63,17 @@ def test_sessionfinish_fails_the_run_when_the_repo_data_dir_changed(
         exitstatus = pytest.ExitCode.OK
 
     session = _Session()
-    suite_conftest.pytest_sessionfinish(session, 0)
+    suite_conftest.pytest_sessionfinish(session)
     assert session.exitstatus == pytest.ExitCode.OK
 
     (fake_repo_data / "backtests.db").write_text("written by a test")
-    suite_conftest.pytest_sessionfinish(session, 0)
+    suite_conftest.pytest_sessionfinish(session)
     assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
-    assert "created: backtests.db" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "created: backtests.db" in err
+    # The guard cannot attribute the change to the suite, so the message must not claim it did.
+    assert "the test session modified" not in err
+    assert "cannot tell which" in err
 
 
 def test_snapshot_diff_reports_created_modified_and_deleted(tmp_path: Path) -> None:
@@ -150,7 +154,7 @@ def test_real_pytest_process_exits_nonzero_when_a_test_writes_the_repo_data_dir(
     result = _run_throwaway_suite(tmp_path, leak, extra_args)
 
     assert result.returncode == pytest.ExitCode.TESTS_FAILED, result.stdout + result.stderr
-    assert "ERROR: the test session modified the repo data directory" in result.stderr
+    assert "ERROR: the repo data directory" in result.stderr and "changed during" in result.stderr
     assert "created: backtests.db" in result.stderr
 
 
@@ -167,4 +171,4 @@ def test_real_pytest_process_exits_zero_when_nothing_touches_the_repo_data_dir(
     result = _run_throwaway_suite(tmp_path, clean, extra_args)
 
     assert result.returncode == pytest.ExitCode.OK, result.stdout + result.stderr
-    assert "ERROR: the test session modified" not in result.stderr
+    assert "ERROR: the repo data directory" not in result.stderr
