@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from live_runner.base_adapter import BaseLiveAdapter
+from live_runner.base_adapter import BaseLiveAdapter, LiveQuote
 from live_runner.daemon import submit_order_with_risk
 from risk.config import RiskConfig
 from risk.engine import RiskEngine
@@ -511,6 +511,19 @@ class _DummyAdapter(BaseLiveAdapter):
 
     async def get_balance(self) -> tuple[float, float]:
         return 100_000.0, 100_000.0
+
+    async def get_pip_value(self, symbol):
+        # #146: a USD-quoted share in a USD account moves 1.0 per 1.0.
+        from live_runner.base_adapter import LivePipValue
+
+        return LivePipValue(
+            value=1.0, units_per_qty=1.0, conversion_rate=1.0,
+            quote_asset="USD", account_asset="USD", source="test",
+        )
+
+    async def get_quote(self, symbol: str) -> LiveQuote:
+        # #125 entry-deviation gate: a quote at the signal entry passes.
+        return LiveQuote(bid=100.0, ask=100.0, timestamp=datetime.now(timezone.utc), source="test")
 
 
 def test_submit_order_with_risk_applies_qty_before_submit():
