@@ -316,9 +316,6 @@ def _patch_ledger(
         calls.append((account_id, symbol))
         return dict(ledgers)
 
-    def _own_ledger(deployment_id: str, symbol: str) -> float:
-        return ledgers.get(deployment_id, 0.0)
-
     def _unfilled_exits(deployment_id: str, symbol: str) -> list[dict]:
         return list(unfilled_exits or [])
 
@@ -334,7 +331,6 @@ def _patch_ledger(
     monkeypatch.setattr(
         daemon, "list_account_unfilled_exit_orders", _account_unfilled_exits, raising=False
     )
-    monkeypatch.setattr(daemon, "get_live_deployment_net_filled_qty", _own_ledger, raising=False)
     return calls
 
 
@@ -367,6 +363,37 @@ def test_prepare_sizes_an_exit_from_the_own_ledger(monkeypatch) -> None:
     # No entry levels: the adapter builds a plain close, not a bracket.
     assert "stop_loss" not in prepared.metadata
     assert "take_profit" not in prepared.metadata
+
+
+def test_exit_drops_spoofed_entry_gate_fields(monkeypatch) -> None:
+    """The entry-deviation gate never runs on an exit, so a payload can't stamp it.
+
+    Entries overwrite these keys with the gate's own figures; an exit has no gate
+    result, so a payload value under one of them would otherwise be persisted as
+    if the gate had accepted it.
+    """
+    from live_runner.daemon import (
+        _ENTRY_QUOTE_METADATA_KEYS,
+        _trade_signal_to_live_signal,
+        prepare_order_with_risk,
+    )
+
+    deployment = _deployment(allow_short=True)
+    _patch_ledger(monkeypatch, deployment, 10.0)
+    adapter = _Adapter([{"symbol": "AAPL", "qty": 10.0}])
+    trade_signal = _exit_trade_signal()
+    spoofed = {key: "spoofed" for key in _ENTRY_QUOTE_METADATA_KEYS}
+    trade_signal = dataclasses.replace(
+        trade_signal, metadata={**trade_signal.metadata, **spoofed}
+    )
+    live = _trade_signal_to_live_signal(trade_signal, deployment)
+    assert all(live.metadata.get(key) == "spoofed" for key in _ENTRY_QUOTE_METADATA_KEYS)
+
+    prepared, qty = asyncio.run(prepare_order_with_risk(adapter, deployment, live))
+
+    assert qty == pytest.approx(10.0)
+    for key in _ENTRY_QUOTE_METADATA_KEYS:
+        assert key not in prepared.metadata, key
 
 
 def test_prepare_takes_the_close_side_from_the_position(monkeypatch) -> None:
@@ -709,6 +736,20 @@ def test_is_exit_order_covers_every_exit_and_nothing_else() -> None:
 class _RefusingAdapter(_Adapter):
     """Refuses every order before the broker request, like a broker-side
     volume floor or Alpaca's no-position guard."""
+
+    async def get_quote(self, symbol):
+        # Entries need a fresh broker quote for the #125 deviation gate.
+        from datetime import datetime, timezone
+
+        from live_runner.base_adapter import LiveQuote
+
+        return LiveQuote(
+            bid=100.0,
+            ask=100.0,
+            timestamp=datetime.now(timezone.utc),
+            source="test",
+            timestamp_source="broker",
+        )
 
     async def submit_order(self, signal, *, qty=None):
         from live_runner.base_adapter import order_not_submitted
