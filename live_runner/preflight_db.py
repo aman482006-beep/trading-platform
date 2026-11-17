@@ -74,8 +74,12 @@ def _sqlite_url_file(url: str) -> str:
 
 
 def resolve_db_path(explicit: str | Path | None = None) -> Path:
-    """The SQLite file the daemon would use: explicit, ``DATABASE_URL`` or ``DATA_DIR``."""
-    if explicit:
+    """The SQLite file the daemon would use: explicit, ``DATABASE_URL`` or ``DATA_DIR``.
+
+    An explicit empty path is still explicit: it names no file and fails the existence check,
+    rather than quietly checking the default database instead.
+    """
+    if explicit is not None:
         return Path(explicit)
     import os
 

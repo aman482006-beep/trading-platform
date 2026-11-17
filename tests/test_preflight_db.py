@@ -442,6 +442,17 @@ def test_resolve_db_path_keeps_a_relative_url_relative(tmp_path: Path, monkeypat
     assert resolve_db_path() == Path("backtests.db")
 
 
+def test_empty_explicit_db_path_is_not_the_default(tmp_path: Path, monkeypatch) -> None:
+    """``--db-path ""`` names no file; it must fail, not silently check the DATABASE_URL file."""
+    real = tmp_path / "real.db"
+    real.touch()
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{real.as_posix()}")
+
+    report = run_db_preflight([], db_path="")
+
+    assert any("not found" in e for e in report.errors), report.errors
+
+
 def test_resolve_db_path_refuses_an_in_memory_url(monkeypatch) -> None:
     """An in-memory database is not a file the check can read, and it is not empty either."""
     monkeypatch.setenv("DATABASE_URL", "sqlite:///:memory:")
