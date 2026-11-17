@@ -663,9 +663,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--db-path",
         default=None,
-        help="SQLite file for --check-db (default: DATABASE_URL or DATA_DIR/backtests.db).",
+        help=(
+            "SQLite file to check (default: DATABASE_URL or DATA_DIR/backtests.db). Giving it "
+            "implies --check-db."
+        ),
     )
     args = parser.parse_args(argv)
+    if args.db_path is not None:
+        # A named database is a request to validate it; ignoring the flag would print the same
+        # green document as a run that never looked at the DB.
+        args.check_db = True
 
     # stdout carries exactly one JSON result document; log lines go to stderr.
     route_console_logs_to_stderr()
@@ -691,12 +698,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             crash_log,
             extra={"data": {"config_path": str(args.config)}},
         )
+        db_report: dict[str, Any] | None = None
+        if args.check_db:
+            # The crash came before the DB was read: a requested check that never ran must say
+            # so, not leave db_deployments null (which means "not requested").
+            from live_runner.preflight_db import db_check_skipped_report
+
+            db_report = asdict(
+                db_check_skipped_report(
+                    "Live preflight crashed before the ACTIVE DB deployments were checked.",
+                    db_path=args.db_path,
+                )
+            )
         result = LivePreflightResult(
             ok=False,
             config_path=str(args.config),
             accounts_env_path=str(args.accounts_env),
             accounts=[],
             deployment_errors=[_crash_message(exc, redact=redact)],
+            db_deployments=db_report,
         )
     print(json.dumps(_result_to_jsonable(result), indent=2, sort_keys=True))
     return 0 if result.ok else 1

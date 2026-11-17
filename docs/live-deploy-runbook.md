@@ -39,8 +39,8 @@ uv run python -m live_runner.preflight --config live_deployments.yaml --accounts
 ```
 
 The daemon trades the ACTIVE rows of the `live_deployments` table, not the YAML. Add `--check-db`
-(read-only; `--db-path` overrides `DATABASE_URL` / `DATA_DIR/backtests.db`) to validate those rows
-too. The JSON result gains `db_deployments` with `matched`, `only_in_db`, `only_in_yaml`,
+(read-only; `--db-path` overrides `DATABASE_URL` / `DATA_DIR/backtests.db` and implies
+`--check-db`) to validate those rows too. The JSON result gains `db_deployments` with `matched`, `only_in_db`, `only_in_yaml`,
 `active_count`, `errors` and `warnings`. It fails the preflight (`ok: false`, exit 1) for:
 
 - an ACTIVE DB deployment absent from the YAML (the daemon trades something the YAML preflight

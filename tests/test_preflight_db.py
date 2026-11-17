@@ -558,3 +558,55 @@ def test_a_lock_timeout_is_not_blamed_on_the_wal(isolated_db, monkeypatch) -> No
 
     assert any("database is locked" in e for e in report.errors), report.errors
     assert not any("WAL" in e for e in report.errors), report.errors
+
+
+def test_crashed_run_with_check_db_reports_the_db_as_not_checked(tmp_path: Path, capsys) -> None:
+    """A requested --check-db that crashed before the DB was read must not report null."""
+    env_file = tmp_path / ".accounts.env"
+    env_file.write_text("".join(f"{k}={v}\n" for k, v in _ENV.items()), encoding="utf-8")
+
+    code = preflight_main(
+        [
+            "--config",
+            str(tmp_path / "missing.yaml"),
+            "--accounts-env",
+            str(env_file),
+            "--check-db",
+            "--db-path",
+            str(tmp_path / "backtests.db"),
+        ]
+    )
+
+    assert code == 1
+    out = capsys.readouterr().out
+    payload = json.loads(out[out.index("{") :])
+    assert payload["db_deployments"] is not None, "a requested check must not read as never run"
+    assert any("crashed" in e for e in payload["db_deployments"]["errors"]), payload[
+        "db_deployments"
+    ]
+
+
+def test_db_path_without_check_db_implies_the_check(tmp_path: Path, isolated_db, capsys) -> None:
+    """--db-path names a database to validate; ignoring it would be a silent green pass."""
+    database = isolated_db[0]
+    _seed(database)
+    config = _yaml(tmp_path, _YAML_ONE)
+    env_file = tmp_path / ".accounts.env"
+    env_file.write_text("".join(f"{k}={v}\n" for k, v in _ENV.items()), encoding="utf-8")
+
+    code = preflight_main(
+        [
+            "--config",
+            str(config),
+            "--accounts-env",
+            str(env_file),
+            "--db-path",
+            str(_db_path(database)),
+        ]
+    )
+
+    out = capsys.readouterr().out
+    payload = json.loads(out[out.index("{") :])
+    assert payload["db_deployments"] is not None, "--db-path alone must run the DB check"
+    assert payload["db_deployments"]["db_path"] == str(_db_path(database))
+    assert code == 0, payload["db_deployments"]
