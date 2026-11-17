@@ -75,9 +75,30 @@ Signal durch `RiskEngine`.
 `gross - commission` (Viewer, `net_pnl`, Alpaca-CFEE-Backfill aus #143).
 Adapter normalisieren vor dem Speichern: cTrader meldet `ProtoOADeal.commission`
 als vorzeichenbehafteten Cashflow (Gebühr negativ) und wird über
-`base_adapter.commission_cost` negiert; Alpaca speichert `abs(commission)`.
-Bereits gespeicherte cTrader-Zeilen (vor dieser Änderung) tragen noch das rohe
-negative Vorzeichen und werden nicht automatisch migriert.
+`base_adapter.commission_cost` negiert; Alpaca meldet keine Commission (bekannte Null `0.0` oder NULL, siehe #124) und
+backfillt CFEE als positive Kosten.
+Bereits gespeicherte cTrader-Zeilen (vor dieser Änderung) trugen das rohe negative
+Vorzeichen; `init_db` wandelt sie einmalig per Migration
+(`_migrate_ctrader_commission_to_cost`, `abs` des gespeicherten Werts) in einen positiven
+Kostenwert um. Nur Konten mit Broker `ctrader` sind betroffen, NULL (unbekannt) und `0.0`
+bleiben. Die Migration ist in `schema_data_migrations` vermerkt und läuft genau einmal:
+ein erneutes `abs` würde einen vom korrigierten Adapter gespeicherten Rebate (negativ)
+in eine Gebühr verwandeln. Ein vor der Änderung gespeicherter cTrader-Rebate (roh positiv)
+ist von einer neuen Gebühr nicht unterscheidbar und bleibt positiv.
+
+## Broker-Raster (Alpaca)
+
+Alpaca nimmt Bracket-/OTO-Entries nur in ganzen Stück und mit SL/TP auf dem
+Preisraster an (0.01 ab 1 USD, 0.0001 darunter). `AlpacaLiveAdapter` normalisiert
+jede Entry vor dem Persistieren: die risk-gesizte `qty` wird auf ganze Stück
+**abgerundet** (unter 1 Stück → abgelehnt), SL und TP werden **zum Entry hin**
+gerundet. Damit liegt das tatsächliche Risiko nie über dem gesizten Budget. Exit-only
+Orders (simple) bleiben unverändert.
+
+Vor dem Persistieren werden zusätzlich abgelehnt (ValueError, kein Signal-Row, keine
+Order): SL/TP auf der falschen Seite des Entry, SL/TP innerhalb eines Ticks vom Entry,
+fehlende/ungültige SL/TP-Level, Extended-Hours-Brackets und Crypto-Symbole (Alpaca
+kennt keine Bracket-/OTO-Orders für Crypto).
 
 ## Implizite Divergenz
 
