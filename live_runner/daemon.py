@@ -73,6 +73,7 @@ from live_runner.trailing_stops import (
     LiveTrailingStopManager,
     adapter_live_trailing_modes,
     run_trailing_stops_loop,
+    validate_adapter_trailing_timeframe,
 )
 from risk import RiskConfig, RiskEngine, TradeSignal
 from risk.live import (
@@ -846,6 +847,15 @@ def _apply_signal_processor(
     validate_trailing_sl_config(
         (processed.metadata or {}).get(TRAILING_SL_CONFIG_METADATA_KEY),
         supported=adapter_live_trailing_modes(adapter),
+        context=(
+            f"live deployment '{deployment.strategy_name}' ({deployment.id}) "
+            f"signal processor '{processor_name}'"
+        ),
+    )
+    validate_adapter_trailing_timeframe(
+        (processed.metadata or {}).get(TRAILING_SL_CONFIG_METADATA_KEY),
+        timeframe,
+        adapter=adapter,
         context=(
             f"live deployment '{deployment.strategy_name}' ({deployment.id}) "
             f"signal processor '{processor_name}'"
@@ -1743,6 +1753,12 @@ async def prepare_order_with_risk(
     validate_trailing_sl_config(
         metadata.get(TRAILING_SL_CONFIG_METADATA_KEY),
         supported=adapter_live_trailing_modes(adapter),
+        context=f"live deployment '{deployment.strategy_name}' ({deployment.id}) order submission",
+    )
+    validate_adapter_trailing_timeframe(
+        metadata.get(TRAILING_SL_CONFIG_METADATA_KEY),
+        _deployment_signal_timeframe(deployment),
+        adapter=adapter,
         context=f"live deployment '{deployment.strategy_name}' ({deployment.id}) order submission",
     )
     # Feed broker truth into sizing so max_positions / max_total_exposure actually

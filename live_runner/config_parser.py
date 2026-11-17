@@ -13,6 +13,12 @@ from shared.logging import get_logger
 from shared.models import LiveAccountConfig, LiveDeploymentConfig
 from shared.trailing import validate_live_deployment_trailing_override
 
+
+def _signal_timeframe(deployment: LiveDeploymentConfig) -> str:
+    configured = (deployment.signal_config or {}).get("timeframe")
+    return str(configured or deployment.timeframe or "").strip()
+
+
 logger = get_logger("live-runner")
 
 _UNEXPANDED_ENV_PATTERN = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}")
@@ -119,6 +125,7 @@ def parse_live_deployments_config(
             deployment.signal_config,
             context=f"live deployment '{deployment.strategy_name}'",
             broker=account_brokers.get(deployment.account_id),
+            timeframe=_signal_timeframe(deployment),
         )
         if deployment.account_id not in account_ids:
             logger.warning(

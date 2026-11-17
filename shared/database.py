@@ -72,6 +72,13 @@ from shared.models import (
 )
 from shared.trailing import validate_live_deployment_trailing_override
 
+
+def _deployment_trailing_timeframe(deployment: Any) -> str:
+    """The timeframe a deployment signals on (signal_config override, else its own)."""
+    configured = (deployment.signal_config or {}).get("timeframe")
+    return str(configured or deployment.timeframe or "").strip()
+
+
 logger = get_logger("database")
 
 # shared.constants loads .env exactly once (see its module docstring); importing
@@ -4050,6 +4057,7 @@ def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentCo
             deployment.signal_config,
             context=f"live deployment '{deployment.strategy_name}'",
             broker=account.broker,
+            timeframe=_deployment_trailing_timeframe(deployment),
         )
         deployment_status = str(deployment.status or "ACTIVE").upper()
         if deployment_status not in {"ACTIVE", "PAUSED", "STOPPED"}:
@@ -4439,6 +4447,7 @@ def update_live_deployment_account(
                 record.to_live_deployment().signal_config,
                 context=f"live deployment '{record.strategy_name}' re-point",
                 broker=account.broker,
+                timeframe=_deployment_trailing_timeframe(record.to_live_deployment()),
             )
 
             current_status = str(record.status or "").strip().upper()

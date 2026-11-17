@@ -532,3 +532,117 @@ def test_stored_row_load_logs_an_error_for_unsupported_trailing_mode(monkeypatch
     assert "unsupported trailing mode" in msg
     assert "supertrend_flip" in str(args)
     assert kwargs["extra"]["data"]["deployment_id"] == STORED_ID
+
+
+# ── trailing needs a trailable timeframe (#150: never trade untrailed) ───────
+
+_UNTRAILABLE = ["1d", "4h", "1w"]
+
+
+@pytest.mark.parametrize("timeframe", _UNTRAILABLE)
+def test_broker_aware_override_check_rejects_percent_on_an_untrailable_timeframe(
+    timeframe: str,
+) -> None:
+    with pytest.raises(ValueError, match="cannot be executed live on timeframe"):
+        validate_live_deployment_trailing_override(
+            _PERCENT, context="test", broker="alpaca", timeframe=timeframe
+        )
+    validate_live_deployment_trailing_override(
+        _PERCENT, context="test", broker="alpaca", timeframe="1h"
+    )
+    validate_live_deployment_trailing_override(
+        {"signal_processor_config": {"trailing_mode": "none"}},
+        context="test",
+        broker="alpaca",
+        timeframe=timeframe,
+    )
+
+
+@pytest.mark.parametrize("timeframe", _UNTRAILABLE)
+def test_creating_a_percent_deployment_on_an_untrailable_timeframe_is_refused(
+    isolated_db, timeframe: str
+) -> None:
+    database, _engine, _data_dir = isolated_db
+    database.ensure_live_account("acct-alpaca", "alpaca")
+    refused = LiveDeploymentConfig(
+        strategy_name="ramjet-live",
+        account_id="acct-alpaca",
+        symbols=["AAPL"],
+        timeframe=timeframe,
+        signal_config=_PERCENT,
+    )
+    with pytest.raises(ValueError, match="cannot be executed live on timeframe"):
+        database.create_live_deployment(refused)
+    assert database.get_live_deployment(str(refused.id)) is None
+
+
+@pytest.mark.parametrize("timeframe", _UNTRAILABLE)
+def test_yaml_percent_deployment_on_an_untrailable_timeframe_is_refused(
+    tmp_path, timeframe: str
+) -> None:
+    from live_runner.config_parser import parse_live_deployments_config
+
+    config = tmp_path / "live.yaml"
+    config.write_text(
+        f"""
+accounts:
+  - id: alp
+    broker: alpaca
+deployments:
+  - strategy_name: ramjet-live
+    account_id: alp
+    symbols: [AAPL]
+    timeframe: {timeframe}
+    signal_config:
+      signal_processor_config:
+        trailing_mode: percent
+""",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="cannot be executed live on timeframe"):
+        parse_live_deployments_config(config)
+
+
+_ALPACA_SERVING = SimpleNamespace(
+    broker_name="alpaca",
+    supports_stop_amendment=True,
+    supports_market_data_timeframe=lambda timeframe: timeframe
+    in {"1m", "5m", "15m", "30m", "1h", "1d"},
+)
+
+
+@pytest.mark.parametrize("timeframe", _UNTRAILABLE)
+def test_processor_gate_refuses_a_percent_entry_on_an_untrailable_timeframe(
+    monkeypatch, timeframe: str
+) -> None:
+    monkeypatch.setattr(
+        daemon,
+        "get_signal_processor",
+        lambda name, config: _Processor({"mode": "percent", "percent": 0.02}),
+    )
+    monkeypatch.setattr(daemon, "_build_processor_market_data", lambda signal, timeframe: None)
+    signal = TradeSignal(
+        action="buy", symbol="AAPL", entry_price=100.0, stop_loss=None,
+        take_profit=None, timeframe=timeframe, metadata={},
+    )
+    deployment = _deployment({"signal_processor": "ramjet"})
+    deployment.timeframe = timeframe
+    with pytest.raises(ValueError, match="cannot be executed live on timeframe"):
+        daemon._apply_signal_processor(signal, deployment, adapter=_ALPACA_SERVING)
+
+
+@pytest.mark.parametrize("timeframe", _UNTRAILABLE)
+def test_order_preparation_refuses_a_percent_entry_on_an_untrailable_timeframe(
+    monkeypatch, timeframe: str
+) -> None:
+    async def _exposure(adapter, deployment):
+        raise AssertionError("sizing was reached past the trailing gate")
+
+    monkeypatch.setattr(daemon, "_broker_exposure_estimate", _exposure)
+    signal = _live_signal(
+        {"trailing_sl_config": {"mode": "percent", "percent": 0.02}, "stop_loss": 95.0}
+    )
+    deployment = _deployment()
+    deployment.timeframe = timeframe
+    with pytest.raises(ValueError, match="cannot be executed live on timeframe"):
+        asyncio.run(daemon.prepare_order_with_risk(_ALPACA_SERVING, deployment, signal))

@@ -50,9 +50,17 @@ not declare the `supports_stop_amendment` capability. Unknown brokers get `none`
   or a retry is due. A bar that is not published yet is re-requested with backoff (15 s doubling
   to 5 min), but only for up to 15 minutes after the boundary (at most one bar): after that the
   feed is treated as closed (night, weekend, holiday) and the next bar boundary tries again.
-- Timeframes: only the timeframes `AlpacaLiveAdapter.get_market_data` serves (`1m`, `5m`, `15m`,
-  `30m`, `1h`, `1d`) can be trailed. A `percent` deployment on any other timeframe (`4h`, `1w`,
-  ...) is given up on at the first pass with one CRITICAL alert; its stop stays where it is.
+- Timeframes: only `1m`, `5m`, `15m`, `30m` and `1h` can be trailed (`LIVE_TRAILING_TIMEFRAMES_BY_BROKER`
+  in `shared/trailing.py`). Their bars are stamped on UTC-aligned boundaries, which is what the
+  manager's wake-up slots and the "closed at open + length" rule assume. `1d` is NOT trailable
+  yet: Alpaca stamps equity daily bars at New-York midnight (05:00Z/04:00Z), so the trail would run
+  a session late versus replay. `4h`/`1w` are not served by the adapter at all. Per #150 such an
+  entry is refused, not traded untrailed: a `percent` entry on an untrailable timeframe is rejected
+  at signal time (processor gate and order-preparation gate), and a deployment that sets
+  `trailing_mode: percent` in `signal_processor_config` is rejected at API create and YAML parse. A
+  deployment whose trailing mode only comes from the signal processor's own default cannot be
+  checked before a signal exists; it is refused at its first entry. Session-aligned daily trailing
+  is a follow-up.
 - Amendment: the protective stop order is replaced in place (`PATCH /v2/orders/{id}`). The
   previous stop keeps working until the replacement is accepted and stays if it is refused; the
   stop is never cancelled in order to move it. The replace and the adapter's order sweeps (STOP
@@ -63,11 +71,17 @@ not declare the `supports_stop_amendment` capability. Unknown brokers get `none`
   stop order id, current and target stop, consecutive failure count) and sent to Sentry
   (`component=live_trailing_stops`). It is retried with the same backoff; the previous
   broker-side stop stays in force meanwhile.
-  A failure that repeats is not retried forever: after 12 consecutive failed passes for one
-  position (about 40 minutes at the backoff cap) the position is given up on with one CRITICAL
-  alert (`Live trailing stop given up on ...`), and nothing is amended or retried for it until
-  its entry signal or the position changes (a daemon restart also starts counting again). The
-  broker-side stop stays at its last level.
+  A failure that repeats is not retried forever: once failures have lasted 40 minutes without a
+  single success (`TRAILING_GIVE_UP_AFTER_SECONDS`, measured from the first of the consecutive
+  failures, so a 1m deployment is not given up on any sooner than a 1h one) the position is given
+  up on with one CRITICAL alert (`Live trailing stop given up on ...`). A failure of the
+  account-wide stop listing counts once per account, not once per position. A given-up position is
+  not retried at the normal pace and raises no further alerts, but it is probed every 15 minutes
+  (`TRAILING_GIVEN_UP_PROBE_SECONDS`): the first pass that succeeds resumes trailing (INFO
+  `Live trailing stop resumed ...`) and it catches up on the closed bars it missed (up to 50).
+  Failures no retry can fix (an unservable timeframe, an adapter without market data) are never
+  probed and last until the entry signal or the position changes (a daemon restart also starts
+  counting again). The broker-side stop stays at its last level while given up.
   This includes a trailed stop the market has already fallen through since the bar closed: the
   broker refuses it, the old stop keeps protecting the position, and the replay backtest would
   have exited on that bar instead.

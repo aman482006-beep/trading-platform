@@ -1052,23 +1052,24 @@ def test_alpaca_reports_which_timeframes_it_serves() -> None:
     ] == [True] * 6 + [False] * 5
 
 
-def test_a_repeating_failure_is_given_up_on_after_the_limit(live: _Live, surfaced) -> None:
+def test_a_repeating_failure_is_given_up_on_after_the_time_limit(live: _Live, surfaced) -> None:
     live.client.orders.append(
         _FakeOrder("stop-2", "AAPL", "sell", order_type="stop", qty=5, stop_price=97.0)
     )
     manager = LiveTrailingStopManager()
     live.closes.append(103.0)
     moment = T0 + MINUTE + timedelta(seconds=2)
+    start = moment
+    limit = timedelta(seconds=trailing_stops.TRAILING_GIVE_UP_AFTER_SECONDS)
 
-    for _ in range(trailing_stops.TRAILING_MAX_CONSECUTIVE_FAILURES + 5):
+    while moment - start <= limit + timedelta(hours=1):
         live.tick(manager, moment)
         moment += timedelta(seconds=trailing_stops.TRAILING_RETRY_MAX_SECONDS)
 
-    limit = trailing_stops.TRAILING_MAX_CONSECUTIVE_FAILURES
-    assert len(surfaced) == limit
-    assert "given up" in surfaced[-1][0]
-    assert surfaced[-1][1]["consecutive_failures"] == limit
-    assert all("given up" not in message for message, _ in surfaced[:-1])
+    given_up = [event for event in surfaced if "given up" in event[0]]
+    assert len(given_up) == 1
+    assert surfaced[-1] is given_up[0]
+    assert given_up[0][1]["consecutive_failures"] >= 2
     assert live.client.replace_calls == []
     assert manager._schedules[ACCOUNT].retry_at is None
 
@@ -1078,6 +1079,163 @@ def test_a_repeating_failure_is_given_up_on_after_the_limit(live: _Live, surface
     live.tick(manager, moment)
     live.tick(manager, moment + timedelta(minutes=1))
     assert live.client.replace_calls != []
+
+
+class _Outage:
+    """Market data that fails with a 503 between two moments (a flaky data API)."""
+
+    def __init__(self, live: _Live) -> None:
+        self.live = live
+        self.failing = False
+        working = live.adapter.get_market_data
+
+        async def _flaky(symbol, *, timeframe, limit=200):
+            if self.failing:
+                raise RuntimeError("503 Service Unavailable")
+            return await working(symbol, timeframe=timeframe, limit=limit)
+
+        live.adapter.get_market_data = _flaky  # type: ignore[method-assign]
+
+    def run(self, manager, *, minutes: int, start: int = 1) -> None:
+        """Tick once a minute (a 1m deployment visits every bar boundary)."""
+        for minute in range(start, start + minutes):
+            if len(self.live.closes) < minute:
+                self.live.closes.append(100.0 + minute)
+            self.live.tick(manager, T0 + minute * MINUTE + timedelta(seconds=2))
+
+
+def test_a_short_data_outage_does_not_stop_a_1m_trail(live: _Live, surfaced) -> None:
+    outage = _Outage(live)
+    manager = LiveTrailingStopManager()
+    outage.run(manager, minutes=1)
+    outage.failing = True
+
+    outage.run(manager, minutes=9, start=2)  # ~9 minutes of 503s: well under the limit
+
+    assert all("given up" not in message for message, _ in surfaced)
+    assert not manager._trails[(ACCOUNT, "AAPL")].outage.given_up
+    outage.failing = False
+    before = len(live.client.replace_calls)
+    outage.run(manager, minutes=1, start=11)
+    assert len(live.client.replace_calls) > before
+    assert manager._trails[(ACCOUNT, "AAPL")].consecutive_failures == 0
+
+
+def test_a_long_outage_gives_up_once_then_resumes_when_data_recovers(
+    live: _Live, surfaced, monkeypatch
+) -> None:
+    infos: list[str] = []
+    monkeypatch.setattr(
+        trailing_stops.logger, "info", lambda message, *a, **k: infos.append(str(message))
+    )
+    outage = _Outage(live)
+    manager = LiveTrailingStopManager()
+    outage.run(manager, minutes=1)
+    outage.failing = True
+    minutes = trailing_stops.TRAILING_GIVE_UP_AFTER_SECONDS // 60
+
+    outage.run(manager, minutes=minutes + 40, start=2)  # past the limit, then well beyond
+
+    given_up = [message for message, _ in surfaced if "given up" in message]
+    assert len(given_up) == 1  # one CRITICAL, no alert storm while probing
+    errors_after = [m for m, _ in surfaced[surfaced.index(
+        next(e for e in surfaced if "given up" in e[0])
+    ) + 1 :]]
+    assert errors_after == []
+    assert manager._trails[(ACCOUNT, "AAPL")].outage.given_up
+
+    outage.failing = False
+    before = len(live.client.replace_calls)
+    outage.run(
+        manager,
+        minutes=trailing_stops.TRAILING_GIVEN_UP_PROBE_SECONDS // 60 + 1,
+        start=minutes + 42,
+    )
+
+    assert len(live.client.replace_calls) > before  # trailing resumed and amended
+    assert not manager._trails[(ACCOUNT, "AAPL")].outage.given_up
+    assert any("resumed" in message for message in infos)
+
+
+def test_an_account_level_listing_failure_counts_once_per_account(
+    live: _Live, surfaced
+) -> None:
+    live.client.positions.append(_FakePosition("MSFT", 10))
+    second = LiveSignal(
+        deployment_id=str(live.deployment.id),
+        symbol="MSFT",
+        action="buy",
+        theoretical_price=100.0,
+        timestamp=T0,
+        metadata={"stop_loss": 98.0, "trailing_sl_config": {"mode": "percent", "percent": 0.01}},
+    )
+    live.database.save_live_signal(second)
+    live.database.save_live_execution(
+        LiveExecution(
+            signal_id=second.id,
+            actual_price=100.0,
+            filled_qty=10.0,
+            commission=0.0,
+            timestamp=T0,
+            broker_order_id="entry-msft",
+        )
+    )
+    live.deployment.symbols = ["AAPL", "MSFT"]
+    listings: list[int] = []
+
+    async def _boom():
+        listings.append(1)
+        raise RuntimeError("503 listing orders")
+
+    live.adapter.list_protective_stops = _boom  # type: ignore[method-assign]
+    manager = LiveTrailingStopManager()
+    live.closes.append(103.0)
+
+    live.tick(manager, T0 + MINUTE + timedelta(seconds=2))
+
+    assert len(surfaced) == 1  # one failure for the account, not one per position
+    assert len(listings) == 1
+    assert manager._schedules[ACCOUNT].stops_outage.failures == 1
+    assert manager._schedules[ACCOUNT].retry_at is not None
+
+
+@pytest.mark.parametrize("timeframe", ["1d", "4h", "1w"])
+def test_unservable_timeframes_are_not_trailable_on_alpaca(live: _Live, timeframe: str) -> None:
+    assert trailing_stops.adapter_live_trailing_timeframes(live.adapter) == {
+        "1m",
+        "5m",
+        "15m",
+        "30m",
+        "1h",
+    }
+    with pytest.raises(ValueError, match="cannot be executed live on timeframe"):
+        trailing_stops.validate_adapter_trailing_timeframe(
+            {"mode": "percent", "percent": 0.01},
+            timeframe,
+            adapter=live.adapter,
+            context="test",
+        )
+    # mode none and no config never need a trailable timeframe
+    trailing_stops.validate_adapter_trailing_timeframe(
+        {"mode": "none"}, timeframe, adapter=live.adapter, context="test"
+    )
+    trailing_stops.validate_adapter_trailing_timeframe(
+        None, timeframe, adapter=live.adapter, context="test"
+    )
+
+
+def test_a_1d_deployment_is_given_up_on_not_trailed_a_session_late(
+    live: _Live, surfaced
+) -> None:
+    live.deployment.timeframe = "1d"
+    manager = LiveTrailingStopManager()
+
+    live.tick(manager, T0 + timedelta(days=1, seconds=2))
+
+    assert live.client.replace_calls == []
+    assert len(surfaced) == 1
+    assert "given up" in surfaced[0][0]
+    assert "cannot serve '1d'" in surfaced[0][1]["error"]
 
 
 def test_a_success_resets_the_failure_count(live: _Live, surfaced) -> None:

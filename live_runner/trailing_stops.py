@@ -41,7 +41,7 @@ import asyncio
 import contextlib
 import math
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -58,6 +58,8 @@ from shared.trailing import (
     TRAILING_MODE_NONE,
     TRAILING_SL_CONFIG_METADATA_KEY,
     live_supported_trailing_modes,
+    live_trailing_timeframes,
+    validate_live_trailing_timeframe,
     validate_trailing_sl_config,
 )
 
@@ -74,11 +76,16 @@ TRAILING_BAR_LOOKBACK = 50
 TRAILING_RETRY_INITIAL_SECONDS = 15.0
 TRAILING_RETRY_MAX_SECONDS = 300.0
 #: A failure that keeps repeating for one position (a pyramided bracket, a
-#: malformed stored config, an unusable bar) is not transient. After this many
-#: consecutive failed passes (~40 min at the backoff cap) the position is given
-#: up on: one CRITICAL alert, no further retries or alerts until the position
-#: or its entry signal changes. The broker-side stop stays in force.
-TRAILING_MAX_CONSECUTIVE_FAILURES = 12
+#: malformed stored config, an unusable bar, a long data outage) is not
+#: transient. Once failures have lasted this long WITHOUT a single success
+#: (measured from the first of the consecutive failures, so the pass rate of a
+#: fast timeframe does not shorten it) the position is given up on: one CRITICAL
+#: alert and no more retries or alerts. The broker-side stop stays in force.
+TRAILING_GIVE_UP_AFTER_SECONDS = 40 * 60
+#: A given-up position is still probed this often (no alert): the first pass
+#: that succeeds resumes trailing and logs INFO. Failures that no retry can fix
+#: (an unservable timeframe, a missing capability) are not probed.
+TRAILING_GIVEN_UP_PROBE_SECONDS = 15 * 60
 #: How long after a bar boundary a not-yet-published bar is treated as "late"
 #: and retried with backoff (capped at one bar). Beyond it the feed is closed
 #: (night, weekend, holiday), not late: the pass waits for the next boundary
@@ -106,16 +113,68 @@ def adapter_live_trailing_modes(adapter: Any) -> frozenset[str]:
     return live_supported_trailing_modes(broker, supports_stop_amendment=can_amend)
 
 
+def adapter_live_trailing_timeframes(adapter: Any) -> frozenset[str]:
+    """Signal timeframes the live path can trail on through this adapter instance.
+
+    The per-broker table in ``shared.trailing`` AND the adapter's own market-data
+    capability must both allow a timeframe; anything unknown resolves to none.
+    """
+    if adapter is None:
+        return frozenset()
+    try:
+        timeframes = live_trailing_timeframes(getattr(adapter, "broker_name", ""))
+        serves = getattr(adapter, "supports_market_data_timeframe", None)
+        if callable(serves):
+            timeframes = frozenset(item for item in timeframes if serves(item))
+    except Exception:
+        return frozenset()
+    return timeframes
+
+
+def validate_adapter_trailing_timeframe(
+    trailing_cfg: Any, timeframe: Any, *, adapter: Any, context: str
+) -> None:
+    """#150: refuse an entry whose trailing cannot run on its timeframe (never trade untrailed)."""
+    if not isinstance(trailing_cfg, Mapping):
+        return
+    validate_live_trailing_timeframe(
+        trailing_cfg.get("mode"),
+        timeframe,
+        supported_timeframes=adapter_live_trailing_timeframes(adapter),
+        context=context,
+    )
+
+
+@dataclass
+class _Outage:
+    """A run of consecutive failures and whether it has been given up on."""
+
+    failures: int = 0
+    first_failure_at: datetime | None = None
+    #: Given up on (see ``TRAILING_GIVE_UP_AFTER_SECONDS``); probed, not retried.
+    given_up: bool = False
+    #: No retry can fix it: never probed.
+    permanent: bool = False
+    next_probe_at: datetime | None = None
+
+    def probe_blocked(self, moment: datetime) -> bool:
+        if not self.given_up:
+            return False
+        return self.permanent or self.next_probe_at is None or moment < self.next_probe_at
+
+
 @dataclass
 class _Trail:
     """In-memory progress of one trailed position. Safe to lose."""
 
     signal_id: str
     last_bar_time: datetime | None = None
-    consecutive_failures: int = 0
-    #: Given up on (see ``TRAILING_MAX_CONSECUTIVE_FAILURES``) until the signal changes.
-    disabled: bool = False
+    outage: _Outage = field(default_factory=_Outage)
     stop_qty_warned: bool = False
+
+    @property
+    def consecutive_failures(self) -> int:
+        return self.outage.failures
 
 
 @dataclass
@@ -123,6 +182,8 @@ class _AccountSchedule:
     last_slot: int | None = None
     retry_at: datetime | None = None
     retry_delay: float = TRAILING_RETRY_INITIAL_SECONDS
+    #: Failures of the account-wide stop listing, counted once per account.
+    stops_outage: _Outage = field(default_factory=_Outage)
 
 
 class _TrailingFailure(Exception):
@@ -302,10 +363,11 @@ class LiveTrailingStopManager:
 
         needs_retry = False
         stops: list[ProtectiveStop] | None = None
+        stops_unavailable = False
         for symbol, position in positions.items():
             key = (account_id, symbol)
             entry = entry_signals.get(symbol)
-            if self._is_given_up(key, entry):
+            if self._is_given_up(key, entry, moment):
                 continue
             context = {
                 "account_id": account_id,
@@ -319,8 +381,16 @@ class LiveTrailingStopManager:
                 if trailing_cfg is None or entry is None:
                     self._trails.pop(key, None)
                     continue
+                if stops is None and not stops_unavailable:
+                    # One account-wide read shared by every position: a failure
+                    # is one failure of the account, not one per position.
+                    stops, wants_retry = await self._read_stops(
+                        account_id, adapter, moment, context
+                    )
+                    stops_unavailable = stops is None
+                    needs_retry |= wants_retry
                 if stops is None:
-                    stops = list(await adapter.list_protective_stops())
+                    continue
                 needs_retry |= await self._trail_position(
                     key=key,
                     adapter=adapter,
@@ -335,7 +405,7 @@ class LiveTrailingStopManager:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                needs_retry |= self._record_failure(key, entry, exc, context)
+                needs_retry |= self._record_failure(key, entry, exc, context, moment)
         return needs_retry
 
     @staticmethod
@@ -352,14 +422,105 @@ class LiveTrailingStopManager:
                 positions[symbol] = row
         return positions
 
-    def _is_given_up(self, key: tuple[str, str], entry: Mapping[str, Any] | None) -> bool:
+    def _is_given_up(
+        self, key: tuple[str, str], entry: Mapping[str, Any] | None, moment: datetime
+    ) -> bool:
+        """Whether this pass leaves a given-up position alone (no probe due)."""
         trail = self._trails.get(key)
         return (
             trail is not None
-            and trail.disabled
             and entry is not None
             and trail.signal_id == str(entry["signal_id"])
+            and trail.outage.probe_blocked(moment)
         )
+
+    async def _read_stops(
+        self,
+        account_id: str,
+        adapter: BaseLiveAdapter,
+        moment: datetime,
+        context: Mapping[str, Any],
+    ) -> tuple[list[ProtectiveStop] | None, bool]:
+        """The account's protective stops, or ``None`` when unavailable this pass."""
+        outage = self._schedules[account_id].stops_outage
+        if outage.probe_blocked(moment):
+            return None, False
+        account_context = {
+            "account_id": account_id,
+            "adapter": type(adapter).__name__,
+            "scope": "account protective-stop listing",
+        }
+        try:
+            stops = list(await adapter.list_protective_stops())
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return None, self._record_outage(outage, exc, account_context, moment)
+        self._resume(outage, account_context)
+        return stops, False
+
+    @staticmethod
+    def _resume(outage: _Outage, context: Mapping[str, Any]) -> None:
+        """A pass succeeded: end the failure run; say so if it had been given up on."""
+        if outage.given_up:
+            logger.info(
+                "Live trailing stop resumed after a given-up failure recovered",
+                extra={"data": dict(context)},
+            )
+        outage.failures = 0
+        outage.first_failure_at = None
+        outage.given_up = False
+        outage.permanent = False
+        outage.next_probe_at = None
+
+    def _record_outage(
+        self,
+        outage: _Outage,
+        exc: BaseException,
+        context: dict[str, Any],
+        moment: datetime,
+        *,
+        permanent: bool = False,
+    ) -> bool:
+        """Count one failed pass; returns whether an early retry is wanted.
+
+        Give-up is based on the time since the first of the consecutive failures,
+        never on the number of passes: a 1m deployment visits every minute and
+        would otherwise give up in a fraction of the outage the limit is meant to
+        ride out. A given-up outage is probed at a low rate and stays quiet.
+        """
+        if outage.given_up:
+            outage.next_probe_at = moment + timedelta(seconds=TRAILING_GIVEN_UP_PROBE_SECONDS)
+            logger.warning(
+                "Live trailing stop probe still failing; staying given up",
+                extra={"data": {**context, "error": repr(exc)}},
+            )
+            return False
+        if outage.first_failure_at is None:
+            outage.first_failure_at = moment
+        outage.failures += 1
+        context["consecutive_failures"] = outage.failures
+        elapsed = (moment - outage.first_failure_at).total_seconds()
+        if permanent or elapsed >= TRAILING_GIVE_UP_AFTER_SECONDS:
+            outage.given_up = True
+            outage.permanent = permanent
+            outage.next_probe_at = moment + timedelta(seconds=TRAILING_GIVEN_UP_PROBE_SECONDS)
+            self._surface(
+                "Live trailing stop given up on for this position; the broker-side stop "
+                "stays at its last level and is no longer amended"
+                + (
+                    " or retried until the position or its entry signal changes"
+                    if permanent
+                    else f" until a probe (every {TRAILING_GIVEN_UP_PROBE_SECONDS // 60} min) "
+                    "succeeds or the position or its entry signal changes"
+                ),
+                exc,
+                context,
+                critical=True,
+            )
+            return False
+        self._surface(_RETRY_MESSAGE, exc, context)
+        return True
 
     def _record_failure(
         self,
@@ -367,6 +528,7 @@ class LiveTrailingStopManager:
         entry: Mapping[str, Any] | None,
         exc: BaseException,
         context: dict[str, Any],
+        moment: datetime,
     ) -> bool:
         """Surface one failed pass; returns whether an early retry is wanted."""
         trail = self._trails.get(key)
@@ -376,22 +538,8 @@ class LiveTrailingStopManager:
         if trail is None:
             self._surface(_RETRY_MESSAGE, exc, context)
             return True
-        trail.consecutive_failures += 1
-        context["consecutive_failures"] = trail.consecutive_failures
         permanent = isinstance(exc, _TrailingFailure) and exc.permanent
-        if permanent or trail.consecutive_failures >= TRAILING_MAX_CONSECUTIVE_FAILURES:
-            trail.disabled = True
-            self._surface(
-                "Live trailing stop given up on for this position; the broker-side stop "
-                "stays at its last level and is no longer amended or retried until the "
-                "position or its entry signal changes",
-                exc,
-                context,
-                critical=True,
-            )
-            return False
-        self._surface(_RETRY_MESSAGE, exc, context)
-        return True
+        return self._record_outage(trail.outage, exc, context, moment, permanent=permanent)
 
     def _trailing_config(
         self,
@@ -482,6 +630,8 @@ class LiveTrailingStopManager:
         newest_seen = bars[-1][0] if bars else trail.last_bar_time
         awaiting_bar = self._is_awaiting_bar(newest_seen, moment, bar_seconds)
         if not bars:
+            # The data was served: a failure run (and a give-up) is over.
+            self._resume(trail.outage, context)
             return awaiting_bar
 
         target = self._trail_target(
@@ -515,7 +665,7 @@ class LiveTrailingStopManager:
         # needed): a failed amendment leaves these bars unprocessed, so the
         # retry recomputes the same target.
         trail.last_bar_time = bars[-1][0]
-        trail.consecutive_failures = 0
+        self._resume(trail.outage, context)
         return awaiting_bar
 
     @staticmethod
@@ -527,7 +677,9 @@ class LiveTrailingStopManager:
                 permanent=True,
             )
         serves = getattr(adapter, "supports_market_data_timeframe", None)
-        if callable(serves) and not serves(timeframe):
+        if (callable(serves) and not serves(timeframe)) or str(
+            timeframe
+        ).strip().lower() not in adapter_live_trailing_timeframes(adapter):
             # No retry can make the broker serve this timeframe.
             raise _TrailingFailure(
                 f"{type(adapter).__name__} cannot serve {timeframe!r} market data, so a "

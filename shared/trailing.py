@@ -66,6 +66,18 @@ LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER: dict[str, frozenset[str]] = {
     "ctrader": LIVE_BASELINE_TRAILING_MODES,
 }
 
+#: Signal timeframes a live broker can trail on, per broker. Trailing is replayed
+#: bar by bar (a bar counts as closed at ``open + length``) and the live manager
+#: wakes at UTC-aligned bar boundaries, so only timeframes whose bars the broker
+#: stamps on UTC-aligned boundaries qualify. Alpaca stamps equity daily bars at
+#: New-York midnight (05:00Z/04:00Z), so ``1d`` would trail a session late versus
+#: replay; ``4h``/``1w`` are not served by its market-data adapter at all. Proper
+#: session-aligned daily trailing is a follow-up. A broker without an entry here
+#: trails on no timeframe.
+LIVE_TRAILING_TIMEFRAMES_BY_BROKER: dict[str, frozenset[str]] = {
+    "alpaca": frozenset({"1m", "5m", "15m", "30m", "1h"}),
+}
+
 #: Modes at least one live broker executes. This is NOT a gate for trading a
 #: signal — it only bounds what a deployment may request before its account's
 #: broker is known (model validation). Every later stage validates per broker.
@@ -208,6 +220,7 @@ def validate_live_deployment_trailing_override(
     *,
     context: str,
     broker: Any = ANY_BROKER,
+    timeframe: Any = None,
 ) -> None:
     """Validate a live deployment's trailing-mode override, if it sets one.
 
@@ -241,8 +254,47 @@ def validate_live_deployment_trailing_override(
             f"{context} signal_processor_config.trailing_mode "
             f"on broker {broker_label!r}"
         )
-    validate_trailing_mode(
+    mode = validate_trailing_mode(
         processor_config.get("trailing_mode"),
         supported=supported,
         context=where,
     )
+    # With a broker AND a timeframe (the stages that know both) the mode must
+    # also be trailable on that timeframe.
+    if broker is not ANY_BROKER and timeframe is not None:
+        validate_live_trailing_timeframe(
+            mode,
+            timeframe,
+            supported_timeframes=live_trailing_timeframes(broker),
+            context=f"{context} on broker {str(broker or '').strip().lower() or 'unknown'!r}",
+        )
+
+
+def live_trailing_timeframes(broker: Any) -> frozenset[str]:
+    """Signal timeframes the live path can trail on for one broker (fail closed: none)."""
+    normalized = str(broker or "").strip().lower()
+    return LIVE_TRAILING_TIMEFRAMES_BY_BROKER.get(normalized, frozenset())
+
+
+def validate_live_trailing_timeframe(
+    mode: Any,
+    timeframe: Any,
+    *,
+    supported_timeframes: frozenset[str],
+    context: str,
+) -> None:
+    """Refuse a trailing mode (other than ``none``) on a timeframe live cannot trail.
+
+    #150: an unservable trail must be refused at entry, never traded untrailed.
+    ``mode`` is the already-validated trailing mode (``None`` means no trailing).
+    """
+    if mode is None or normalize_trailing_mode(mode) == TRAILING_MODE_NONE:
+        return
+    normalized = str(timeframe or "").strip().lower()
+    if normalized not in supported_timeframes:
+        allowed = ", ".join(sorted(supported_timeframes)) or "none"
+        raise ValueError(
+            f"{context}: trailing mode {normalize_trailing_mode(mode)!r} cannot be "
+            f"executed live on timeframe {timeframe!r} (trailable timeframes: {allowed}); "
+            "refusing to trade it without the requested trailing stop"
+        )
