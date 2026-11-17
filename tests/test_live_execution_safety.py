@@ -4953,7 +4953,7 @@ def test_alpaca_extended_hours_bracket_is_refused_before_persistence(monkeypatch
     assert saved == []
 
 
-@pytest.mark.parametrize("symbol", ["BTC/USD", "ETHUSD"])
+@pytest.mark.parametrize("symbol", ["BTC/USD", "ETHUSD", "BTC-USD", "ETH-USDT"])
 def test_alpaca_crypto_bracket_entry_is_refused_before_persistence(monkeypatch, symbol):
     # Alpaca crypto has no bracket/OTO orders; refuse instead of a post-persist 422.
     adapter, submitted, saved = _alpaca_bracket_adapter(monkeypatch)

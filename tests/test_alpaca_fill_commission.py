@@ -1676,6 +1676,13 @@ def test_alpaca_symbol_classification(symbol, expected):
         ("BTCUSD", ("BTC", "USD")),
         ("SOLUSDT", ("SOL", "USDT")),
         ("ETHBTC", ("ETH", "BTC")),
+        ("BTC-USD", ("BTC", "USD")),
+        ("eth-usdt", ("ETH", "USDT")),
+        ("BRK-B", None),
+        ("BF-B", None),
+        ("BTC-EUR", None),
+        ("BT-USD", None),
+        ("BTC-USD-X", None),
         ("AAPL", None),
         ("AAPL261120C00200000", None),
     ],
@@ -2329,3 +2336,26 @@ def test_plan_refuses_a_zero_quantity_local_order_without_aborting_the_pass():
     (plan,) = plans
     assert plan.problem is not None and "no positive recorded quantity" in plan.problem
     assert plan.commissions == {}
+
+
+@pytest.mark.parametrize(
+    ("symbol", "expected"),
+    [
+        ("BTC-USD", "crypto"),
+        ("ETH-USDT", "crypto"),
+        ("BRK-B", "us_equity"),
+        ("BF-B", "us_equity"),
+        ("BTC-EUR", "unknown"),
+    ],
+)
+def test_hyphen_symbols_classify_like_their_slash_spelling(symbol, expected):
+    from shared.alpaca_symbols import classify_alpaca_symbol
+
+    assert classify_alpaca_symbol(symbol) == expected
+
+
+@pytest.mark.parametrize("symbol", ["BTC-USD", "BTC/USD", "btcusd"])
+def test_crypto_pair_key_is_one_key_for_every_spelling(symbol):
+    from shared.alpaca_symbols import crypto_pair_key
+
+    assert crypto_pair_key(symbol) == "BTCUSD"
