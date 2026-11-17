@@ -610,3 +610,45 @@ def test_db_path_without_check_db_implies_the_check(tmp_path: Path, isolated_db,
     assert payload["db_deployments"] is not None, "--db-path alone must run the DB check"
     assert payload["db_deployments"]["db_path"] == str(_db_path(database))
     assert code == 0, payload["db_deployments"]
+
+
+def _yaml_equity_momentum() -> LiveDeploymentConfig:
+    return LiveDeploymentConfig(
+        strategy_name="equity_momentum",
+        account_id="alpaca-paper",
+        symbols=["AAPL"],
+        timeframe="1h",
+    )
+
+
+def test_padded_stored_symbol_is_an_error_not_a_clean_match(isolated_db) -> None:
+    """The daemon matches a stored symbol verbatim (upper, no strip): " AAPL " never matches AAPL.
+
+    Normalizing both sides before comparing would call this row clean while it is dead.
+    """
+    database = isolated_db[0]
+    _seed(database, symbols=(" AAPL ",))
+
+    report = run_db_preflight(
+        [_yaml_equity_momentum()],
+        db_path=_db_path(database),
+    )
+
+    assert any('" AAPL "' in e and "match" in e for e in report.errors), report.errors
+    assert not any("has no symbols" in e for e in report.errors), report.errors
+
+
+def test_non_string_stored_symbols_are_not_manufactured_into_symbols(isolated_db) -> None:
+    """A foreign row with [null] is an error naming the item, not the symbol "NONE"."""
+    database = isolated_db[0]
+    _seed(database)
+    with sqlite3.connect(database.DB_PATH) as connection:
+        connection.execute("UPDATE live_deployments SET symbols = '[null]'")
+
+    report = run_db_preflight(
+        [_yaml_equity_momentum()],
+        db_path=_db_path(database),
+    )
+
+    assert any("null" in e and "not clean" in e for e in report.errors), report.errors
+    assert not any("NONE" in w for w in report.warnings + report.errors), report.errors

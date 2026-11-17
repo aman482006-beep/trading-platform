@@ -47,6 +47,8 @@ The daemon trades the ACTIVE rows of the `live_deployments` table, not the YAML.
   never saw);
 - an ACTIVE row whose `account_id` is not in `live_accounts`, or whose symbols or timeframe are
   empty;
+- an ACTIVE row with a stored symbol that is padded, blank or not a string (`" AAPL"`, `null`): the
+  daemon's Discord signal match compares a stored symbol verbatim, so that symbol never matches;
 - two ACTIVE rows for the same `(strategy_name, account_id)` — the daemon dispatches every ACTIVE
   match, so the same strategy would submit a second order per signal;
 - a `DATABASE_URL` that points at an in-memory database, which no read-only check can inspect;
@@ -56,8 +58,9 @@ Warnings (the preflight still exits 0): a YAML deployment with no ACTIVE DB row 
 not trade it), a YAML deployment listed twice, and any field where the DB value and the YAML
 disagree — `symbols`, `timeframe`, `signal_source` (the flag that routes a deployment's Discord
 signals) and `signal_source_id` (which credential it is dispatched with). Symbols and timeframes are
-normalized on both sides the way their writers normalize them, so a spelling difference is not
-reported as drift. The DB value is what runs, so a warning means the daemon is about to trade
+normalized on both sides before they are compared, so a case or alias difference (`aapl`, `1H`) is
+not reported as drift. Whitespace around a stored symbol is not normalized away: the row is an error
+above, because the daemon does not match it. The DB value is what runs, so a warning means the daemon is about to trade
 something other than what the YAML says.
 
 The read-only open cannot run WAL recovery. Against a WAL database left needing recovery (after an

@@ -37,6 +37,8 @@ class DbDeploymentRow:
     timeframe: str
     signal_source: str
     signal_source_id: str
+    #: Stored symbol items the daemon cannot match: non-strings, blanks, or padded spellings.
+    unclean_symbols: tuple[str, ...] = ()
 
     @property
     def key(self) -> DeploymentKey:
@@ -98,14 +100,27 @@ def resolve_db_path(explicit: str | Path | None = None) -> Path:
     return Path(constants.DATA_DIR) / "backtests.db"
 
 
-def _load_symbols(raw: Any) -> tuple[str, ...]:
+def _load_symbols(raw: Any) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """The stored symbols, and the items the daemon cannot match (as their JSON text).
+
+    The daemon matches a stored symbol with ``item.upper()`` and no strip, so a padded, blank or
+    non-string item never equals a signal's symbol. Those items are not normalized into the list
+    here: that would hide a row the daemon will not trade behind a clean-looking match.
+    """
     try:
         parsed = json.loads(raw) if isinstance(raw, str) else raw
     except ValueError:
-        return ()
+        return (), ()
     if not isinstance(parsed, list):
-        return ()
-    return tuple(str(item).strip().upper() for item in parsed if str(item).strip())
+        return (), ()
+    symbols: list[str] = []
+    unclean: list[str] = []
+    for item in parsed:
+        if isinstance(item, str) and item.strip() and item == item.strip():
+            symbols.append(item)
+        else:
+            unclean.append(json.dumps(item))
+    return tuple(symbols), tuple(unclean)
 
 
 def read_active_db_deployments(db_path: Path) -> tuple[list[DbDeploymentRow], set[str]]:
@@ -122,19 +137,23 @@ def read_active_db_deployments(db_path: Path) -> tuple[list[DbDeploymentRow], se
         account_ids = {str(row["id"]) for row in connection.execute("SELECT id FROM live_accounts")}
     finally:
         connection.close()
-    return (
-        [
+    deployments: list[DbDeploymentRow] = []
+    for row in rows:
+        symbols, unclean = _load_symbols(row["symbols"])
+        deployments.append(
             DbDeploymentRow(
                 id=str(row["id"]),
                 strategy_name=str(row["strategy_name"]),
                 account_id=str(row["account_id"]),
-                symbols=_load_symbols(row["symbols"]),
+                symbols=symbols,
                 timeframe=str(row["timeframe"] or ""),
                 signal_source=str(row["signal_source"] or ""),
                 signal_source_id=str(row["signal_source_id"] or ""),
+                unclean_symbols=unclean,
             )
-            for row in rows
-        ],
+        )
+    return (
+        deployments,
         account_ids,
     )
 
@@ -149,8 +168,14 @@ def _db_row_errors(row: DbDeploymentRow, db_account_ids: set[str]) -> list[str]:
     errors: list[str] = []
     if row.account_id not in db_account_ids:
         errors.append(f"DB deployment {row.label}: account_id is not in live_accounts.")
-    if not row.symbols:
+    if not row.symbols and not row.unclean_symbols:
         errors.append(f"DB deployment {row.label}: has no symbols configured.")
+    if row.unclean_symbols:
+        errors.append(
+            f"DB deployment {row.label}: stored symbols {', '.join(row.unclean_symbols)} are not "
+            "clean symbol strings; the daemon's Discord signal match compares a stored symbol "
+            "verbatim, so these will never match a signal. Rewrite the row's symbols."
+        )
     if not row.timeframe.strip():
         errors.append(f"DB deployment {row.label}: has no timeframe configured.")
     return errors
@@ -159,11 +184,12 @@ def _db_row_errors(row: DbDeploymentRow, db_account_ids: set[str]) -> list[str]:
 def _db_row_drift(row: DbDeploymentRow, yaml_dep: LiveDeploymentConfig) -> list[str]:
     """Fields where this DB row and its YAML twin disagree. The DB value is what runs.
 
-    The comparison normalizes both sides the way the writers do: symbols through
+    The comparison normalizes both sides: symbols through
     ``shared.constants.normalize_symbols`` and timeframes through
     ``shared.constants.normalize_timeframe``. Raw comparison would report a difference for every
-    cosmetic spelling (``" AAPL"``, ``1H`` vs ``1h``) and the warning would stop carrying
-    information.
+    cosmetic spelling (``aapl``, ``1H`` vs ``1h``) and the warning would stop carrying
+    information. A padded stored symbol is not hidden by this normalization: ``_db_row_errors``
+    reports it as an error.
 
     ``signal_source`` is on this list because the daemon gates Discord dispatch on the DB value
     (``live_runner.daemon._active_discord_deployments_for_account`` and

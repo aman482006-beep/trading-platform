@@ -78,10 +78,11 @@ def normalize_symbols(symbols: Sequence[str] | None) -> list[str]:
     """Uppercase stripped symbol entries, dropping blanks.
 
     One normalizer for every place a symbol list crosses a boundary: the YAML a
-    deployment is written from, the value stored in ``live_deployments.symbols``, and
-    the read-only comparison between the two. Two copies of this rule disagree the
-    moment one is edited, and " AAPL" vs "AAPL" is exactly the drift a comparison
-    then reports forever.
+    deployment is written from, the ``symbol_filter`` stored in ``live_deployments``, and
+    the read-only comparison of the stored ``symbols`` against the YAML. Two copies of
+    this rule disagree the moment one is edited, and " AAPL" vs "AAPL" is exactly the
+    drift a comparison then reports forever. Stored ``symbols`` are not normalized on
+    write, so the comparison reports a padded one as an error instead of matching it.
     """
     return [str(symbol).strip().upper() for symbol in (symbols or []) if str(symbol).strip()]
 
