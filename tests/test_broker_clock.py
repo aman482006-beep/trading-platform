@@ -316,15 +316,32 @@ def test_to_utc_is_the_right_inverse_of_to_server_time(clock):
 def test_to_utc_rejects_a_server_time_the_clock_skipped():
     # 2024-04-06 00:00 UTC the clock jumps UTC+2 -> UTC+3, so the broker never
     # shows 02:00-03:00 that morning; reading such a time would be a guess.
+    skipped = [pd.Timestamp("2024-04-06 02:30")]
     with pytest.raises(ValueError, match="never shows the server wall time"):
-        DUKASCOPY_MT5_INDEX.to_utc([pd.Timestamp("2024-04-06 02:30")])
+        DUKASCOPY_MT5_INDEX.to_utc(skipped)
 
 
-def test_to_utc_returns_the_first_occurrence_of_a_repeated_hour():
-    # 2024-11-10 07:00 UTC the clock steps back UTC+3 -> UTC+2, so 02:00-03:00
-    # happens twice; the first occurrence is the one before the step back.
+def test_to_utc_reads_a_wall_time_with_a_single_occurrence_before_the_step_back():
+    # 02:30 server time on 2024-11-10 is shown once: the Saturday-night reading
+    # 2024-11-09 23:30 UTC (UTC+3). It is not the repeated hour; see below.
     out = DUKASCOPY_MT5_INDEX.to_utc([pd.Timestamp("2024-11-10 02:30")])
     assert out[0] == pd.Timestamp("2024-11-09 23:30", tz="UTC")
+
+
+@pytest.mark.parametrize(
+    ("server_time", "expected_utc"),
+    [
+        # 2024-11-10 07:00 UTC the clock steps back UTC+3 -> UTC+2, so server
+        # 09:00-10:00 is shown twice (09:59:59 -> 09:00:00). The first occurrence
+        # is the UTC+3 one, 06:00-07:00 UTC; the second would be 07:00-08:00 UTC.
+        ("2024-11-10 09:00", "2024-11-10 06:00"),
+        ("2024-11-10 09:30", "2024-11-10 06:30"),
+        ("2024-11-10 09:59:59", "2024-11-10 06:59:59"),
+    ],
+)
+def test_to_utc_returns_the_first_occurrence_of_a_repeated_hour(server_time, expected_utc):
+    out = DUKASCOPY_MT5_INDEX.to_utc([pd.Timestamp(server_time)])
+    assert out[0] == pd.Timestamp(expected_utc, tz="UTC")
 
 
 def test_to_utc_returns_utc_aware_times_and_keeps_nat():
