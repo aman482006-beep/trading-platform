@@ -4982,7 +4982,7 @@ def test_alpaca_extended_hours_bracket_is_refused_before_persistence(monkeypatch
     assert saved == []
 
 
-@pytest.mark.parametrize("symbol", ["BTC/USD", "ETHUSD"])
+@pytest.mark.parametrize("symbol", ["BTC/USD", "ETHUSD", "BTC-USD", "ETH-USDT"])
 def test_alpaca_crypto_bracket_entry_is_refused_before_persistence(monkeypatch, symbol):
     # Alpaca crypto has no bracket/OTO orders; refuse instead of a post-persist 422.
     adapter, submitted, saved = _alpaca_bracket_adapter(monkeypatch)
@@ -4990,6 +4990,21 @@ def test_alpaca_crypto_bracket_entry_is_refused_before_persistence(monkeypatch, 
 
     submission = adapter.submit_order(signal, qty=11.4)
     with pytest.raises(ValueError, match="crypto"):
+        asyncio.run(submission)
+
+    assert submitted == []
+    assert saved == []
+
+
+@pytest.mark.parametrize("symbol", ["BTC-EUR", "BTC-GBP", "AAPL261120C00200000", "AAPL!"])
+def test_alpaca_unclassifiable_bracket_entry_is_refused_before_persistence(monkeypatch, symbol):
+    # Fail closed: only a provable US equity may reach a BRACKET submit. A non-CRYPTO_QUOTES
+    # hyphen pair (BTC-EUR) or an option must not persist and then 422 at the broker (B-8).
+    adapter, submitted, saved = _alpaca_bracket_adapter(monkeypatch)
+    signal = _alpaca_entry("buy", 3000.0, 2900.0, 3200.0).model_copy(update={"symbol": symbol})
+
+    submission = adapter.submit_order(signal, qty=11.4)
+    with pytest.raises(ValueError, match="US equity"):
         asyncio.run(submission)
 
     assert submitted == []
