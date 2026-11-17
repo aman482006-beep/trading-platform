@@ -2416,6 +2416,13 @@ def _conflicting_broker_order_ids(metadata: Mapping[str, Any]) -> list[str]:
     return [str(item).strip() for item in raw if str(item).strip()]
 
 
+def _log_duplicate_live_signal_skipped(record: LiveSignalModel) -> None:
+    """Log the one duplicate shape that needs no ledger change (shared by both skip paths)."""
+    logger.info(
+        "Skipping duplicate live signal (discord_message_id=%s)", record.discord_message_id
+    )
+
+
 def _reconcile_existing_live_signal(
     session: Session, existing: LiveSignalModel, record: LiveSignalModel
 ) -> None:
@@ -2428,9 +2435,7 @@ def _reconcile_existing_live_signal(
     new_broker_id = (record.broker_order_id or "").strip()
     existing_broker_id = (existing.broker_order_id or "").strip()
     if not new_broker_id or new_broker_id == existing_broker_id:
-        logger.info(
-            "Skipping duplicate live signal (discord_message_id=%s)", record.discord_message_id
-        )
+        _log_duplicate_live_signal_skipped(record)
         return
     # Either a backfill (the stored row has no id) or a conflict (it has a different one). Both
     # are read-modify-writes on state this session may have loaded before a concurrent duplicate
@@ -2456,9 +2461,7 @@ def _reconcile_existing_live_signal(
     if new_broker_id == existing_broker_id:
         # A concurrent duplicate already stored this very id; ends the lock taken above.
         session.commit()
-        logger.info(
-            "Skipping duplicate live signal (discord_message_id=%s)", record.discord_message_id
-        )
+        _log_duplicate_live_signal_skipped(record)
         return
     # A second, different broker order id for one logical signal: either a second broker
     # order was placed or the ids were mapped wrongly. Either way a broker order may exist
