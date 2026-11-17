@@ -25,6 +25,7 @@ from shared.trailing import (
     REPLAY_SUPPORTED_TRAILING_MODES,
     RISK_ENGINE_SUPPORTED_TRAILING_MODES,
     live_supported_trailing_modes,
+    tp1_partial_quantity,
     validate_live_deployment_trailing_override,
     validate_trailing_mode,
     validate_trailing_sl_config,
@@ -55,7 +56,8 @@ def _deployment(signal_config: dict | None = None) -> LiveDeploymentConfig:
 
 def test_support_sets_are_what_the_paths_can_execute() -> None:
     assert KNOWN_TRAILING_MODES == {"none", "percent", "supertrend_flip"}
-    assert REPLAY_SUPPORTED_TRAILING_MODES == {"none", "percent"}
+    # #168: replay executes supertrend_flip itself; the risk engine does not.
+    assert REPLAY_SUPPORTED_TRAILING_MODES == {"none", "percent", "supertrend_flip"}
     assert RISK_ENGINE_SUPPORTED_TRAILING_MODES == {"none", "percent"}
     # Live support is per broker (#167): percent on Alpaca only.
     assert LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER == {
@@ -95,11 +97,13 @@ def test_unknown_mode_is_rejected(value) -> None:
 
 
 def test_known_but_unsupported_mode_is_rejected_with_its_own_message() -> None:
-    with pytest.raises(ValueError, match="not supported by the replay path"):
+    # #168 made replay support supertrend_flip; the live Alpaca set still
+    # lacks it, so it carries the "known but unsupported" case now.
+    with pytest.raises(ValueError, match="not supported by the live path"):
         validate_trailing_mode(
             "supertrend_flip",
-            supported=REPLAY_SUPPORTED_TRAILING_MODES,
-            context="the replay path",
+            supported=LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER["alpaca"],
+            context="the live path",
         )
 
 
@@ -646,3 +650,84 @@ def test_order_preparation_refuses_a_percent_entry_on_an_untrailable_timeframe(
     deployment.timeframe = timeframe
     with pytest.raises(ValueError, match="cannot be executed live on timeframe"):
         asyncio.run(daemon.prepare_order_with_risk(_ALPACA_SERVING, deployment, signal))
+
+
+# ── #168: a complete supertrend_flip config is still refused live ────────────
+
+_FULL_FLIP_CONFIG = {
+    "mode": "supertrend_flip",
+    "breakeven_after_tp1": True,
+    "activation_phase": "wait_for_first_green_after_tp1",
+    "exit_phase": "exit_on_first_red_after_activation",
+    "supertrend_period": 10,
+    "supertrend_multiplier": 3.0,
+}
+
+
+@pytest.mark.parametrize("adapter", [_ALPACA_LIKE, _CTRADER_LIKE, None])
+def test_live_signal_with_a_complete_supertrend_flip_config_is_refused(
+    monkeypatch, adapter
+) -> None:
+    """Replay executes supertrend_flip (#168); live refuses it on every broker
+    even when the config is complete — the refusal is about the mode."""
+    with pytest.raises(ValueError, match="'supertrend_flip' is not supported"):
+        _process(monkeypatch, _FULL_FLIP_CONFIG, adapter)
+
+
+@pytest.mark.parametrize("adapter", [_ALPACA_LIKE, _CTRADER_LIKE])
+def test_order_preparation_refuses_a_complete_supertrend_flip_config(
+    monkeypatch, adapter
+) -> None:
+    async def _exposure(adapter, deployment):
+        raise AssertionError("sizing was reached past the trailing gate")
+
+    monkeypatch.setattr(daemon, "_broker_exposure_estimate", _exposure)
+    signal = _live_signal(
+        {
+            "trailing_sl_config": _FULL_FLIP_CONFIG,
+            "stop_loss": 95.0,
+            "tp1_price": 110.0,
+            "tp1_exit_percent": 0.5,
+        }
+    )
+    deployment = _deployment()
+    with pytest.raises(ValueError, match="'supertrend_flip' is not supported"):
+        asyncio.run(daemon.prepare_order_with_risk(adapter, deployment, signal))
+
+
+@pytest.mark.parametrize("broker", ["alpaca", "ctrader", None, "ibkr"])
+def test_deployment_override_supertrend_flip_is_refused_per_broker(broker) -> None:
+    with pytest.raises(ValueError, match="supertrend_flip"):
+        validate_live_deployment_trailing_override(
+            {"signal_processor_config": {"trailing_mode": "supertrend_flip"}},
+            context="test",
+            broker=broker,
+        )
+
+
+# ── #168: the TP1 tranche is whole shares, floored ──────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("quantity", "fraction", "expected"),
+    [
+        (7.0, 0.5, 3.0),
+        (1.0, 0.5, 0.0),  # the original bot: nothing to sell at TP1
+        (7.5, 0.5, 3.0),  # 3.75 floors to 3, never up to 4
+        (7.0, 0.25, 1.0),
+        (200.0, 0.5, 100.0),
+        (7.0, 1.0, 7.0),  # a full fraction still floors to the whole quantity
+        (0.0, 0.5, 0.0),
+        (-7.0, 0.5, 0.0),  # fail closed: never a negative tranche
+        (3.0, 0.999999, 2.0),  # never rounds up to the whole position
+    ],
+)
+def test_tp1_partial_quantity_floors_to_whole_shares(quantity, fraction, expected) -> None:
+    assert tp1_partial_quantity(quantity, fraction) == expected
+
+
+def test_tp1_partial_quantity_of_non_finite_inputs_is_zero() -> None:
+    """A non-finite quantity/fraction cannot produce a tranche: 0, which the
+    caller must treat as \"nothing to sell\" (never a NaN order quantity)."""
+    for quantity, fraction in ((float("nan"), 0.5), (7.0, float("inf")), (7.0, float("nan"))):
+        assert tp1_partial_quantity(quantity, fraction) == 0.0
