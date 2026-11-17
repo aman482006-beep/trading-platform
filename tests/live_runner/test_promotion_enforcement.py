@@ -184,6 +184,15 @@ class _Adapter(BaseLiveAdapter):
     async def get_positions(self) -> list[dict[str, Any]]:
         return list(self.positions)
 
+    async def get_pip_value(self, symbol: str):
+        # #146: sizing needs a trusted broker pip value for entries.
+        from live_runner.base_adapter import LivePipValue
+
+        return LivePipValue(
+            value=1.0, units_per_qty=1.0, conversion_rate=1.0,
+            quote_asset="USD", account_asset="USD", source="test",
+        )
+
 
 def _entry_signal(**metadata: Any) -> LiveSignal:
     return LiveSignal(
