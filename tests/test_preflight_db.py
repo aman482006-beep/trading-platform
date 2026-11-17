@@ -670,3 +670,43 @@ def test_active_db_row_whose_yaml_twin_is_paused_names_the_paused_entry(isolated
 
     assert any("YAML lists it as PAUSED" in e for e in report.errors), report.errors
     assert not any("absent from the YAML" in e for e in report.errors), report.errors
+
+
+def _stored_symbol_filter(database, deployment_id: str) -> list[str]:
+    with sqlite3.connect(database.DB_PATH) as connection:
+        raw = connection.execute(
+            "SELECT symbol_filter FROM live_deployments WHERE id = ?", (deployment_id,)
+        ).fetchone()[0]
+    return json.loads(raw)
+
+
+def test_symbol_filter_is_normalized_on_write_and_on_read(isolated_db) -> None:
+    """A cosmetically dirty symbol_filter is stored clean and read back clean.
+
+    The stored column is checked directly: the returned object is rehydrated through the read
+    path, which would hide a write that stored the dirty spelling.
+    """
+    database = isolated_db[0]
+    database.ensure_live_account("alpaca-paper", "alpaca", name="alpaca-paper")
+    config = LiveDeploymentConfig(
+        strategy_name="equity_momentum",
+        account_id="alpaca-paper",
+        symbols=["AAPL"],
+        timeframe="1h",
+        symbol_filter=[" aapl ", "MSFT", " "],
+    )
+
+    created = database.create_live_deployment(config)
+
+    assert _stored_symbol_filter(database, str(created.id)) == ["AAPL", "MSFT"]
+    model = database.LiveDeploymentModel.from_live_deployment(config)
+    assert model.symbol_filter_json == ["AAPL", "MSFT"]
+
+    with sqlite3.connect(database.DB_PATH) as connection:
+        connection.execute(
+            "UPDATE live_deployments SET symbol_filter = ? WHERE id = ?",
+            ('[" aapl ", " "]', str(created.id)),
+        )
+    read_back = database.get_live_deployment(str(created.id))
+    assert read_back is not None
+    assert read_back.symbol_filter == ["AAPL"]
