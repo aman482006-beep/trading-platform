@@ -910,7 +910,6 @@ def _own_ledger_of_four(monkeypatch, deployment):
     """#142: an exit closes the deployment's own ledger quantity (here 4)."""
     for name, value in (
         ("get_account_net_filled_qty_by_deployment", lambda a, s: {str(deployment.id): 4.0}),
-        ("get_live_deployment_net_filled_qty", lambda d, s: 4.0),
         ("list_live_deployment_unfilled_exit_orders", lambda d, s: []),
         ("list_account_unfilled_exit_orders", lambda a, s, **k: []),
     ):

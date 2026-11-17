@@ -316,9 +316,6 @@ def _patch_ledger(
         calls.append((account_id, symbol))
         return dict(ledgers)
 
-    def _own_ledger(deployment_id: str, symbol: str) -> float:
-        return ledgers.get(deployment_id, 0.0)
-
     def _unfilled_exits(deployment_id: str, symbol: str) -> list[dict]:
         return list(unfilled_exits or [])
 
@@ -334,7 +331,6 @@ def _patch_ledger(
     monkeypatch.setattr(
         daemon, "list_account_unfilled_exit_orders", _account_unfilled_exits, raising=False
     )
-    monkeypatch.setattr(daemon, "get_live_deployment_net_filled_qty", _own_ledger, raising=False)
     return calls
 
 
