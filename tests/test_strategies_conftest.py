@@ -17,7 +17,6 @@ These cover the three silent-skip defects of Cleanup 17-B:
 from __future__ import annotations
 
 import importlib.util
-from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -246,9 +245,12 @@ def test_ohlcv_root_defaults_to_the_suite_data_dir(gate, monkeypatch, tmp_path):
     assert gate._ohlcv_root() == tmp_path / "ohlcv"
 
 
-def test_ohlcv_opt_in_reads_a_local_dataset_outside_the_suite_data_dir(gate, monkeypatch, tmp_path):
+def test_ohlcv_opt_in_reads_a_local_dataset_outside_the_suite_data_dir(
+    gate, monkeypatch, tmp_path
+):
     """The suite's DATA_DIR is a throwaway dir, so a developer's real datasets are invisible unless
-    they name them explicitly with TP_TEST_OHLCV_DIR (read-only; the data-dir guard never sees it)."""
+    they name them explicitly with TP_TEST_OHLCV_DIR (read-only; the data-dir guard never sees
+    it)."""
     local_datasets = tmp_path / "local-datasets"
     _write_shard(local_datasets / "forex" / "EURUSD" / "1h.parquet", "2024-01-01", "2024-01-02")
     monkeypatch.delenv("TP_TEST_OHLCV_DIR", raising=False)

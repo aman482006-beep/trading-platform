@@ -47,7 +47,8 @@ def diff_snapshots(
 ) -> list[str]:
     changes = [f"created: {p}" for p in sorted(after.keys() - before.keys())]
     changes += [f"deleted: {p}" for p in sorted(before.keys() - after.keys())]
-    changes += [f"modified: {p}" for p in sorted(p for p in before.keys() & after.keys() if before[p] != after[p])]
+    modified = sorted(p for p in before.keys() & after.keys() if before[p] != after[p])
+    changes += [f"modified: {p}" for p in modified]
     return changes
 
 
@@ -65,10 +66,11 @@ def pytest_configure(config: pytest.Config) -> None:
 def pytest_sessionfinish(session: pytest.Session) -> None:
     """Fail the run loudly if the repo's real ``data/`` directory changed during the session.
 
-    Limits, by design: the window is ``pytest_configure`` to here, so writes after the session (atexit
-    handlers, threads still running after the last test) are not seen. The check cannot attribute a
-    change to the suite: any process writing ``data/`` during the run (e.g. a live viewer or daemon in
-    the same checkout) fails it too. The remedy is to stop that process or run the suite elsewhere.
+    Limits, by design: the window is ``pytest_configure`` to here, so writes after the session
+    (atexit handlers, threads still running after the last test) are not seen. The check cannot
+    attribute a change to the suite: any process writing ``data/`` during the run (e.g. a live
+    viewer or daemon in the same checkout) fails it too. The remedy is to stop that process or run
+    the suite elsewhere.
     """
     if hasattr(session.config, "workerinput") or _REPO_DATA_BEFORE is None:
         return
@@ -80,9 +82,9 @@ def pytest_sessionfinish(session: pytest.Session) -> None:
     print(
         f"\n\nERROR: the repo data directory {REPO_DATA_DIR} changed during the test session:"
         f"\n  {shown}{more}"
-        "\nTests must write under tmp_path / the session DATA_DIR only. This check cannot tell which"
-        "\nprocess made the change: if a running viewer or daemon in this checkout wrote it, stop that"
-        "\nprocess or run the suite from a separate checkout.",
+        "\nTests must write under tmp_path / the session DATA_DIR only. This check cannot tell"
+        " which process made the change: if a running viewer or daemon in this checkout wrote it,"
+        " stop that process or run the suite from a separate checkout.",
         file=sys.stderr,
     )
     session.exitstatus = pytest.ExitCode.TESTS_FAILED
