@@ -230,7 +230,10 @@ Bedingung nennt, erzeugt eine neue Entry-Order.
   Adapter noch einmal (cTrader-Volumen per Floor statt `round()`). Ein Exit
   schließt so nie mehr als den verlangten Anteil bzw. die eigene Menge. Fällt
   er auf 0, wird er ignoriert und auf `WARNING` geloggt, mit `requested_qty`
-  und `qty_step`. Entries runden wie bisher.
+  und `qty_step`. Entries werden ebenfalls nie aufgerundet: der cTrader-Adapter
+  rundet das Entry-Volumen per Floor auf den Broker-`stepVolume` ab
+  (`_floor_to_volume_step`); liegt das Ergebnis unter `minVolume`, wird die
+  Order wie bisher abgelehnt, nie auf das Minimum hochgesetzt.
 - **Ledger-Überhang: Deckelung am Broker + Alert (#121, Entscheidung 2):** Ein
   Exit schließt nur die eigene Ledger-Menge des Deployments, höchstens aber die
   Broker-Position: `Menge = min(eigene Ledger-Menge, Broker-Menge)`, dann der

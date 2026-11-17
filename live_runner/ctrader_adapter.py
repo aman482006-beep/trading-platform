@@ -285,9 +285,11 @@ class SymbolScale:
     ``lot_size_from_broker``: the broker sent ``lotSize`` itself. A "broker"
     scale may still borrow a missing ``lotSize`` from the fallback table; the
     pip value (#146) is only derived from a broker-sent one.
-    ``step_volume``: broker volume increment (``stepVolume``). Exits round DOWN
-    to it (#121 review). Unknown means one broker volume unit, so a full close of
-    the real position volume is never cut short.
+    ``step_volume``: broker volume increment (``stepVolume``). cTrader rejects
+    any order volume that is not a multiple of it (``TRADING_BAD_VOLUME``), so
+    entries and exits are both floored onto this grid. Unknown means one broker
+    volume unit (no known grid), so a full close of the real position volume is
+    never cut short.
     """
 
     volume_per_qty: float
@@ -397,6 +399,24 @@ def _fallback_symbol_scale(symbol: str) -> SymbolScale:
     )
 
 
+def _optional_int(value: Any) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_float(value: Any) -> float | None:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _fallback_field(fallback: SymbolScale | None, name: str, default: Any = None) -> Any:
+    return getattr(fallback, name) if fallback is not None else default
+
+
 def _symbol_scale_from_broker_props(
     *,
     digits: int | None,
@@ -406,35 +426,23 @@ def _symbol_scale_from_broker_props(
     step_volume: Any = None,
 ) -> SymbolScale | None:
     """Build a broker-authoritative scale, using a fallback only when available."""
-    try:
-        digit_count = int(digits) if digits is not None else None
-    except (TypeError, ValueError):
-        digit_count = None
+    digit_count = _optional_int(digits)
     if digit_count is None or not 0 <= digit_count <= 10:
-        digit_count = fallback.price_digits if fallback is not None else None
-    try:
-        lots = float(lot_size) if lot_size is not None else None
-    except (TypeError, ValueError):
-        lots = None
+        digit_count = _fallback_field(fallback, "price_digits")
+    lots = _optional_float(lot_size)
     lots_from_broker = lots is not None and math.isfinite(lots) and lots > 0
     if not lots_from_broker:
-        lots = fallback.lot_size if fallback is not None else None
-    try:
-        minimum = int(min_volume) if min_volume is not None else None
-    except (TypeError, ValueError):
-        minimum = None
+        lots = _fallback_field(fallback, "lot_size")
+    minimum = _optional_int(min_volume)
     if minimum is None or minimum <= 0:
-        minimum = fallback.min_volume if fallback is not None else None
+        minimum = _fallback_field(fallback, "min_volume")
     if digit_count is None or lots is None or minimum is None:
         return None
-    try:
-        step = int(step_volume) if step_volume is not None else None
-    except (TypeError, ValueError):
-        step = None
-    if step is None or isinstance(step_volume, bool) or step <= 0:
+    step = _optional_int(step_volume)
+    if step is None or step <= 0:
         # Protobuf reports an unset optional as 0. One unit never cuts a full
         # close short; a wrong partial is the broker's to reject, never upsized.
-        step = 1
+        step = _fallback_field(fallback, "step_volume", 1)
     return SymbolScale(
         volume_per_qty=lots / 100.0,
         price_digits=digit_count,
@@ -458,6 +466,20 @@ def _qty_to_broker_volume(qty: float, volume_per_qty: float = QTY_VOLUME_SCALE) 
             "refusing to submit an order with a default size."
         )
     return volume
+
+
+def _floor_to_volume_step(volume: int, step_volume: int) -> int:
+    """Floor *volume* onto the broker's volume grid.
+
+    cTrader rejects an order whose volume is not a multiple of the symbol's
+    ``stepVolume`` (``TRADING_BAD_VOLUME``). A risk-sized volume almost never
+    lands on that grid, so it is rounded DOWN: rounding up would exceed the
+    risk budget. A result below the broker minimum is refused by the caller.
+    """
+    step = int(step_volume)
+    if step <= 1:
+        return int(volume)
+    return (int(volume) // step) * step
 
 
 def _broker_volume_to_qty(volume: float, volume_per_qty: float = QTY_VOLUME_SCALE) -> float:
@@ -1583,7 +1605,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         if str(metadata.get("risk_sizing_mode") or "") == EXIT_ONLY_RISK_SIZING_MODE:
             volume = self._exit_volume(signal.symbol, qty, scale)
         else:
-            volume = _qty_to_broker_volume(qty, scale.volume_per_qty)
+            # Entries: floor onto the broker grid (never exceed the risk budget).
+            volume = _floor_to_volume_step(
+                _qty_to_broker_volume(qty, scale.volume_per_qty), scale.step_volume
+            )
         if volume < scale.min_volume:
             raise ValueError(
                 f"Risk-sized volume {volume} for {signal.symbol} is below "
