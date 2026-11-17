@@ -13260,7 +13260,10 @@ async def get_live_dashboard() -> dict[str, Any]:
     }
 
 
-@app.post("/api/live/deployments/ctrader/top5")
+@app.post(
+    "/api/live/deployments/ctrader/top5",
+    responses={409: {"description": "A deployment is refused by the promotion gate (#165)"}},
+)
 async def deploy_top_ctrader_strategies(payload: CTraderTopDeployRequest) -> dict[str, Any]:
     limit = max(1, min(int(payload.limit or 5), 20))
     status = "ACTIVE" if payload.activate else "PAUSED"
@@ -13408,7 +13411,11 @@ def _validate_live_deployment_route(
         ) from exc
 
 
-@app.post(LIVE_DEPLOYMENTS_PATH, status_code=201)
+@app.post(
+    LIVE_DEPLOYMENTS_PATH,
+    status_code=201,
+    responses={409: {"description": "The deployment is refused by the promotion gate (#165)"}},
+)
 async def create_live_deployment_endpoint(
     payload: LiveDeploymentCreateRequest,
 ) -> dict[str, Any]:
@@ -13652,7 +13659,10 @@ async def _reverify_account_against_broker(account_id: str) -> bool:
     return False
 
 
-@app.put("/api/live/deployments/{deployment_id}/status")
+@app.put(
+    "/api/live/deployments/{deployment_id}/status",
+    responses={409: {"description": "Activation is refused by the promotion gate (#165)"}},
+)
 async def update_live_deployment_status_endpoint(
     deployment_id: str,
     payload: LiveDeploymentStatusUpdateRequest,
