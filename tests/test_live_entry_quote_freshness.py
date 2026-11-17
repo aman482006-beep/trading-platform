@@ -293,13 +293,20 @@ def test_stale_rejection_is_logged_with_age_and_rule(caplog):
     assert data["max_entry_quote_age_seconds"] == pytest.approx(10.0)
 
 
-def test_exit_only_orders_still_skip_the_gate():
+def test_exit_only_orders_still_skip_the_gate(monkeypatch):
     @dataclass
     class _Book(_Adapter):
         async def get_positions(self) -> list[dict[str, Any]]:
             return [{"symbol": "AAPL", "qty": 4.0}]
 
     deployment = _deployment()
+    for name, value in (
+        ("get_account_net_filled_qty_by_deployment", lambda a, s: {str(deployment.id): 4.0}),
+        ("list_live_deployment_unfilled_exit_orders", lambda d, s: []),
+        ("list_account_unfilled_exit_orders", lambda a, s, **k: []),
+    ):
+        # #142: an exit closes the deployment's own ledger quantity (here 4).
+        monkeypatch.setattr(daemon, name, value, raising=False)
     adapter = _Book(quote=_quote(age=None))
     signal = _signal(deployment, {"exit_only": True}).model_copy(update={"action": "sell"})
 

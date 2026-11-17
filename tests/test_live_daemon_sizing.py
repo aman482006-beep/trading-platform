@@ -211,10 +211,19 @@ def test_deployment_risk_config_rejects_non_positive_notional_cap():
 # ── reduce-only guarantees on the real exit path ──────────────────────────────
 
 
-def test_exit_only_close_takes_broker_qty_and_ignores_payload_quantities():
+def test_exit_only_close_takes_broker_qty_and_ignores_payload_quantities(monkeypatch):
     """Was test_size_live_signal_reduce_only_flattens_broker_qty_ignoring_metadata.
     The daemon's exit-only path is the live reduce path."""
     deployment = _deployment()
+    # #142: an exit closes the deployment's own ledger quantity (here the whole
+    # broker position of 7), never a payload quantity.
+    for name, value in (
+        ("get_account_net_filled_qty_by_deployment", lambda a, s: {str(deployment.id): 7.0}),
+        ("get_live_deployment_net_filled_qty", lambda d, s: 7.0),
+        ("list_live_deployment_unfilled_exit_orders", lambda d, s: []),
+        ("list_account_unfilled_exit_orders", lambda a, s, **k: []),
+    ):
+        monkeypatch.setattr(daemon, name, value, raising=False)
     broker = _Broker(positions=[{"symbol": "AAPL", "qty": 7.0}])
     signal = _signal(
         {

@@ -924,9 +924,20 @@ def test_gate_rejection_is_logged_with_quote_deviation_and_rule(
     assert data["max_entry_deviation_sl_fraction"] == pytest.approx(0.25)
 
 
-def test_exit_only_orders_are_not_gated():
+def _own_ledger_of_four(monkeypatch, deployment):
+    """#142: an exit closes the deployment's own ledger quantity (here 4)."""
+    for name, value in (
+        ("get_account_net_filled_qty_by_deployment", lambda a, s: {str(deployment.id): 4.0}),
+        ("list_live_deployment_unfilled_exit_orders", lambda d, s: []),
+        ("list_account_unfilled_exit_orders", lambda a, s, **k: []),
+    ):
+        monkeypatch.setattr(daemon, name, value, raising=False)
+
+
+def test_exit_only_orders_are_not_gated(monkeypatch):
     """Exit-only closes reduce exposure; the deviation gate is for entries."""
     deployment = _deployment()
+    _own_ledger_of_four(monkeypatch, deployment)
     adapter = _GateAdapter(
         quote_error=RuntimeError("must not be asked"),
         positions=[{"symbol": "AAPL", "qty": 4.0}],
@@ -1077,14 +1088,14 @@ def test_entry_gate_settings_rejects_zero_max_age():
 
 
 def test_entry_deviation_rejects_wrong_side_stop_for_buy():
-    """entry_deviation_sl_fraction must reject stop_loss >= entry_price for a buy (mutation test gap)."""
+    """entry_deviation_sl_fraction rejects stop_loss >= entry_price for a buy."""
     from risk.live import entry_deviation_sl_fraction
     with pytest.raises(ValueError, match="wrong side"):
         entry_deviation_sl_fraction("buy", entry_price=100.0, stop_loss=105.0, quote_price=100.0)
 
 
 def test_entry_deviation_rejects_wrong_side_stop_for_sell():
-    """entry_deviation_sl_fraction must reject stop_loss <= entry_price for a sell (mutation test gap)."""
+    """entry_deviation_sl_fraction rejects stop_loss <= entry_price for a sell."""
     from risk.live import entry_deviation_sl_fraction
     with pytest.raises(ValueError, match="wrong side"):
         entry_deviation_sl_fraction("sell", entry_price=100.0, stop_loss=95.0, quote_price=100.0)
@@ -1094,7 +1105,9 @@ def test_daemon_sizing_metadata_does_not_leak_payload_current_positions():
     """The payload's current_positions must not appear in the sized metadata (mutation test gap)."""
     deployment = _deployment()
     adapter = _GateAdapter(quote=_at_entry())
-    signal = _signal(deployment, {"stop_loss": 95.0, "take_profit": 110.0, "current_positions": 999})
+    signal = _signal(
+        deployment, {"stop_loss": 95.0, "take_profit": 110.0, "current_positions": 999}
+    )
     prepared, _ = _prepare(adapter, deployment, signal)
     # The payload value should be dropped, not forwarded
     assert prepared.metadata.get("current_positions") == 0

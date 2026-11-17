@@ -190,6 +190,21 @@ def test_ctrader_get_quote_scales_spot_prices():
     assert list(sent[1].symbolId) == [1]
 
 
+def test_ctrader_spot_subscription_requests_the_broker_timestamp():
+    """The quote age rests on the broker's spot time, so the subscription must ask for it."""
+
+    def _push(adapter, request):
+        adapter._handle_spot_event(_spot(1, bid=108_512, ask=108_530, timestamp=1_762_700_000_000))
+
+    adapter, sent = _ctrader_adapter(on_subscribe=_push)
+
+    asyncio.run(adapter.get_quote("EURUSD"))
+
+    subscribe = sent[0]
+    assert subscribe.kind == "subscribe"
+    assert subscribe.subscribeToSpotTimestamp is True
+
+
 def test_ctrader_get_quote_combines_partial_spot_events():
     def _push(adapter, request):
         adapter._handle_spot_event(_spot(1, bid=108_500))
