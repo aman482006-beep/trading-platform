@@ -2424,6 +2424,13 @@ def _conflicting_broker_order_ids(metadata: Mapping[str, Any]) -> list[str]:
     return [str(item).strip() for item in raw if str(item).strip()]
 
 
+def _log_duplicate_live_signal_skipped(record: LiveSignalModel) -> None:
+    """Log the one duplicate shape that needs no ledger change (shared by both skip paths)."""
+    logger.info(
+        "Skipping duplicate live signal (discord_message_id=%s)", record.discord_message_id
+    )
+
+
 def _reconcile_existing_live_signal(
     session: Session, existing: LiveSignalModel, record: LiveSignalModel
 ) -> None:
@@ -2433,10 +2440,20 @@ def _reconcile_existing_live_signal(
     broker order id carried by the duplicate in the conflict list
     (``conflicting_broker_order_ids``) instead of replacing the tracked id.
     """
-    # Reconcile broker_order_id: if existing lacks it but new record has it, update
     new_broker_id = (record.broker_order_id or "").strip()
     existing_broker_id = (existing.broker_order_id or "").strip()
-    if new_broker_id and not existing_broker_id:
+    if not new_broker_id or new_broker_id == existing_broker_id:
+        _log_duplicate_live_signal_skipped(record)
+        return
+    # Either a backfill (the stored row has no id) or a conflict (it has a different one). Both
+    # are read-modify-writes on state this session may have loaded before a concurrent duplicate
+    # committed, so take the write lock and re-read before deciding. Without it two redeliveries
+    # with different ids on an empty tracked id would both backfill from a stale empty copy and
+    # the loser's id would land nowhere: a live broker order the ledger never tracks.
+    session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+    session.refresh(existing)
+    existing_broker_id = (existing.broker_order_id or "").strip()
+    if not existing_broker_id:
         existing.broker_order_id = new_broker_id
         # Also update metadata_json for consistency
         metadata = dict(existing.metadata_json or {})
@@ -2448,37 +2465,33 @@ def _reconcile_existing_live_signal(
             "Updated existing live signal with broker_order_id (discord_message_id=%s)",
             record.discord_message_id,
         )
-    elif new_broker_id and existing_broker_id and new_broker_id != existing_broker_id:
-        # A second, different broker order id for one logical signal: either a second broker
-        # order was placed or the ids were mapped wrongly. Either way a broker order may exist
-        # that the ledger does not track. The stored id is kept (never overwritten), but the
-        # conflicting id is persisted on the signal so operators and reconciliation can find
-        # and resolve it instead of it living only in a log line (issue #126).
-        # Take the write lock before reading the list: the copy loaded earlier in this session
-        # may be stale, and a concurrent duplicate must not commit between our read and write.
-        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
-        session.refresh(existing)
-        metadata = dict(existing.metadata_json or {})
-        conflicts = _conflicting_broker_order_ids(metadata)
-        if new_broker_id not in conflicts:
-            conflicts.append(new_broker_id)
-            metadata[BROKER_ORDER_CONFLICTS_KEY] = conflicts
-            existing.metadata_json = metadata
-            session.add(existing)
-        # Ends the write transaction opened above; a no-op commit when nothing changed.
-        session.commit()
-        logger.error(
-            "Conflicting broker_order_id for duplicate live signal: an untracked broker "
-            "order may exist (signal_id=%s, tracked=%s, conflicting=%s)",
-            existing.id,
-            existing_broker_id,
-            new_broker_id,
-        )
         return
-    else:
-        logger.info(
-            "Skipping duplicate live signal (discord_message_id=%s)", record.discord_message_id
-        )
+    if new_broker_id == existing_broker_id:
+        # A concurrent duplicate already stored this very id; ends the lock taken above.
+        session.commit()
+        _log_duplicate_live_signal_skipped(record)
+        return
+    # A second, different broker order id for one logical signal: either a second broker
+    # order was placed or the ids were mapped wrongly. Either way a broker order may exist
+    # that the ledger does not track. The stored id is kept (never overwritten), but the
+    # conflicting id is persisted on the signal so operators and reconciliation can find
+    # and resolve it instead of it living only in a log line (issue #126).
+    metadata = dict(existing.metadata_json or {})
+    conflicts = _conflicting_broker_order_ids(metadata)
+    if new_broker_id not in conflicts:
+        conflicts.append(new_broker_id)
+        metadata[BROKER_ORDER_CONFLICTS_KEY] = conflicts
+        existing.metadata_json = metadata
+        session.add(existing)
+    # Ends the write transaction opened above; a no-op commit when nothing changed.
+    session.commit()
+    logger.error(
+        "Conflicting broker_order_id for duplicate live signal: an untracked broker "
+        "order may exist (signal_id=%s, tracked=%s, conflicting=%s)",
+        existing.id,
+        existing_broker_id,
+        new_broker_id,
+    )
 
 
 def save_live_signal(signal: LiveSignal) -> tuple[str, bool]:
