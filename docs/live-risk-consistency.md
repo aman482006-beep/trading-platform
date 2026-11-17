@@ -98,7 +98,12 @@ jedes Live-Signal durch `RiskEngine`.
   Submit prüft nur die Symbol-Skala, nicht den Umrechnungskurs. Das SL-Budget ist
   daher keine harte Verlustgrenze in Konto-Währung. Ein expliziter `pip_value`-Override
   (`source="caller"`) trägt keine `units_per_qty`; cTrader verweigert ihn, weil die
-  Skala beim Submit nicht prüfbar wäre.
+  Skala beim Submit nicht prüfbar wäre. Jede Nutzung des Overrides schreibt eine
+  Warnung ins Log (`Caller-supplied pip_value override in use`), da er den
+  Broker-Lookup samt Frische-Prüfung umgeht.
+  Der cTrader-Volumen-Divisor (`CTRADER_VOLUME_PER_BASE_UNIT = 100`) ist nur auf den
+  Demo-Symbolklassen geprüft, auf denen er verifiziert wurde (EURUSD/FX, XAUUSD,
+  US500); für andere Klassen ist er unverifiziert.
   Nur ein vom Broker gesendetes `lotSize` zählt;
   die statische Fallback-Tabelle (in Basis-Einheiten, für FX/XAU 100x unter den
   Broker-Cent, #184) wird nie fürs Sizing benutzt. Ändert sich die Skala zwischen

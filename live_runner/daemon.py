@@ -1270,7 +1270,10 @@ async def _resolve_live_pip_value(
         raise _refuse(
             f"pip value {value!r} != units per qty {units_per_qty!r} * conversion rate {rate!r}"
         )
-    if rate != 1.0 and not resolved.conversion_quotes:
+    converts = resolved.quote_asset != resolved.account_asset or not math.isclose(
+        rate, 1.0, rel_tol=1e-12
+    )
+    if converts and not resolved.conversion_quotes:
         raise _refuse(f"conversion rate {rate!r} came without the quotes it was derived from")
     max_age = entry_gate_settings(deployment.settings).max_quote_age_seconds
     now = _utc_now()
