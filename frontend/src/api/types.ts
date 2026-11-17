@@ -1165,7 +1165,7 @@ export interface MaintenanceDeleteItem {
   error?: string;
   journal_pending?: boolean;
   /** Set on `skipped` items of a two-phase bulk delete: why the confirmed id
-   * was not deleted (e.g. `no_longer_empty`, `now_kept_entry`, `not_found`). */
+   * was not deleted (e.g. `no_longer_empty`, `now_kept_entry`, `no_longer_duplicate`, `not_found`, `recheck_failed`). */
   reason?: string;
 }
 
