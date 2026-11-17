@@ -200,7 +200,7 @@ def _db_row_drift(row: DbDeploymentRow, yaml_dep: LiveDeploymentConfig) -> list[
     deployment to.
     """
     differences: list[str] = []
-    db_symbols = tuple(sorted(row.symbols))
+    db_symbols = tuple(sorted(normalize_symbols(row.symbols)))
     yaml_symbols = tuple(sorted(normalize_symbols(yaml_dep.symbols)))
     if db_symbols != yaml_symbols:
         differences.append(f"symbols differ (DB {list(db_symbols)} vs YAML {list(yaml_symbols)})")

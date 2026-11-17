@@ -544,6 +544,33 @@ def test_cosmetic_spelling_is_not_drift(isolated_db) -> None:
     assert len(report.matched) == 1
 
 
+def test_a_lowercase_stored_symbol_is_not_drift(isolated_db) -> None:
+    """The daemon matches a stored symbol with ``.upper()``, so ``aapl`` trades as ``AAPL``.
+
+    The runbook promises a case difference is not reported as drift; the DB side has to be
+    normalized the same way as the YAML side, or this row warns about a spelling the daemon
+    never mismatches.
+    """
+    database = isolated_db[0]
+    _seed(database, symbols=("aapl",))
+
+    report = run_db_preflight(
+        [
+            LiveDeploymentConfig(
+                strategy_name="equity_momentum",
+                account_id="alpaca-paper",
+                symbols=["AAPL"],
+                timeframe="1h",
+            )
+        ],
+        db_path=_db_path(database),
+    )
+
+    assert report.errors == []
+    assert report.warnings == [], report.warnings
+    assert len(report.matched) == 1
+
+
 def test_a_lock_timeout_is_not_blamed_on_the_wal(isolated_db, monkeypatch) -> None:
     """Only the write-refusal form carries the WAL hint; a lock is a lock."""
     database = isolated_db[0]

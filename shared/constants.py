@@ -77,12 +77,14 @@ def normalize_timeframe(timeframe: str | None) -> str:
 def normalize_symbols(symbols: Sequence[str] | None) -> list[str]:
     """Uppercase stripped symbol entries, dropping blanks.
 
-    One normalizer for every place a symbol list crosses a boundary: the YAML a
-    deployment is written from, the ``symbol_filter`` stored in ``live_deployments``, and
-    the read-only comparison of the stored ``symbols`` against the YAML. Two copies of
-    this rule disagree the moment one is edited, and " AAPL" vs "AAPL" is exactly the
-    drift a comparison then reports forever. Stored ``symbols`` are not normalized on
-    write, so the comparison reports a padded one as an error instead of matching it.
+    One normalizer for the symbol lists of the deployment path: the YAML a deployment is
+    written from, the ``symbol_filter`` stored in ``live_deployments``, and the read-only
+    comparison of the stored ``symbols`` against the YAML. Two copies of this rule disagree
+    the moment one is edited, and " AAPL" vs "AAPL" is exactly the drift a comparison then
+    reports forever. Stored ``symbols`` are not normalized on write, so the comparison
+    reports a padded one as an error instead of matching it. Per-symbol helpers elsewhere
+    (for example the market-data stream's key normalization) are not list normalizers and
+    are not routed through this function.
     """
     return [str(symbol).strip().upper() for symbol in (symbols or []) if str(symbol).strip()]
 
