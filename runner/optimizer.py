@@ -39,7 +39,7 @@ from runner.universe_provenance import (
 )
 from shared.atomic_io import write_text_atomically
 from shared.constants import DATA_DIR, OPTIMIZATIONS_DIR, normalize_timeframe
-from shared.models import BacktestResult
+from shared.models import BacktestResult, resolve_defined_stat
 from shared.strategy_registry import find_strategy_entry
 
 logger = logging.getLogger(__name__)
@@ -184,6 +184,27 @@ def _study_direction(target_metric: str) -> str:
     return direction
 
 
+def _penalize_trial(
+    trial: Any,
+    metric_name: str,
+    completed_trading_values: list[float],
+    target_metric: str,
+) -> float:
+    """Mark ``trial`` as penalised and return a value that can never win.
+
+    Shared by the no-trade and undefined-metric branches so both always set the
+    ``penalty_applied`` marker and the recorded value together.
+    """
+    trial.set_user_attr("penalty_applied", True)
+    trial.set_user_attr("metric_name", metric_name)
+    penalty = _no_trade_penalty_value(
+        completed_trading_values,
+        direction=_study_direction(target_metric),
+    )
+    trial.set_user_attr("metric_value", float(penalty))
+    return penalty
+
+
 def _no_trade_penalty_value(
     completed_trading_values: list[float],
     *,
@@ -221,7 +242,9 @@ def _best_trial_or_raise(
 
     No-trade (penalized) trials are excluded from selection (Cleanup 16-D1,
     AC 2): a study whose completed trials are ALL no-trade trials must not
-    hand back a no-trade parameter set as "best".
+    hand back a no-trade parameter set as "best". The same marker covers a
+    trial whose target metric was never measured (#132, e.g. a ruined run), so
+    a sentinel value can never win the study.
 
     ``direction`` must match the study's direction (#82): minimize-studies
     (p_value) rank lower-is-better, so the best trading trial is the MINIMUM.
@@ -241,9 +264,10 @@ def _best_trial_or_raise(
     ]
     if not trading_trials:
         raise RuntimeError(
-            "Every completed optimization trial was a no-trade trial — no "
-            "parameter region produced trades. Widen parameter_ranges or "
-            "relax position-sizing constraints before retrying."
+            "Every completed optimization trial was a no-trade trial or had an "
+            "undefined target metric — no parameter region produced a rankable "
+            "result. Widen parameter_ranges or relax position-sizing "
+            "constraints before retrying."
         )
     if direction == "minimize":
         return min(trading_trials, key=lambda trial: float(trial.value or 0.0))
@@ -288,8 +312,10 @@ class OptimizationConfig(BaseModel):
     # fraction worse than train (relative drop). Default 0.5 = 50% degradation.
     max_train_validation_degradation: float = Field(default=0.5, ge=0.0)
     # min_deflated_sharpe: probability that the selected trial's Sharpe is not
-    # due to selection bias (Bailey & Lopez de Prado 2014). Default 0.95.
-    min_deflated_sharpe: float = Field(default=0.95, gt=0.0, le=1.0)
+    # due to selection bias (Bailey & Lopez de Prado 2014). Default 0.90.
+    # This is an overfitting / selection-luck hint, not a judgement of
+    # strategy quality: a low Sharpe can still be a useful portfolio component.
+    min_deflated_sharpe: float = Field(default=0.90, gt=0.0, le=1.0)
 
     @field_validator("base_backtest_id", "target_metric")
     @classmethod
@@ -634,14 +660,30 @@ def run_optimization(
             # The explicit penalty is strictly below the value of the worst
             # trading trial observed so far, and the marker stays on the trial
             # for downstream validation.
-            trial.set_user_attr("penalty_applied", True)
-            trial.set_user_attr("metric_name", _metric_key(config.target_metric, train_stats))
-            penalty = _no_trade_penalty_value(
+            return _penalize_trial(
+                trial,
+                _metric_key(config.target_metric, train_stats),
                 completed_trading_values,
-                direction=_study_direction(config.target_metric),
+                config.target_metric,
             )
-            trial.set_user_attr("metric_value", float(penalty))
-            return penalty
+
+        metric_key = _metric_key(config.target_metric, train_stats)
+        if train_stats.get("ruined") is True or (
+            resolve_defined_stat(train_stats, metric_key, None) is None
+        ):
+            # #132: a ruined run publishes its return metrics as None, and an
+            # undefined objective is unrankable - it is not a score of 0.0,
+            # which would beat every honest losing trial. A metric the producer
+            # names in `undefined_metrics` is unrankable even when a placeholder
+            # 0.0 is published (degenerate curves). A ruined run never ranks
+            # whatever the target: its drawdown can exceed 1.0 (negative equity),
+            # which would otherwise trip the percent-scale guard. It gets the same
+            # worst-trial penalty as a no-trade trial so it can never be
+            # selected as the best parameter set, and the study keeps going
+            # instead of aborting on the whole run.
+            return _penalize_trial(
+                trial, metric_key, completed_trading_values, config.target_metric
+            )
 
         raw_metric_value = _metric_value(train_stats, config.target_metric)
         metric_value = raw_metric_value
@@ -649,7 +691,6 @@ def run_optimization(
         # carry mandatory trade-count/drawdown haircuts so lucky sparse
         # runs cannot beat robust ones. Terms are recorded for transparency.
         metric_direction = _study_direction(config.target_metric)
-        metric_key = _metric_key(config.target_metric, train_stats)
         if config.risk_adjust_objective:
             metric_value, penalty_terms = _risk_adjusted_metric_value(
                 metric_value,
@@ -761,11 +802,17 @@ def run_optimization(
         and math.isfinite(float(row["validation_score"]))
     ]
     if not selectable_rows:
+        reasons = "; ".join(
+            f"trial {row['number']}: "
+            f"{row.get('unselectable_reason') or 'non-finite validation score'}"
+            for row in validation_rows
+        )
         raise RuntimeError(
             "No completed optimization trial produced a selectable validation "
-            "result; every trial either never traded, failed on validation, or "
-            "had a non-finite validation score. Widen parameter_ranges or relax "
-            "position-sizing constraints before retrying."
+            "result; every trial either never traded, was ruined, had an "
+            "undefined target metric, failed on validation, or had a "
+            "non-finite validation score. Widen parameter_ranges or relax "
+            f"position-sizing constraints before retrying. Reasons: {reasons}"
         )
     # The winner is fixed HERE, on validation only. From this point the
     # selection is immutable: the test evaluation below reads it and cannot
@@ -819,6 +866,14 @@ def run_optimization(
     winner_test_row = next(
         row for row in test_rows if row["number"] == int(best_trial.number)
     )
+    if winner_test_row["test_failure_reason"]:
+        # The headline holdout result is the winner's own. Without it there is
+        # no honest result to write, so fail loudly and name the trial.
+        raise RuntimeError(
+            f"Holdout test evaluation failed for the selected winner (trial "
+            f"{int(best_trial.number)}); no optimization result was written. "
+            f"{winner_test_row['test_failure_reason']}"
+        )
     final_test_stats = dict(winner_test_row["test_stats"])
     validation_stats = dict(winner_row["validation_stats"])
     # Flags the winner's overfitting risk; it never changes the selection or
@@ -900,7 +955,6 @@ def run_optimization(
                 config=config,
             ),
             "test_distribution": _test_distribution_payload(
-                selection=selection,
                 test_rows=test_rows,
                 target_metric=config.target_metric,
             ),
@@ -1079,7 +1133,9 @@ def _trade_net_pnl(trade: Any) -> float:
         return float("nan")
 
 
-def _trial_subperiod_pnl(result: BacktestResult, subperiods: list[dict[str, Any]]) -> dict[str, float]:
+def _trial_subperiod_pnl(
+    result: BacktestResult, subperiods: list[dict[str, Any]]
+) -> dict[str, float]:
     """Realized net PnL of one trial, per stability sub-period."""
     if not subperiods:
         return {}
@@ -1170,6 +1226,19 @@ def _trial_selection_score(
     return score, raw_metric
 
 
+def _validation_unselectable_reason(
+    result: BacktestResult, stats: Mapping[str, Any], metric_key: str
+) -> str | None:
+    """Why a validation result cannot be selected, or None when it can."""
+    if not result.trades:
+        return "validation: no trades"
+    if stats.get("ruined") is True:
+        return "validation: ruined"
+    if resolve_defined_stat(dict(stats), metric_key, None) is None:
+        return f"validation: target metric {metric_key!r} is undefined"
+    return None
+
+
 def _evaluate_trials_on_validation(
     *,
     trials: Sequence[Any],
@@ -1214,7 +1283,12 @@ def _evaluate_trials_on_validation(
             "validation_metric_value": None,
             "validation_stats": {},
             "validation_moments": None,
+            "unselectable_reason": None,
         }
+        if penalty_applied:
+            row["unselectable_reason"] = (
+                "train: no trades or unrankable result (penalty trial)"
+            )
         try:
             result = _run_period_backtest(
                 strategy_slug=strategy_slug,
@@ -1230,12 +1304,29 @@ def _evaluate_trials_on_validation(
             score, raw_metric = _trial_selection_score(stats, config)
             moments = daily_returns_moments(result.equity_curve)
         except (ValueError, RuntimeError, KeyError) as exc:
-            trial.set_user_attr(
-                VALIDATION_FAILURE_ATTR, f"{type(exc).__name__}: {exc}"
-            )
+            reason = f"validation run failed: {type(exc).__name__}: {exc}"
+            trial.set_user_attr(VALIDATION_FAILURE_ATTR, reason)
+            row["unselectable_reason"] = reason
+            logger.info("Trial %s unselectable: %s", trial.number, reason)
             rows.append(row)
             continue
 
+        # A trial that did nothing, was liquidated, or has no defined target
+        # metric out of sample must never win on validation, mirroring the
+        # train-side guard in the objective (#132, 16-D1). The metric may even
+        # carry a 0.0 placeholder, which `resolve_defined_stat` rejects.
+        validation_reason = _validation_unselectable_reason(
+            result, stats, _metric_key(config.target_metric, stats)
+        )
+        if validation_reason is not None:
+            trial.set_user_attr(VALIDATION_FAILURE_ATTR, validation_reason)
+            logger.info(
+                "Trial %s unselectable on validation: %s",
+                trial.number,
+                validation_reason,
+            )
+            if row["unselectable_reason"] is None:
+                row["unselectable_reason"] = validation_reason
         trial.set_user_attr(VALIDATION_STATS_ATTR, _json_safe(stats))
         trial.set_user_attr(VALIDATION_MOMENTS_ATTR, _json_safe(moments))
         trial.set_user_attr(VALIDATION_SCORE_ATTR, float(score))
@@ -1245,7 +1336,7 @@ def _evaluate_trials_on_validation(
                 # A no-trade trial stays unselectable even if it happens to
                 # trade on validation: the penalty marks a parameter region the
                 # study must not hand back as its answer.
-                "selectable": not penalty_applied,
+                "selectable": not penalty_applied and validation_reason is None,
                 "validation_score": float(score),
                 "validation_metric_value": float(raw_metric),
                 "validation_stats": stats,
@@ -1282,35 +1373,44 @@ def _evaluate_top_set_on_test(
     rows: list[dict[str, Any]] = []
     for selected in selection["top_set"]:
         trial = selected["trial"]
-        result = _run_period_backtest(
-            strategy_slug=strategy_slug,
-            strategy_path=strategy_path,
-            symbols=trial.user_attrs.get("symbols") or symbols,
-            timeframe=timeframe,
-            period=test_period,
-            initial_capital=initial_capital,
-            parameters=_trial_effective_parameters(trial, base_parameters),
-            base_runtime=base_runtime,
-        )
-        stats = _canonical_stats(result)
-        rows.append(
-            {
-                "number": int(trial.number),
-                "validation_rank": validation_rank[int(trial.number)],
-                "validation_score": float(selected["validation_score"]),
-                "validation_metric_value": _safe_float_or_none(
-                    selected.get("validation_metric_value")
-                ),
-                "test_metric_value": _metric_value(stats, config.target_metric),
-                "test_stats": _json_safe(stats),
-            }
-        )
+        number = int(trial.number)
+        row: dict[str, Any] = {
+            "number": number,
+            "validation_rank": validation_rank[number],
+            "validation_score": float(selected["validation_score"]),
+            "validation_metric_value": _safe_float_or_none(
+                selected.get("validation_metric_value")
+            ),
+            "test_metric_value": None,
+            "test_stats": {},
+            "test_failure_reason": None,
+        }
+        # Same isolation as the validation pass: one candidate whose holdout
+        # run fails is recorded, and the rest of the top set still reports.
+        try:
+            result = _run_period_backtest(
+                strategy_slug=strategy_slug,
+                strategy_path=strategy_path,
+                symbols=trial.user_attrs.get("symbols") or symbols,
+                timeframe=timeframe,
+                period=test_period,
+                initial_capital=initial_capital,
+                parameters=_trial_effective_parameters(trial, base_parameters),
+                base_runtime=base_runtime,
+            )
+            stats = _canonical_stats(result)
+            metric_value = _metric_value(stats, config.target_metric)
+        except (ValueError, RuntimeError, KeyError) as exc:
+            row["test_failure_reason"] = f"{type(exc).__name__}: {exc}"
+            rows.append(row)
+            continue
+        row.update({"test_metric_value": metric_value, "test_stats": _json_safe(stats)})
+        rows.append(row)
     return rows
 
 
 def _test_distribution_payload(
     *,
-    selection: Mapping[str, Any],
     test_rows: Sequence[Mapping[str, Any]],
     target_metric: str,
 ) -> dict[str, Any]:
@@ -1323,7 +1423,14 @@ def _test_distribution_payload(
     """
     from scipy.stats import spearmanr
 
-    rows = list(test_rows)
+    # A candidate whose holdout run failed has no result to summarise; it is
+    # reported under `failures` instead of silently shrinking the sample.
+    failures = [
+        {"trial_number": int(row["number"]), "reason": str(row["test_failure_reason"])}
+        for row in test_rows
+        if row.get("test_failure_reason")
+    ]
+    rows = [row for row in test_rows if not row.get("test_failure_reason")]
     direction = _study_direction(target_metric)
     sign = -1.0 if direction == "minimize" else 1.0
     metric_values = [
@@ -1363,6 +1470,7 @@ def _test_distribution_payload(
 
     return {
         "count": len(rows),
+        "failures": failures,
         "share_profitable": (
             round(profitable / len(rows), 6) if rows else None
         ),
@@ -1396,6 +1504,7 @@ def _selection_payload(
     """The fixed selection: winner, ranked top set and the tie-break rule."""
     ranked = list(selection["ranked"])
     winner = selection["winner"]
+    ranked_numbers = {int(row["number"]) for row in ranked}
     return {
         "winner_trial_number": (
             int(winner["trial"].number) if winner is not None else None
@@ -1407,6 +1516,15 @@ def _selection_payload(
         "top_set_size": len(selection["top_set"]),
         "n_selectable_trials": len(ranked),
         "n_unselectable_trials": max(len(validation_rows) - len(ranked), 0),
+        "unselectable_trials": [
+            {
+                "trial_number": int(row["number"]),
+                "reason": row.get("unselectable_reason")
+                or "non-finite validation score",
+            }
+            for row in validation_rows
+            if int(row["number"]) not in ranked_numbers
+        ],
         "tie_break": (
             "higher validation score first; equal scores by lower trial number"
         ),
@@ -1498,7 +1616,9 @@ def _overfitting_payload(
         "var_sharpe_per_obs": _safe_float_or_none(var_sr),
         "note": (
             "A failed verdict only flags this result: the winner and its "
-            "metrics are reported unchanged. Promotion decisions belong to the "
+            "metrics are reported unchanged. The deflated Sharpe check is an "
+            "overfitting / selection-luck hint (many trials were tried), not a "
+            "judgement of strategy quality. Promotion decisions belong to the "
             "promotion gate."
         ),
     }
@@ -2066,6 +2186,9 @@ def _run_risk_parity_covariance_optimization(
         "test_period": test_period,
         "train_stats": {
             "risk_parity_score": selection["best_score"],
+            # "structure_only" => Sharpe undefined (no datetime index) and
+            # excluded from the score; see runner/risk_parity_optimizer.py.
+            "risk_parity_score_basis": selection.get("score_basis"),
             "risk_parity_sharpe": selection["best_sharpe"],
             "risk_parity_volatility": selection["best_volatility"],
             "diversification_ratio": selection["best_diversification_ratio"],
@@ -2108,7 +2231,13 @@ def _asset_returns_frame_from_base_result(result: BacktestResult) -> pd.DataFram
     # NOTE (C3): the 0.0 here fills STRATEGY-equity days (a day without a
     # trade leaves equity flat, so 0% is exact — not fabricated market data).
     # Market-data bars use intersection instead (see above).
-    return pd.DataFrame(series).sort_index().fillna(0.0)
+    frame = pd.DataFrame(series).sort_index().fillna(0.0)
+    # #129 H8: these rows are per-TRADE equity changes, not a fixed-frequency
+    # time series, so no annualisation (sqrt(252)) is valid for them. Drop the
+    # timestamps so the risk-parity scorer sees an unknown observation
+    # frequency and reports Sharpe as undefined instead of inventing one.
+    # Weights/correlations do not need the index.
+    return frame.reset_index(drop=True)
 
 
 def _asset_returns_frame_from_market_data(

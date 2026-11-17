@@ -940,3 +940,24 @@ def test_daily_returns_moments_undefined_cases_return_none():
     assert daily_returns_moments([]) is None
     assert daily_returns_moments(_moments_curve([100.0])) is None
     assert daily_returns_moments(_moments_curve([100.0, 100.0, 100.0, 100.0, 100.0])) is None
+
+
+def test_daily_returns_moments_need_four_observations_for_kurtosis():
+    """Sample skew needs 3 and sample kurtosis 4 daily returns: fewer are undefined.
+
+    Pins the documented minimum so a two- or three-return curve is reported as
+    uncomputable rather than getting NaN moments.
+    """
+    from runner.stats import daily_returns_moments
+    from shared.models import EquityPoint
+
+    def curve(values):
+        return [
+            EquityPoint(time=f"2024-01-{day:02d}T00:00:00+00:00", equity=value)
+            for day, value in enumerate(values, start=1)
+        ]
+
+    assert daily_returns_moments(curve([100.0, 101.0, 100.5])) is None  # 2 returns
+    assert daily_returns_moments(curve([100.0, 101.0, 100.5, 102.0])) is None  # 3
+    four = daily_returns_moments(curve([100.0, 101.0, 100.5, 102.0, 101.0]))
+    assert four is not None and four["count"] == 4

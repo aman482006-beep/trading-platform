@@ -740,8 +740,16 @@ def test_realized_pnl_is_attributed_to_the_subperiod_that_produced_it():
     """A trade opened in one sub-period and closed in the next belongs to the
     second: the result is what the period actually produced."""
     subperiods = [
-        {"label": "fold_0", "start": "2024-01-01T00:00:00+00:00", "end": "2024-02-01T00:00:00+00:00"},
-        {"label": "fold_1", "start": "2024-02-01T00:00:00+00:00", "end": "2024-03-01T00:00:00+00:00"},
+        {
+            "label": "fold_0",
+            "start": "2024-01-01T00:00:00+00:00",
+            "end": "2024-02-01T00:00:00+00:00",
+        },
+        {
+            "label": "fold_1",
+            "start": "2024-02-01T00:00:00+00:00",
+            "end": "2024-03-01T00:00:00+00:00",
+        },
     ]
 
     realized = realized_pnl_by_subperiod(
@@ -763,8 +771,16 @@ def test_realized_pnl_reports_every_subperiod_even_with_no_events():
     """"Nothing was realized here" and "this sub-period was never measured"
     must not look the same to a reader."""
     subperiods = [
-        {"label": "fold_0", "start": "2024-01-01T00:00:00+00:00", "end": "2024-02-01T00:00:00+00:00"},
-        {"label": "fold_1", "start": "2024-02-01T00:00:00+00:00", "end": "2024-03-01T00:00:00+00:00"},
+        {
+            "label": "fold_0",
+            "start": "2024-01-01T00:00:00+00:00",
+            "end": "2024-02-01T00:00:00+00:00",
+        },
+        {
+            "label": "fold_1",
+            "start": "2024-02-01T00:00:00+00:00",
+            "end": "2024-03-01T00:00:00+00:00",
+        },
     ]
 
     assert realized_pnl_by_subperiod([], subperiods) == {"fold_0": 0.0, "fold_1": 0.0}
@@ -775,7 +791,11 @@ def test_realized_pnl_is_never_counted_twice_when_subperiods_overlap():
     two periods: it is attributed to the first period that contains it."""
     subperiods = [
         {"label": "wide", "start": "2024-01-01T00:00:00+00:00", "end": "2024-03-01T00:00:00+00:00"},
-        {"label": "narrow", "start": "2024-02-01T00:00:00+00:00", "end": "2024-02-15T00:00:00+00:00"},
+        {
+            "label": "narrow",
+            "start": "2024-02-01T00:00:00+00:00",
+            "end": "2024-02-15T00:00:00+00:00",
+        },
     ]
 
     realized = realized_pnl_by_subperiod(
@@ -1042,7 +1062,11 @@ def test_an_unreadable_pnl_is_dropped_rather_than_charged_to_a_subperiod():
     from runner.optimizer import _trade_net_pnl
 
     subperiods = [
-        {"label": "fold_0", "start": "2024-01-01T00:00:00+00:00", "end": "2024-03-01T00:00:00+00:00"}
+        {
+            "label": "fold_0",
+            "start": "2024-01-01T00:00:00+00:00",
+            "end": "2024-03-01T00:00:00+00:00",
+        }
     ]
 
     realized = realized_pnl_by_subperiod(
@@ -1392,6 +1416,15 @@ def test_select_by_validation_top_fraction_at_least_one():
     assert len(result["top_set"]) == 1
 
 
+def test_select_by_validation_rounds_a_fractional_top_set_up():
+    """A fractional candidate count rounds UP, never down (ceil, not floor)."""
+    trials = [{"number": i, "validation_score": float(i)} for i in range(16)]
+    result = select_by_validation(trials, top_fraction=0.1)
+    # 16 * 0.1 = 1.6 -> ceil = 2. A floor would test only one candidate.
+    assert len(result["top_set"]) == 2
+    assert [t["number"] for t in result["top_set"]] == [15, 14]
+
+
 def test_select_by_validation_all_missing_scores():
     """All scores missing -> winner None, empty top_set."""
     trials = [
@@ -1538,6 +1571,24 @@ def test_overfitting_verdict_all_pass():
     assert verdict["reasons"] == []
 
 
+def test_overfitting_verdict_degradation_at_threshold_passes():
+    """The check is ``degradation <= max_degradation``: equality passes."""
+    verdict = overfitting_verdict(
+        degradation=0.5,
+        deflated_sharpe=0.97,
+        max_degradation=0.5,
+        min_deflated_sharpe=0.95,
+    )
+    assert verdict["checks"]["degradation"]["passed"] is True
+    just_over = overfitting_verdict(
+        degradation=0.5000001,
+        deflated_sharpe=0.97,
+        max_degradation=0.5,
+        min_deflated_sharpe=0.95,
+    )
+    assert just_over["checks"]["degradation"]["passed"] is False
+
+
 def test_overfitting_verdict_degradation_fail():
     """Degradation exceeds threshold -> passed=False."""
     verdict = overfitting_verdict(
@@ -1634,6 +1685,9 @@ def test_deflated_sharpe_ratio_zero_trial_variance_has_no_hurdle():
     many = deflated_sharpe_ratio(sr=0.08, t=120, skew=0.0, kurt=3.0, n=500, var_sr=0.0)
     one = deflated_sharpe_ratio(sr=0.08, t=120, skew=0.0, kurt=3.0, n=1, var_sr=0.0)
     assert many == pytest.approx(one)
+    # Zero variance is a valid input (a zero hurdle), not an error: the DSR
+    # must still be computed. Rejecting var_sr == 0 would return None here.
+    assert deflated_sharpe_ratio(sr=0.08, t=120, skew=0.0, kurt=3.0, n=500, var_sr=0.0) is not None
 
 
 def test_walk_forward_folds_stop_where_three_way_validation_ends():
@@ -1691,3 +1745,69 @@ def test_three_way_split_takes_the_embargo_out_of_train():
     assert length(split.validation) == total * 0.2
     assert length(split.test) == total * 0.2
     assert length(split.train) == total * 0.6 - pd.Timedelta(days=20)
+
+
+def test_zero_embargo_never_puts_a_boundary_bar_in_two_segments():
+    """With no embargo a bar exactly on a boundary lands in one segment only.
+
+    ``apply_date_filter`` is inclusive on both ends, so touching segments would
+    trade that bar in both; the split keeps at least 1 microsecond between them.
+    """
+    from runner.engines.contract import apply_date_filter
+    from runner.optimization_diagnostics import three_way_split
+
+    split = three_way_split(
+        "2024-01-01T00:00:00+00:00",
+        "2024-01-11T00:00:00+00:00",
+        train_fraction=0.6,
+        validation_fraction=0.2,
+        test_fraction=0.2,
+        embargo_days=0,
+        embargo_pct=0.0,
+    )
+    boundaries = [
+        pd.Timestamp(split.train["end"]),
+        pd.Timestamp(split.validation["start"]),
+        pd.Timestamp(split.validation["end"]),
+        pd.Timestamp(split.test["start"]),
+    ]
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.date_range(
+                "2024-01-01T00:00:00+00:00", "2024-01-11T00:00:00+00:00", freq="1D"
+            ).append(pd.DatetimeIndex(boundaries)).sort_values().unique()
+        }
+    )
+    segments = {
+        name: apply_date_filter(
+            frame, start=getattr(split, name)["start"], end=getattr(split, name)["end"]
+        )
+        for name in ("train", "validation", "test")
+    }
+    seen: list[pd.Timestamp] = []
+    for name in ("train", "validation", "test"):
+        seen.extend(segments[name]["timestamp"])
+    assert len(seen) == len(set(seen)), "a bar was traded in two segments"
+    gap = pd.Timedelta(microseconds=1)
+    assert pd.Timestamp(split.validation["start"]) - pd.Timestamp(split.train["end"]) >= gap
+    assert pd.Timestamp(split.test["start"]) - pd.Timestamp(split.validation["end"]) >= gap
+
+
+def test_zero_embargo_walk_forward_range_ends_before_the_test_holdout():
+    from runner.optimization_diagnostics import (
+        three_way_split,
+        walk_forward_train_validation_folds,
+    )
+
+    kwargs = {"embargo_days": 0, "embargo_pct": 0.0}
+    split = three_way_split(
+        "2024-01-01", "2024-01-11", train_fraction=0.6,
+        validation_fraction=0.2, test_fraction=0.2, **kwargs,
+    )
+    folds = walk_forward_train_validation_folds(
+        "2024-01-01", "2024-01-11", n_splits=2, train_fraction=0.7,
+        test_fraction=0.2, **kwargs,
+    )
+    test_start = pd.Timestamp(split.test["start"])
+    for fold in folds:
+        assert pd.Timestamp(fold["test"]["end"]) < test_start

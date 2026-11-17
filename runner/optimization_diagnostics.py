@@ -57,6 +57,9 @@ __all__ = [
 ]
 
 
+#: Shared by every split/fold function that takes an embargo fraction.
+_NEGATIVE_EMBARGO_MESSAGE = "embargo_pct must not be negative"
+
 def _as_timestamp(value: Any) -> pd.Timestamp:
     ts = pd.Timestamp(value)
     if ts.tzinfo is None:
@@ -126,7 +129,7 @@ def embargo_split(
     if not 0.0 < train_split_pct < 1.0:
         raise ValueError("train_split_pct must be strictly between 0 and 1")
     if embargo_pct < 0.0:
-        raise ValueError("embargo_pct must not be negative")
+        raise ValueError(_NEGATIVE_EMBARGO_MESSAGE)
     if holding_bars < 0:
         raise ValueError("holding_bars must not be negative")
 
@@ -181,6 +184,19 @@ class ThreeWaySplit:
         }
 
 
+#: Smallest separation between two segments. ``apply_date_filter`` is inclusive
+#: on both ends, so segments that merely touch would both trade a bar sitting
+#: exactly on the shared boundary; one microsecond keeps every bar in at most
+#: one segment even with a zero embargo.
+_MIN_SEGMENT_GAP = pd.Timedelta(microseconds=1)
+
+
+def _segment_gap(embargo_days: int, embargo_pct: float, total: pd.Timedelta) -> pd.Timedelta:
+    """Gap between consecutive segments: the configured embargo, at least 1 µs."""
+    configured = pd.Timedelta(days=max(int(embargo_days), 0)) + (total * float(embargo_pct))
+    return max(configured, _MIN_SEGMENT_GAP)
+
+
 def three_way_split(
     start: Any,
     end: Any,
@@ -222,7 +238,7 @@ def three_way_split(
     if embargo_days < 0:
         raise ValueError("embargo_days must not be negative")
     if embargo_pct < 0.0:
-        raise ValueError("embargo_pct must not be negative")
+        raise ValueError(_NEGATIVE_EMBARGO_MESSAGE)
 
     start_ts = _as_timestamp(start)
     end_ts = _as_timestamp(end)
@@ -230,7 +246,7 @@ def three_way_split(
         raise ValueError(f"Invalid period: start={start!r}, end={end!r}")
 
     total = end_ts - start_ts
-    embargo_gap = pd.Timedelta(days=max(int(embargo_days), 0)) + (total * float(embargo_pct))
+    embargo_gap = _segment_gap(embargo_days, embargo_pct, total)
 
     # Compute segment boundaries working backwards from end (test ends at end)
     test_end_ts = end_ts
@@ -244,7 +260,7 @@ def three_way_split(
     train_end_ts = embargo_train_val_start_ts
     train_start_ts = start_ts
 
-    # Verify all segments have positive duration (embargo gaps can be zero)
+    # Verify all segments have positive duration (gaps are at least 1 µs)
     if train_end_ts <= train_start_ts:
         raise ValueError("train segment would be empty")
     if embargo_train_val_end_ts < embargo_train_val_start_ts:
@@ -300,7 +316,7 @@ def walk_forward_train_validation_folds(
     if embargo_days < 0:
         raise ValueError("embargo_days must not be negative")
     if embargo_pct < 0.0:
-        raise ValueError("embargo_pct must not be negative")
+        raise ValueError(_NEGATIVE_EMBARGO_MESSAGE)
 
     start_ts = _as_timestamp(start)
     end_ts = _as_timestamp(end)
@@ -310,7 +326,7 @@ def walk_forward_train_validation_folds(
     total = end_ts - start_ts
     # Same gap arithmetic as `three_way_split`, so the fold range ends exactly
     # where that function ends the validation segment.
-    embargo_gap = pd.Timedelta(days=max(int(embargo_days), 0)) + (total * float(embargo_pct))
+    embargo_gap = _segment_gap(embargo_days, embargo_pct, total)
     test_start_ts = end_ts - total * test_fraction
     wf_end_ts = test_start_ts - embargo_gap
     if wf_end_ts <= start_ts:
@@ -1063,7 +1079,8 @@ def train_validation_degradation(
     """
     if not (math.isfinite(train_metric) and math.isfinite(validation_metric)):
         return None
-    if train_metric == 0.0:
+    # Only an exact zero is undefined; a tiny train metric is a large but valid ratio.
+    if abs(train_metric) <= 0.0:
         return None
     return (train_metric - validation_metric) / abs(train_metric)
 
@@ -1136,7 +1153,9 @@ def overfitting_verdict(
         degradation: Result from train_validation_degradation (None if uncomputable).
         deflated_sharpe: Result from deflated_sharpe_ratio (None if uncomputable).
         max_degradation: Threshold for max allowed degradation (e.g., 0.5 = 50%).
-        min_deflated_sharpe: Minimum acceptable deflated Sharpe probability (e.g., 0.95).
+        min_deflated_sharpe: Minimum deflated Sharpe probability before the
+            overfitting / selection-luck hint stops flagging (e.g., 0.90). It is
+            not a quality threshold for the strategy itself.
 
     Returns:
         Dict with:

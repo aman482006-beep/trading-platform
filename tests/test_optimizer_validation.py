@@ -608,10 +608,11 @@ def test_split_period_without_embargo_stays_contiguous():
         test_split_pct=0.2,
         embargo_days=0,
     )
-    # No embargo requested: each segment starts exactly where the previous one
-    # ends. Production runs default to a one-day embargo.
-    assert pd.Timestamp(split.validation["start"]) == pd.Timestamp(split.train["end"])
-    assert pd.Timestamp(split.test["start"]) == pd.Timestamp(split.validation["end"])
+    # No embargo requested: segments still never touch. The date filter is
+    # inclusive on both ends, so a shared boundary would trade one bar twice.
+    gap = pd.Timedelta(microseconds=1)
+    assert pd.Timestamp(split.validation["start"]) == pd.Timestamp(split.train["end"]) + gap
+    assert pd.Timestamp(split.test["start"]) == pd.Timestamp(split.validation["end"]) + gap
 
 
 def test_split_period_rejects_an_embargo_that_eats_a_segment():
@@ -871,7 +872,40 @@ def test_overfitting_thresholds_defaults():
     )
     assert config.test_top_fraction == pytest.approx(0.10)
     assert config.max_train_validation_degradation == pytest.approx(0.5)
-    assert config.min_deflated_sharpe == pytest.approx(0.95)
+    assert config.min_deflated_sharpe == pytest.approx(0.90)
+
+
+def test_deflated_sharpe_092_passes_default_and_fails_explicit_095():
+    """The DSR check is an overfitting hint; the default threshold is 0.90.
+
+    A winner with DSR 0.92 clears the default but would be flagged at the
+    stricter explicit 0.95, so the default is the only thing that changed.
+    """
+    from runner.optimization_diagnostics import overfitting_verdict
+
+    config = OptimizationConfig(
+        base_backtest_id="bt_x",
+        target_metric="sharpe_ratio",
+        n_trials=10,
+        parameter_ranges={"x": {"type": "float", "min": 0.0, "max": 1.0}},
+    )
+    default_verdict = overfitting_verdict(
+        degradation=0.1,
+        deflated_sharpe=0.92,
+        max_degradation=config.max_train_validation_degradation,
+        min_deflated_sharpe=config.min_deflated_sharpe,
+    )
+    assert default_verdict["passed"] is True
+    assert default_verdict["checks"]["deflated_sharpe"]["threshold"] == pytest.approx(0.90)
+
+    strict_verdict = overfitting_verdict(
+        degradation=0.1,
+        deflated_sharpe=0.92,
+        max_degradation=config.max_train_validation_degradation,
+        min_deflated_sharpe=0.95,
+    )
+    assert strict_verdict["passed"] is False
+    assert strict_verdict["checks"]["deflated_sharpe"]["passed"] is False
 
 
 def test_overfitting_thresholds_bounds():

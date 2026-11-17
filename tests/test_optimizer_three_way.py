@@ -73,6 +73,7 @@ def _trial_result(
     metric: float,
     trade_count: int = 1,
     with_equity: bool = True,
+    stat_overrides: dict[str, object] | None = None,
 ) -> BacktestResult:
     trades = []
     if trade_count > 0:
@@ -108,6 +109,7 @@ def _trial_result(
         "total_return": metric / 100.0,
         "max_drawdown_pct": -0.1 if trade_count else 0.0,
     }
+    stats.update(stat_overrides or {})
     return BacktestResult(
         meta=BacktestMeta(
             id="trial-demo",
@@ -151,6 +153,7 @@ def _patch_environment(
     metrics: dict[str, dict[int, float]],
     trade_counts: dict[tuple[str, int], int] | None = None,
     with_equity: bool = True,
+    stat_overrides: dict[tuple[str, int], dict[str, object]] | None = None,
 ) -> dict[str, object]:
     """Fake backtest environment; returns the recorded runs and the split."""
     backtests_dir = tmp_path / "backtests"
@@ -217,6 +220,7 @@ def _patch_environment(
             metric=metrics[segment][window],
             trade_count=trade_count,
             with_equity=with_equity,
+            stat_overrides=(stat_overrides or {}).get((segment, window)),
         )
 
     monkeypatch.setattr(optimizer_module, "_run_vectorbt_backtest", fake_run_backtest)
@@ -239,7 +243,8 @@ def test_search_runs_only_train_and_test_is_read_after_selection(
     )
     calls = environment["calls"]
     split = environment["split"]
-    assert isinstance(calls, list) and isinstance(split, optimizer_module.ThreeWaySplit)
+    assert isinstance(calls, list)
+    assert isinstance(split, optimizer_module.ThreeWaySplit)
 
     search_phase_runs: list[dict[str, object]] = []
     runs_when_search_ended: list[dict[str, object]] = []
@@ -484,6 +489,239 @@ def test_no_trade_trial_is_not_selectable_even_with_the_best_validation(
     assert payload["three_way"]["selection"]["n_unselectable_trials"] == 1
 
 
+def _losing_validation_metrics() -> dict[str, dict[int, float]]:
+    # Window 1 is the honest trial: it trades and loses on validation.
+    # Window 2 looks better on every placeholder / degenerate reading.
+    return {
+        "train": {1: 1.0, 2: 1.0},
+        "validation": {1: -2.0, 2: 0.0},
+        "test": {1: -2.0, 2: 5.0},
+    }
+
+
+def test_trial_without_validation_trades_never_wins(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config = _config(n_trials=2)
+    _patch_environment(
+        monkeypatch,
+        tmp_path,
+        config=config,
+        metrics=_losing_validation_metrics(),
+        # Window 2 trades on train but does nothing out of sample; its 0.0
+        # Sharpe would otherwise beat the honest -2.0 of window 1.
+        trade_counts={("validation", 2): 0},
+    )
+
+    payload = optimizer_module.run_optimization(config)
+
+    assert payload["best_params"] == {"window": 1}
+    selection = payload["three_way"]["selection"]
+    assert selection["n_unselectable_trials"] == 1
+    assert [r["reason"] for r in selection["unselectable_trials"]] == [
+        "validation: no trades"
+    ]
+
+
+def test_trial_ruined_only_on_validation_never_wins(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config = _config(n_trials=2, target_metric="total_return")
+    metrics = {
+        "train": {1: 1.0, 2: 1.0},
+        "validation": {1: -50.0, 2: 90.0},
+        "test": {1: -50.0, 2: 90.0},
+    }
+    _patch_environment(
+        monkeypatch,
+        tmp_path,
+        config=config,
+        metrics=metrics,
+        # total_return stays finite at ruin, so only the ruined flag excludes it.
+        stat_overrides={("validation", 2): {"ruined": True}},
+    )
+
+    payload = optimizer_module.run_optimization(config)
+
+    assert payload["best_params"] == {"window": 1}
+    reasons = [r["reason"] for r in payload["three_way"]["selection"]["unselectable_trials"]]
+    assert reasons == ["validation: ruined"]
+
+
+def test_undefined_validation_metric_with_placeholder_never_wins(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config = _config(n_trials=2)
+    _patch_environment(
+        monkeypatch,
+        tmp_path,
+        config=config,
+        metrics=_losing_validation_metrics(),
+        # The producer names the metric undefined but still publishes 0.0.
+        stat_overrides={
+            ("validation", 2): {"undefined_metrics": ["sharpe_ratio"]}
+        },
+    )
+
+    payload = optimizer_module.run_optimization(config)
+
+    assert payload["best_params"] == {"window": 1}
+    reasons = [r["reason"] for r in payload["three_way"]["selection"]["unselectable_trials"]]
+    assert len(reasons) == 1 and "undefined" in reasons[0]
+
+
+def test_all_trials_unselectable_on_validation_fails_loudly_with_reasons(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config = _config(n_trials=2)
+    _patch_environment(
+        monkeypatch,
+        tmp_path,
+        config=config,
+        metrics=_losing_validation_metrics(),
+        trade_counts={("validation", 1): 0},
+        stat_overrides={("validation", 2): {"ruined": True}},
+    )
+
+    with pytest.raises(RuntimeError, match="selectable validation result") as excinfo:
+        optimizer_module.run_optimization(config)
+
+    message = str(excinfo.value)
+    assert "validation: no trades" in message
+    assert "validation: ruined" in message
+
+
+def _fail_test_backtest_for_window(
+    monkeypatch, config: OptimizationConfig, window: int, message: str
+) -> None:
+    """Make the holdout backtest of one parameter window raise, nothing else."""
+    _, periods = _three_way_periods(config)
+    test_start = periods["test"]["start"]
+    inner = optimizer_module._run_vectorbt_backtest
+
+    def failing_on_test(backtest_config, strategy_path):
+        if backtest_config.start_date == test_start and int(
+            backtest_config.parameters["window"]
+        ) == window:
+            raise RuntimeError(message)
+        return inner(backtest_config, strategy_path)
+
+    monkeypatch.setattr(optimizer_module, "_run_vectorbt_backtest", failing_on_test)
+
+
+def test_failed_holdout_run_of_a_non_winner_is_recorded_not_fatal(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config = _config(n_trials=2, test_top_fraction=1.0)
+    _patch_environment(
+        monkeypatch,
+        tmp_path,
+        config=config,
+        metrics={
+            "train": {1: 1.0, 2: 2.0},
+            "validation": {1: 1.0, 2: 2.0},
+            "test": {1: 1.0, 2: 2.0},
+        },
+    )
+    _fail_test_backtest_for_window(monkeypatch, config, window=1, message="holdout boom")
+
+    payload = optimizer_module.run_optimization(config)
+
+    # The search and the winner are unaffected: the result is still written.
+    assert payload["best_params"] == {"window": 2}
+    assert payload["final_test_stats"]["sharpe_ratio"] == 2.0
+    distribution = payload["three_way"]["test_distribution"]
+    # The failed member is reported, and it is not in the distribution stats.
+    assert distribution["count"] == 1
+    assert distribution["failures"] == [
+        {"trial_number": 1, "reason": "RuntimeError: holdout boom"}
+    ]
+
+
+def test_failed_holdout_run_of_the_winner_fails_loudly_and_names_the_trial(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config = _config(n_trials=2, test_top_fraction=1.0)
+    _patch_environment(
+        monkeypatch,
+        tmp_path,
+        config=config,
+        metrics={
+            "train": {1: 1.0, 2: 2.0},
+            "validation": {1: 1.0, 2: 2.0},
+            "test": {1: 1.0, 2: 2.0},
+        },
+    )
+    # Window 2 is the validation winner, so its holdout result is the headline.
+    _fail_test_backtest_for_window(monkeypatch, config, window=2, message="holdout boom")
+
+    # Optuna numbers trials from 0, so the message is matched on its shape, not
+    # on a hard-coded number.
+    with pytest.raises(RuntimeError, match=r"selected winner \(trial \d+\)") as excinfo:
+        optimizer_module.run_optimization(config)
+    assert "holdout boom" in str(excinfo.value)
+    # Nothing is written for a result whose headline test value is missing.
+    assert not list((tmp_path / "optimizations").glob("*.json"))
+
+
+def test_share_profitable_counts_a_flat_holdout_arm_as_not_profitable() -> None:
+    rows = [
+        {"number": 1, "validation_rank": 1, "test_metric_value": 1.0,
+         "test_stats": {"total_pnl": 5.0}},
+        {"number": 2, "validation_rank": 2, "test_metric_value": 0.0,
+         "test_stats": {"total_pnl": 0.0}},
+        {"number": 3, "validation_rank": 3, "test_metric_value": -1.0,
+         "test_stats": {"total_pnl": -2.0}},
+    ]
+    distribution = optimizer_module._test_distribution_payload(
+        test_rows=rows,
+        target_metric="sharpe",
+    )
+    # Only the strictly positive arm is profitable: 1 of 3, not 2 of 3.
+    assert distribution["share_profitable"] == pytest.approx(1 / 3)
+
+
+def test_deflated_sharpe_uses_the_number_of_selectable_trials() -> None:
+    import statistics
+
+    from runner.optimization_diagnostics import deflated_sharpe_ratio
+
+    winner_moments = {"count": 120, "sharpe_per_obs": 0.08, "skew": -0.3, "kurtosis": 4.0}
+    other_sharpes = [0.02, 0.05]
+    selectable_rows = [{"validation_moments": winner_moments, "validation_metric_value": 2.0}]
+    selectable_rows += [
+        {
+            "validation_moments": {
+                "count": 120,
+                "sharpe_per_obs": sharpe,
+                "skew": 0.0,
+                "kurtosis": 3.0,
+            },
+            "validation_metric_value": 1.0,
+        }
+        for sharpe in other_sharpes
+    ]
+    var_sr = statistics.variance([0.08, *other_sharpes])
+
+    overfitting = optimizer_module._overfitting_payload(
+        winner_row=selectable_rows[0],
+        train_stats={"sharpe_ratio": 1.0},
+        selectable_rows=selectable_rows,
+        config=_config(n_trials=3),
+    )
+
+    assert overfitting["n_selectable_trials"] == 3
+    expected = deflated_sharpe_ratio(
+        sr=0.08, t=120, skew=-0.3, kurt=4.0, n=3, var_sr=var_sr
+    )
+    # The correction must use all three selectable trials, not a single one:
+    # with n=1 the DSR is the plain PSR and is measurably larger here.
+    plain = deflated_sharpe_ratio(sr=0.08, t=120, skew=-0.3, kurt=4.0, n=1, var_sr=var_sr)
+    assert plain - expected > 1e-3
+    # The payload stores the value rounded to 6 decimal places.
+    assert overfitting["deflated_sharpe"] == pytest.approx(expected, abs=1e-6)
+
+
 def test_walk_forward_folds_stop_before_the_test_holdout_embargo() -> None:
     import pandas as pd
 
@@ -592,9 +830,10 @@ def test_verdict_reports_degradation_and_deflated_sharpe(
     assert overfitting["var_sharpe_per_obs"] is not None
     assert overfitting["thresholds"] == {
         "max_train_validation_degradation": 0.5,
-        "min_deflated_sharpe": 0.95,
+        "min_deflated_sharpe": 0.90,
     }
-    assert "checks" in overfitting and "reasons" in overfitting
+    assert "checks" in overfitting
+    assert "reasons" in overfitting
 
 
 def test_failing_overfitting_verdict_still_returns_the_full_result(
