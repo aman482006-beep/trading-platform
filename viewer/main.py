@@ -9467,8 +9467,11 @@ async def deduplicate_backtests(
     phase 1. Only submitted ids are deleted, and each id is re-checked against
     the criterion first: a member that is no longer in a duplicate group, is
     now the kept newest entry, or no longer exists is reported per item with
-    status ``skipped`` and a ``reason`` and is not deleted. A phase-2 call
-    without ``ids`` deletes nothing and returns HTTP 400.
+    status ``skipped`` and a ``reason`` and is not deleted. If the re-check
+    itself raises, that id is skipped with reason ``recheck_failed`` and the
+    rest of the request continues. ``kept_ids`` is the group snapshot taken
+    when the request starts; the per-item reasons are authoritative. A
+    phase-2 call without ``ids`` deletes nothing and returns HTTP 400.
 
     Deletion is journaled per item, so a failure in the middle leaves earlier
     items deleted; ``items`` reports every item (``deleted`` / ``skipped`` /
@@ -9517,7 +9520,18 @@ async def deduplicate_backtests(
         if not backtest_id or backtest_id in seen:
             continue
         seen.add(backtest_id)
-        member = _current_duplicate_member(_duplicate_backtest_members, backtest_id)
+        try:
+            member = _current_duplicate_member(_duplicate_backtest_members, backtest_id)
+        except Exception:
+            # Fail closed for this id only: an unreadable re-check keeps it, and
+            # the items already deleted stay reported.
+            logger.exception(
+                "Backtest duplicate re-check failed",
+                extra={"data": {"backtest": _log_safe(backtest_id)}},
+            )
+            items.append(_bulk_delete_skipped_item(backtest_id, "recheck_failed"))
+            skipped_ids.append(backtest_id)
+            continue
         if member is None:
             items.append(_bulk_delete_skipped_item(backtest_id, "no_longer_duplicate"))
             skipped_ids.append(backtest_id)
@@ -12107,8 +12121,11 @@ async def deduplicate_portfolios(
     phase 1. Only submitted ids are deleted, and each id is re-checked against
     the criterion first: a portfolio that is no longer in a duplicate group,
     is now the kept newest entry, or no longer exists is reported per item
-    with status ``skipped`` and a ``reason`` and is not deleted. A phase-2
-    call without ``ids`` deletes nothing and returns HTTP 400.
+    with status ``skipped`` and a ``reason`` and is not deleted. If the
+    re-check itself raises, that id is skipped with reason ``recheck_failed``
+    and the rest of the request continues. ``kept_ids`` is the group snapshot
+    taken when the request starts; the per-item reasons are authoritative. A
+    phase-2 call without ``ids`` deletes nothing and returns HTTP 400.
 
     Deletion is journaled per item, so a failure in the middle leaves earlier
     items deleted; ``items`` reports every item (``deleted`` / ``skipped`` /
@@ -12157,7 +12174,18 @@ async def deduplicate_portfolios(
         if not portfolio_id or portfolio_id in seen:
             continue
         seen.add(portfolio_id)
-        member = _current_duplicate_member(_duplicate_portfolio_members, portfolio_id)
+        try:
+            member = _current_duplicate_member(_duplicate_portfolio_members, portfolio_id)
+        except Exception:
+            # Fail closed for this id only: an unreadable re-check keeps it, and
+            # the items already deleted stay reported.
+            logger.exception(
+                "Portfolio duplicate re-check failed",
+                extra={"data": {"portfolio": _log_safe(portfolio_id)}},
+            )
+            items.append(_bulk_delete_skipped_item(portfolio_id, "recheck_failed"))
+            skipped_ids.append(portfolio_id)
+            continue
         if member is None:
             items.append(_bulk_delete_skipped_item(portfolio_id, "no_longer_duplicate"))
             skipped_ids.append(portfolio_id)

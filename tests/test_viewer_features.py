@@ -7861,7 +7861,9 @@ def test_deduplicate_backtests_confirm_rechecks_each_id_before_delete(
 
     alive = {"a", "b", "c"}
     monkeypatch.setattr(
-        viewer_app_module, "_duplicate_backtest_members", _duplicate_group_fake(alive, _GROUP_CREATED)
+        viewer_app_module,
+        "_duplicate_backtest_members",
+        _duplicate_group_fake(alive, _GROUP_CREATED),
     )
     deleted: list[str] = []
 
@@ -7871,7 +7873,12 @@ def test_deduplicate_backtests_confirm_rechecks_each_id_before_delete(
             alive.discard("a")
         alive.discard(backtest_id)
         deleted.append(backtest_id)
-        return {"id": backtest_id, "status": "deleted", "database": "deleted", "artifact": "deleted"}
+        return {
+            "id": backtest_id,
+            "status": "deleted",
+            "database": "deleted",
+            "artifact": "deleted",
+        }
 
     monkeypatch.setattr(viewer_app_module, "_delete_backtest_with_artifacts", fake_delete)
 
@@ -7916,7 +7923,12 @@ def test_deduplicate_backtests_recheck_error_skips_item_and_reports_rest(
         alive.discard(backtest_id)
         deleted.append(backtest_id)
         reads_broken = True  # the re-check for C (next id) fails
-        return {"id": backtest_id, "status": "deleted", "database": "deleted", "artifact": "deleted"}
+        return {
+            "id": backtest_id,
+            "status": "deleted",
+            "database": "deleted",
+            "artifact": "deleted",
+        }
 
     monkeypatch.setattr(viewer_app_module, "_delete_backtest_with_artifacts", fake_delete)
 
@@ -7956,7 +7968,12 @@ def test_deduplicate_portfolios_recheck_error_skips_item_and_reports_rest(
         alive.discard(portfolio_id)
         deleted.append(portfolio_id)
         reads_broken = True  # the re-check for C (next id) fails
-        return {"id": portfolio_id, "status": "deleted", "database": "deleted", "artifact": "deleted"}
+        return {
+            "id": portfolio_id,
+            "status": "deleted",
+            "database": "deleted",
+            "artifact": "deleted",
+        }
 
     monkeypatch.setattr(viewer_app_module, "_delete_portfolio_with_artifacts", fake_delete)
 
