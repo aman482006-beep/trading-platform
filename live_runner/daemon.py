@@ -1415,16 +1415,6 @@ async def prepare_order_with_risk(
             signal,
             instruction=None if is_exit_intent(metadata) else FULL_EXIT,
         )
-    # Promotion gate (#165). Every entry order of every deployment - Discord
-    # and internal alike - is prepared here, so this is the one place the daemon
-    # enforces it. The verdict comes from the adapter, the same source of truth
-    # as the demo-only block in `_ensure_adapter_for_active_account`: an adapter
-    # that is not provably demo/paper is real money. Exit-only orders returned
-    # above: closing a position must never be blocked by a missing promotion.
-    # Raises StrategyNotPromotedError before any broker state is read.
-    enforce_promotion_gate(
-        deployment, real_money=is_real_money(_adapter_is_demo(adapter))
-    )
     # #150 fail closed at the last chokepoint before the broker: the live path
     # never trails (#167), so an entry signal carrying a trailing config its
     # mode cannot satisfy here is refused — never submitted untrailed. This
@@ -1434,6 +1424,16 @@ async def prepare_order_with_risk(
         metadata.get(TRAILING_SL_CONFIG_METADATA_KEY),
         supported=LIVE_SUPPORTED_TRAILING_MODES,
         context=f"live deployment '{deployment.strategy_name}' ({deployment.id}) order submission",
+    )
+    # Promotion gate (#165). Every entry order of every deployment - Discord
+    # and internal alike - is prepared here, so this is the one place the daemon
+    # enforces it. The verdict comes from the adapter, the same source of truth
+    # as the demo-only block in `_ensure_adapter_for_active_account`: an adapter
+    # that is not provably demo/paper is real money. Exit-only orders returned
+    # above: closing a position must never be blocked by a missing promotion.
+    # Raises StrategyNotPromotedError before any broker state is read.
+    enforce_promotion_gate(
+        deployment, real_money=is_real_money(_adapter_is_demo(adapter))
     )
     # Feed broker truth into sizing so max_positions / max_total_exposure actually
     # bind. Without this, every signal is sized as if the account were flat.
