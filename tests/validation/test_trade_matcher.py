@@ -391,3 +391,47 @@ def test_global_assignment_splits_into_components_without_a_full_matrix(monkeypa
 
     assert len(result.matched) == 28 and not result.missing and not result.extra
     assert shapes and max(r * a for r, a in shapes) == 1
+
+
+def _make_open_trade(trade_id: int = 1, entry_time: str = "2024-01-01T10:00:00Z") -> Trade:
+    """An open position: schema-legal, no exits, so it has no exit time (#138)."""
+    return Trade(
+        id=trade_id,
+        symbol="EURUSD",
+        direction="LONG",
+        entry_time=entry_time,
+        entry_price=1.1000,
+        quantity=1000.0,
+        exits=[],
+        pnl=0.0,
+    )
+
+
+class TestExitlessTrades:
+    def test_open_trade_does_not_abort_the_match(self):
+        """One open position must not abort the whole comparison run (#138 contract)."""
+        open_trade = _make_open_trade(trade_id=2, entry_time="2024-01-02T10:00:00Z")
+        ref = [_make_trade(trade_id=1), open_trade]
+        act = [_make_trade(trade_id=1)]
+        result = TradeMatcher.match(ref, act)
+        assert len(result.matched) == 1
+        assert [t.id for t in result.missing] == [2]
+        assert result.extra == []
+
+    def test_open_trade_on_actual_side_is_extra_not_an_error(self):
+        ref = [_make_trade(trade_id=1)]
+        open_trade = _make_open_trade(trade_id=2, entry_time="2024-01-02T10:00:00Z")
+        act = [_make_trade(trade_id=1), open_trade]
+        result = TradeMatcher.match(ref, act)
+        assert len(result.matched) == 1
+        assert result.missing == []
+        assert [t.id for t in result.extra] == [2]
+
+    def test_open_trade_never_matches_a_closed_trade(self):
+        """An open trade has no exit to compare, so it cannot satisfy the exit tolerance."""
+        ref = [_make_open_trade(trade_id=1)]
+        act = [_make_trade(trade_id=1)]
+        result = TradeMatcher.match(ref, act)
+        assert result.matched == []
+        assert len(result.missing) == 1
+        assert len(result.extra) == 1

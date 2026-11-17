@@ -105,6 +105,13 @@ def _match_cost(
     return time_weight * time_cost + price_weight * price_cost + quantity_weight * qty_cost
 
 
+def _exit_timestamp(trade: Trade) -> datetime | None:
+    """Normalized final-exit time, or None for an open trade without exits (#138)."""
+    if not trade.exits:
+        return None
+    return _normalize_timestamp(trade.last_exit_time)
+
+
 def _canonical_key(data: dict[str, Any]) -> tuple[Any, ...]:
     """Stable sort key that makes the assignment independent of input order.
 
@@ -115,11 +122,15 @@ def _canonical_key(data: dict[str, Any]) -> tuple[Any, ...]:
     trade = data["trade"]
     price = float(trade.entry_price or 0.0)
     quantity = float(trade.quantity or 0.0)
+    exit_time = data["exit"]
+    # An open trade has no exit time; order it before every closed trade with
+    # the same entry, without comparing ``None`` against a datetime.
+    exit_key: tuple[int, datetime | None] = (0, None) if exit_time is None else (1, exit_time)
     # ``nan`` never compares, which would leave the order undefined; clamping
     # keeps the canonical order total.
     return (
         data["entry"],
-        data["exit"],
+        exit_key,
         trade.symbol,
         trade.direction,
         price if math.isfinite(price) else math.inf,
@@ -263,6 +274,10 @@ class TradeMatcher:
             ``time_weight``/``price_weight``/``quantity_weight`` (float):
                 Cost-term weights for tie-breaking (default 1.0 each).
 
+        Trades without exits (open positions, #138) have no exit time, so they
+        are never paired; they are reported in ``missing``/``extra`` instead
+        of aborting the run.
+
         Returns
         -------
         MatchResult
@@ -287,7 +302,7 @@ class TradeMatcher:
             {
                 "trade": t,
                 "entry": _normalize_timestamp(t.entry_time),
-                "exit": _normalize_timestamp(t.last_exit_time),
+                "exit": _exit_timestamp(t),
             }
             for t in reference_trades
         ]
@@ -295,7 +310,7 @@ class TradeMatcher:
             {
                 "trade": t,
                 "entry": _normalize_timestamp(t.entry_time),
-                "exit": _normalize_timestamp(t.last_exit_time),
+                "exit": _exit_timestamp(t),
             }
             for t in actual_trades
         ]
@@ -321,6 +336,10 @@ class TradeMatcher:
                     continue
 
                 if _time_diff_seconds(ref["entry"], act["entry"]) > tolerance_seconds:
+                    continue
+                # An open trade (no exits, #138) has no exit to compare, so it
+                # cannot satisfy the exit tolerance and is never paired.
+                if ref["exit"] is None or act["exit"] is None:
                     continue
                 if _time_diff_seconds(ref["exit"], act["exit"]) > tolerance_seconds:
                     continue
