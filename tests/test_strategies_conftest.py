@@ -34,6 +34,10 @@ def _load_gate():
 
 @pytest.fixture
 def gate(monkeypatch, tmp_path):
+    # An exported TP_TEST_OHLCV_DIR (the local read-only opt-in) must not leak into
+    # these tests: they build their own dataset under tmp_path. Tests of the opt-in
+    # set it explicitly.
+    monkeypatch.delenv("TP_TEST_OHLCV_DIR", raising=False)
     module = _load_gate()
     monkeypatch.setattr(module, "DATA_DIR", tmp_path)
     monkeypatch.setattr(module, "FAIL_ON_MISSING_DATA", False)
