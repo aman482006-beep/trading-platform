@@ -380,42 +380,13 @@ def _finite_float(value: Any, *, field: str, context: str) -> float:
     return number
 
 
-def parse_supertrend_flip_plan(
-    trailing_cfg: Any,
-    metadata: Any,
-    *,
-    action: str,
-    take_profit: float | None,
-    context: str,
-) -> SupertrendFlipPlan:
-    """Validate a ``supertrend_flip`` signal and return its plan.
-
-    Fail closed, no invented defaults: every parameter must be present and
-    valid, otherwise ``ValueError`` and the signal is not traded.
-
-    - ``trailing_cfg``: ``supertrend_period`` (integer >= 1),
-      ``supertrend_multiplier`` (> 0), ``breakeven_after_tp1`` (bool); the
-      optional ``activation_phase`` / ``exit_phase`` descriptions must name
-      the implemented phases.
-    - ``metadata`` (the signal metadata): ``tp1_price`` (> 0) and
-      ``tp1_exit_percent`` — a *fraction* in (0, 1] despite its name, as the
-      RamJet processor emits it (0.5 = half the position).
-    - ``action`` must be ``buy``: the workflow (green activates, red exits) is
-      defined for long positions only.
-    - ``take_profit``, when set, must equal ``tp1_price``. The workflow has no
-      full-position take profit; a different level would be ambiguous.
-    """
+def _validate_flip_config(trailing_cfg: Any, *, context: str) -> tuple[int, float, bool]:
+    """Return ``(supertrend_period, supertrend_multiplier, breakeven_after_tp1)``
+    from a ``supertrend_flip`` config, or raise ``ValueError``."""
     if not isinstance(trailing_cfg, dict):
         raise ValueError(f"trailing_sl_config in {context} must be a mapping.")
     if normalize_trailing_mode(trailing_cfg.get("mode")) != TRAILING_MODE_SUPERTREND_FLIP:
         raise ValueError(f"trailing_sl_config in {context} is not a supertrend_flip config.")
-    if str(action or "").strip().lower() not in {"buy", "long"}:
-        raise ValueError(
-            f"supertrend_flip in {context} is defined for long entries only, got action "
-            f"{action!r}."
-        )
-    if not isinstance(metadata, dict):
-        raise ValueError(f"supertrend_flip in {context} requires signal metadata.")
 
     raw_period = trailing_cfg.get("supertrend_period")
     period_value = _finite_float(raw_period, field="supertrend_period", context=context)
@@ -446,6 +417,51 @@ def parse_supertrend_flip_plan(
                 f"supertrend_flip in {context} declares {key}={trailing_cfg[key]!r}; only "
                 f"{expected!r} is implemented."
             )
+    return int(period_value), multiplier, breakeven
+
+
+def parse_supertrend_flip_plan(
+    trailing_cfg: Any,
+    metadata: Any,
+    *,
+    action: str,
+    take_profit: float | None,
+    stop_loss: float | None,
+    context: str,
+) -> SupertrendFlipPlan:
+    """Validate a ``supertrend_flip`` signal and return its plan.
+
+    Fail closed, no invented defaults: every parameter must be present and
+    valid, otherwise ``ValueError`` and the signal is not traded.
+
+    - ``trailing_cfg``: ``supertrend_period`` (integer >= 1),
+      ``supertrend_multiplier`` (> 0), ``breakeven_after_tp1`` (bool); the
+      optional ``activation_phase`` / ``exit_phase`` descriptions must name
+      the implemented phases.
+    - ``metadata`` (the signal metadata): ``tp1_price`` (> 0) and
+      ``tp1_exit_percent`` — a *fraction* in (0, 1] despite its name, as the
+      RamJet processor emits it (0.5 = half the position).
+    - ``action`` must be ``buy``: the workflow (green activates, red exits) is
+      defined for long positions only.
+    - ``stop_loss`` must be a finite positive stop: before TP1 it is the only
+      protection of the position.
+    - ``take_profit``, when set, must equal ``tp1_price``. The workflow has no
+      full-position take profit; a different level would be ambiguous.
+    """
+    if str(action or "").strip().lower() not in {"buy", "long"}:
+        raise ValueError(
+            f"supertrend_flip in {context} is defined for long entries only, got action "
+            f"{action!r}."
+        )
+    if not isinstance(metadata, dict):
+        raise ValueError(f"supertrend_flip in {context} requires signal metadata.")
+    period, multiplier, breakeven = _validate_flip_config(trailing_cfg, context=context)
+
+    if stop_loss is None:
+        raise ValueError(f"supertrend_flip in {context} requires a stop_loss.")
+    _finite_float(stop_loss, field="stop_loss", context=context)
+    if float(stop_loss) <= 0:
+        raise ValueError(f"supertrend_flip in {context} requires stop_loss > 0, got {stop_loss!r}.")
 
     tp1_price = _finite_float(metadata.get("tp1_price"), field="tp1_price", context=context)
     if tp1_price <= 0:
@@ -470,6 +486,6 @@ def parse_supertrend_flip_plan(
         tp1_price=tp1_price,
         tp1_exit_fraction=fraction,
         breakeven_after_tp1=breakeven,
-        supertrend_period=int(period_value),
+        supertrend_period=period,
         supertrend_multiplier=multiplier,
     )

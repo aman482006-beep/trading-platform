@@ -70,6 +70,7 @@ def _signal(
     take_profit: float | None = TP1,
     symbol: str = "AAPL",
     timestamp: str = "2026-01-01T00:00:00Z",
+    no_stop: bool = False,
 ) -> ReplaySignal:
     meta = {
         "trailing_sl_config": dict(FLIP_CONFIG if trailing is None else trailing),
@@ -83,7 +84,7 @@ def _signal(
             "symbol": symbol,
             "action": action,
             "entry_price": ENTRY,
-            "stop_loss": STOP if action == "buy" else 105.0,
+            "stop_loss": None if no_stop else (STOP if action == "buy" else 105.0),
             "take_profit": take_profit,
             "timeframe": "1m",
             "metadata": meta,
@@ -666,7 +667,34 @@ def test_incomplete_or_invalid_flip_config_rejects_the_run(trailing, metadata, m
 def test_missing_tp1_exit_percent_is_not_defaulted() -> None:
     with pytest.raises(ValueError, match="tp1_exit_percent"):
         parse_supertrend_flip_plan(
-            FLIP_CONFIG, {"tp1_price": TP1}, action="buy", take_profit=TP1, context="test"
+            FLIP_CONFIG,
+            {"tp1_price": TP1},
+            action="buy",
+            take_profit=TP1,
+            stop_loss=STOP,
+            context="test",
+        )
+
+
+def test_a_flip_signal_without_a_stop_is_refused() -> None:
+    """Before TP1 the stop is the only protection: a stopless flip entry would
+    sit unprotected until TP1 and never be stopped out afterwards, so it is
+    refused instead of traded."""
+    frame = _frame([ENTRY_BAR, _flat()])
+    signals = [_signal(no_stop=True)]
+    with pytest.raises(ValueError, match="requires a stop_loss"):
+        _run(frame, signals=signals)
+
+
+def test_plan_parsing_refuses_a_missing_stop() -> None:
+    with pytest.raises(ValueError, match="requires a stop_loss"):
+        parse_supertrend_flip_plan(
+            FLIP_CONFIG,
+            {"tp1_price": TP1, "tp1_exit_percent": 0.5},
+            action="buy",
+            take_profit=TP1,
+            stop_loss=None,
+            context="test",
         )
 
 
@@ -690,6 +718,7 @@ def test_plan_is_parsed_from_config_and_metadata() -> None:
         {"tp1_price": TP1, "tp1_exit_percent": 0.25},
         action="buy",
         take_profit=None,
+        stop_loss=STOP,
         context="test",
     )
     assert plan.tp1_price == TP1

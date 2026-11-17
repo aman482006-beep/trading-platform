@@ -898,6 +898,7 @@ class SignalReplayAdapter:
                     effective_signal.metadata,
                     action=effective_signal.action,
                     take_profit=effective_signal.take_profit,
+                    stop_loss=effective_signal.stop_loss,
                     context=f"signal replay ({effective_signal.symbol})",
                 )
                 if trailing_mode == TRAILING_MODE_SUPERTREND_FLIP
