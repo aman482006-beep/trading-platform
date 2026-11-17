@@ -5,6 +5,7 @@ import asyncio
 import contextlib
 import json
 import re
+import sys
 import traceback
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
@@ -132,11 +133,71 @@ def _resolve_ctrader_credentials(
     return app_id, app_secret, access_token, refresh_token, demo
 
 
+def _release_twisted_reactor_threads() -> None:
+    """Stop the Twisted reactor's thread pool so the process can exit.
+
+    The cTrader adapter starts the asyncio-backed Twisted reactor with
+    ``startRunning`` and never stops it (the daemon owns it for the process
+    lifetime). Twisted resolves the broker host name through its reactor thread
+    pool, whose worker threads are not daemon threads and are only stopped by
+    the reactor's shutdown event. Without this, a preflight that connected to
+    cTrader printed its result and then hung forever in interpreter shutdown.
+    """
+    # ``installReactor`` stores the reactor instance under this key, so membership
+    # means "a reactor was installed"; importing it here cannot install a new one.
+    if "twisted.internet.reactor" not in sys.modules:
+        return
+    from twisted.internet import reactor
+
+    if getattr(reactor, "threadpool", None) is None:
+        return
+    stop_thread_pool = getattr(reactor, "_stopThreadPool", None)
+    if callable(stop_thread_pool):
+        # The reactor's own shutdown-trigger handler: removes its triggers and
+        # joins the workers. Shutdown never fires here, so it is called directly.
+        stop_thread_pool()
+    else:
+        logger.warning(
+            "Twisted reactor has a thread pool but no _stopThreadPool handler; "
+            "the process may hang at exit. The Twisted private API likely changed."
+        )
+
+
+@contextlib.contextmanager
+def _connectivity_event_loop(enabled: bool) -> Iterator[asyncio.AbstractEventLoop | None]:
+    """One event loop for every account's connectivity check.
+
+    The Twisted reactor binds to the first asyncio loop it is installed on.
+    With one ``asyncio.run`` per account, every cTrader account after the
+    first talked to a closed loop and timed out, so a config with two cTrader
+    accounts always failed preflight for the second one.
+    """
+    if not enabled:
+        yield None
+        return
+    loop = asyncio.new_event_loop()
+    try:
+        yield loop
+    finally:
+        try:
+            _release_twisted_reactor_threads()
+        except Exception:
+            logger.warning(
+                "Releasing Twisted reactor threads failed; the process may hang at exit",
+                exc_info=True,
+            )
+        with contextlib.suppress(Exception):
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.close()
+
+
 def _run_broker_connectivity_check(
     adapter: AlpacaLiveAdapter | CTraderLiveAdapter,
     *,
     broker_label: str,
     errors: list[str],
+    env_values: Mapping[str, str],
+    loop: asyncio.AbstractEventLoop | None = None,
 ) -> tuple[bool, float | None, float | None, int | None]:
     connected = False
     balance: float | None = None
@@ -156,9 +217,18 @@ def _run_broker_connectivity_check(
                 await adapter.disconnect()
 
     try:
-        balance, equity, positions_count = asyncio.run(_check())
+        if loop is None:
+            balance, equity, positions_count = asyncio.run(_check())
+        else:
+            balance, equity, positions_count = loop.run_until_complete(_check())
     except Exception as exc:
-        errors.append(f"{broker_label} connectivity check failed: {type(exc).__name__}: {exc}")
+        # Broker error text can quote credential values; redact like every other path.
+        errors.append(
+            _redact_values(
+                f"{broker_label} connectivity check failed: {type(exc).__name__}: {exc}",
+                env_values,
+            )
+        )
     return connected, balance, equity, positions_count
 
 
@@ -169,6 +239,7 @@ def _preflight_alpaca_account(
     check_connectivity: bool,
     errors: list[str],
     warnings: list[str],
+    loop: asyncio.AbstractEventLoop | None = None,
 ) -> tuple[bool | None, bool | None, float | None, float | None, int | None]:
     credentials = resolve_alpaca_credentials(
         account_id=account.id,
@@ -200,6 +271,8 @@ def _preflight_alpaca_account(
                 adapter,
                 broker_label="Alpaca",
                 errors=errors,
+                env_values=env_values,
+                loop=loop,
             )
     return paper, connected, balance, equity, positions_count
 
@@ -238,6 +311,7 @@ def _preflight_ctrader_account(
     accounts_env_path: Path,
     errors: list[str],
     warnings: list[str],
+    loop: asyncio.AbstractEventLoop | None = None,
 ) -> tuple[bool | None, bool | None, float | None, float | None, int | None]:
     credentials = _ctrader_preflight_credentials(env_values, errors)
     demo: bool | None = None
@@ -284,6 +358,8 @@ def _preflight_ctrader_account(
             adapter,
             broker_label="cTrader",
             errors=errors,
+            env_values=env_values,
+            loop=loop,
         )
     return demo, connected, balance, equity, positions_count
 
@@ -294,6 +370,7 @@ def _preflight_account(
     env_values: Mapping[str, str],
     check_connectivity: bool,
     accounts_env_path: Path,
+    loop: asyncio.AbstractEventLoop | None = None,
 ) -> LivePreflightAccountResult:
     errors: list[str] = []
     warnings: list[str] = []
@@ -317,6 +394,7 @@ def _preflight_account(
             check_connectivity=check_connectivity,
             errors=errors,
             warnings=warnings,
+            loop=loop,
         )
 
     elif account.broker == "ctrader":
@@ -333,6 +411,7 @@ def _preflight_account(
             accounts_env_path=accounts_env_path,
             errors=errors,
             warnings=warnings,
+            loop=loop,
         )
 
     return LivePreflightAccountResult(
@@ -543,15 +622,17 @@ def run_live_preflight(
         },
     )
 
-    account_results = [
-        _preflight_account(
-            account,
-            env_values=env_values,
-            check_connectivity=check_connectivity,
-            accounts_env_path=accounts_env,
-        )
-        for account in accounts
-    ]
+    with _connectivity_event_loop(check_connectivity) as loop:
+        account_results = [
+            _preflight_account(
+                account,
+                env_values=env_values,
+                check_connectivity=check_connectivity,
+                accounts_env_path=accounts_env,
+                loop=loop,
+            )
+            for account in accounts
+        ]
     deployment_errors, deployment_warnings = _validate_deployments(accounts, deployments)
 
     ok = all(result.ok for result in account_results) and not deployment_errors
