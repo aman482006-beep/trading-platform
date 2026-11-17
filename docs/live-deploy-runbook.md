@@ -8,12 +8,125 @@ Status: credential-gated as of 2026-07-13.
 - Alpaca account blocks `ACC1..3` (Nitro, RamJet, RocketFuel) contain paper endpoints only; IDs werden aus `.accounts.env` aufgeloest, nicht hier dokumentiert.
 - Discord bot tokens and channel IDs are set for Nitro, RamJet, and RocketFuel.
 - cTrader credentials are demo credentials if the cTrader smoke is run.
-- Trailing stops are not executed live yet (#167). A deployment whose
-  `signal_config.signal_processor_config.trailing_mode` is anything other than `none` is rejected
-  when it is created or parsed from YAML. A stored deployment that already has such a value still
-  loads (so it stays listed and can be stopped), the daemon logs an error for it at load, and each
-  of its signals is refused before it reaches the broker. See `shared/trailing.py` and
-  `docs/signal_bots.md`.
+- Trailing stops: live support is per broker (see "Live Trailing Stops" below). Alpaca executes
+  `none` and `percent`; cTrader executes `none` only. Any other combination is rejected when the
+  deployment is validated and again at signal time, before anything reaches the broker.
+
+## Live Trailing Stops
+
+Central definition: `shared/trailing.py` (`LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER`). Execution:
+`live_runner/trailing_stops.py`.
+
+| Broker  | `none` | `percent` | `supertrend_flip` |
+|---------|--------|-----------|-------------------|
+| Alpaca  | yes    | yes       | no (#168)         |
+| cTrader | yes    | no        | no (#168)         |
+
+cTrader stays on `none`: the daemon has no cTrader market data to trail on, and the adapter does
+not declare the `supports_stop_amendment` capability. Unknown brokers get `none` only.
+
+**Where an unsupported mode is rejected**
+
+- Deployment validation: `LiveDeploymentConfig` rejects a `trailing_mode` override no live broker
+  executes; `create_live_deployment`, `update_live_deployment_account` (re-point) and the YAML
+  parser reject one the deployment's account broker does not execute.
+- Signal time: the signal-processor gate and the order-preparation gate both check the mode
+  against the adapter that would submit the order (broker table and the adapter's own
+  `supports_stop_amendment` flag). A refused signal is not traded; a requested trail is never
+  dropped silently.
+- Stored rows: a stored deployment whose trailing override no live broker executes still loads
+  (so it stays listed and can be stopped); the daemon logs an error for it at load and every
+  signal it produces is refused before it reaches the broker.
+
+**How `percent` is executed (Alpaca)**
+
+- Arithmetic: `RiskEngine.apply_trailing_stop`, the same call the replay backtest makes, applied
+  once per closed bar to the bar close. A stop only ever moves in the favourable direction. The
+  broker stop is the computed stop rounded to Alpaca's price tick away from the market (down for
+  a long, up for a short), so it is at most one tick looser than the replay stop.
+- Trigger: each closed bar of the deployment's signal timeframe (`signal_config.timeframe`, else
+  the deployment timeframe). The loop wakes every 15 s but only compares timestamps; it reads
+  positions, orders and bars (`AlpacaLiveAdapter.get_market_data`) when a bar boundary has passed
+  or a retry is due. A bar that is not published yet is re-requested with backoff (15 s doubling
+  to 5 min), but only for up to 15 minutes after the boundary (at most one bar): after that the
+  feed is treated as closed (night, weekend, holiday) and the next bar boundary tries again.
+- Timeframes: only `1m`, `5m`, `15m`, `30m` and `1h` can be trailed (`LIVE_TRAILING_TIMEFRAMES_BY_BROKER`
+  in `shared/trailing.py`). Their bars are stamped on UTC-aligned boundaries, which is what the
+  manager's wake-up slots and the "closed at open + length" rule assume. `1d` is NOT trailable
+  yet: Alpaca stamps equity daily bars at New-York midnight (05:00Z/04:00Z), so the trail would run
+  a session late versus replay. `4h`/`1w` are not served by the adapter at all. Per #150 such an
+  entry is refused, not traded untrailed: a `percent` entry on an untrailable timeframe is rejected
+  at signal time (processor gate and order-preparation gate), and a deployment that sets
+  `trailing_mode: percent` in `signal_processor_config` is rejected at API create and YAML parse. A
+  deployment whose trailing mode only comes from the signal processor's own default cannot be
+  checked before a signal exists; it is refused at its first entry. Session-aligned daily trailing
+  is a follow-up.
+- Amendment: the protective stop order is replaced in place (`PATCH /v2/orders/{id}`). The
+  previous stop keeps working until the replacement is accepted and stays if it is refused; the
+  stop is never cancelled in order to move it. The replace and the adapter's order sweeps (STOP
+  flatten, cancel of exposure-opening orders, orphan cleanup) are serialised per adapter, so a
+  flatten never misses a stop that was replaced under it.
+- Failure: a refused or failed amendment, a missing or ambiguous stop, or missing market data is
+  logged at ERROR (`Live trailing stop could not be updated; ...`, with account, symbol, signal,
+  stop order id, current and target stop, consecutive failure count) and sent to Sentry
+  (`component=live_trailing_stops`). It is retried with the same backoff; the previous
+  broker-side stop stays in force meanwhile.
+  A failure that repeats is not retried forever: once failures have lasted 40 minutes without a
+  single success (`TRAILING_GIVE_UP_AFTER_SECONDS`, measured from the first of the consecutive
+  failures, so a 1m deployment is not given up on any sooner than a 1h one) the position is given
+  up on with one CRITICAL alert (`Live trailing stop given up on ...`). A failure of the
+  account-wide stop listing counts once per account, not once per position. A given-up position is
+  not retried at the normal pace and raises no further alerts, but it is probed every 15 minutes
+  (`TRAILING_GIVEN_UP_PROBE_SECONDS`): the first pass that succeeds resumes trailing (INFO
+  `Live trailing stop resumed ...`) and it catches up on the closed bars it missed (up to 50).
+  Failures no retry can fix (an unservable timeframe, an adapter without market data) are never
+  probed and last until the entry signal or the position changes (a daemon restart also starts
+  counting again). The broker-side stop stays at its last level while given up.
+  This includes a trailed stop the market has already fallen through since the bar closed: the
+  broker refuses it, the old stop keeps protecting the position, and the replay backtest would
+  have exited on that bar instead.
+- Restart: nothing needs to be restored. The current stop is read from the broker on every pass
+  and the trailing config from the persisted entry signal (`live_signals.metadata`,
+  `trailing_sl_config`). After a restart the trail continues from the broker's stop, catches up on
+  up to 50 closed bars, and cannot move a stop backwards.
+- Cleanup: in-memory progress is dropped as soon as the position is gone at the broker (stop or
+  take profit hit, exit signal, manual close) or its deployment is no longer ACTIVE. A partial
+  exit keeps the trail on the remaining quantity.
+- Stop quantity: an amendment moves the price only. After a partial exit a bracket stop leg can
+  still be sized to the original entry; the loop logs a WARNING once per position when the stop
+  covers more than the position holds, but does not resize it. What Alpaca does when such a stop
+  triggers (cap, oversell, reject) has **not** been verified on paper.
+
+**Limits to know when operating it**
+
+- Only ACTIVE deployments are trailed. PAUSED leaves orders untouched and STOPPED flattens; the
+  stop stays at its last broker level. Resuming continues from that level.
+- A position is attributed to the newest filled entry signal for its symbol among the account's
+  ACTIVE deployments. A position opened outside the platform on a symbol whose newest filled
+  platform entry asked for `percent` trailing would be trailed too; keep manual trades off
+  accounts that run trailing deployments.
+- Exactly one working plain `stop` order on the reducing side is required per symbol. Several
+  stops on one symbol (pyramided entries), a stop-limit, or no stop at all is reported as a
+  failure on every pass and nothing is amended.
+- Real-money accounts are never amended: the loop only receives connected demo/paper adapters,
+  the same hard block that applies to orders.
+**Verified on Alpaca paper (2026-11-16)**
+
+Probe on a paper account (endpoint host checked as `paper-api.alpaca.markets`): 1 share of `F`
+as a market bracket entry (stop 3 % below, take profit 5 % above), then listings, a replace and a
+clean-up.
+
+- Right after the entry fills: parent `filled`; take-profit leg `new`; stop leg `held`.
+- `status=open` (nested or flat) lists the take-profit leg only. **The `held` stop leg is not in
+  any open listing.** `AlpacaLiveAdapter.list_protective_stops` therefore also reads filled
+  parents of symbols with an open position from a `status=all`, `nested=true` listing and takes
+  their `held` stop legs (fixed in this PR; before it a real bracket position reported "no stop").
+- `PATCH /v2/orders/{id}` on the `held` stop leg is accepted: the response is a new order id,
+  `held`, with the new `stop_price`; the parent's `legs` then show the new stop and the unchanged
+  take-profit leg. Through the adapter the stop moved 11.35 -> 11.52 with the take profit intact.
+- Not covered by this PR: `close_all_positions` on a bracket with a `held` stop leg returned
+  `orders-still-working ... NO-STOP-RESTORED` (the sweep lists open orders only); the leg was
+  cancelled by Alpaca's OCO handling and the position was closable afterwards. Tracked separately.
 
 ## Provisioning and Rotation
 
@@ -120,7 +233,7 @@ Bars are keyed by canonical pair (`BTC/USD`) in every spelling (`BTCUSD`, `btc-u
 
 - `live_executions.commission` is nullable. `0.0` is a known zero (Alpaca equities); `NULL` means the fee is not known yet. Every reader treats `NULL` as "net PnL incomplete", never as zero: the live stats payload reports `net_pnl: null`, `net_pnl_complete: false` and `commission_unknown_count`, and trade/signal payloads carry `commission: null`.
 - Alpaca crypto fees are posted end of day as `CFEE` account activities, so crypto fills are stored with `NULL`. The daemon's hourly `commission-backfill` task reads `FILL`, `CFEE` and `FEE` activities over REST, once a trade date is two UTC days old and for fills up to 30 days back, allocates each (pair, trade date)'s fee pro rata by received quantity, converts it to USD and writes it. Everything it cannot attribute unambiguously stays `NULL` and is logged ("Alpaca commission backfill: leaving ..."); see `live_runner/alpaca_fees.py` for the rules.
-- The schema migration rebuilds `live_executions` once to drop the `NOT NULL` and turns the hard-coded `0.0` on existing Alpaca fills into `NULL` unless the symbol is provably an equity (`shared/alpaca_symbols.py`): crypto in either spelling (`BTC/USD`, `BTCUSD`) and anything unclassifiable (options, malformed symbols) become unknown. The backfill logs every unknown-commission execution it skips, with the reason (not crypto, trade date not posted yet).
+- The schema migration rebuilds `live_executions` once to drop the `NOT NULL` and turns the hard-coded `0.0` on existing Alpaca fills into `NULL` unless the symbol is provably an equity (`shared/alpaca_symbols.py`): crypto in any accepted spelling (`BTC/USD`, `BTC-USD`, `BTCUSD`) and anything unclassifiable (options, malformed symbols) become unknown. The backfill logs every unknown-commission execution it skips, with the reason (not crypto, trade date not posted yet).
 - `actual_price_observed` labels every Alpaca price: `observed` (stated for this fill), `derived` (computed from broker prices: the order's `filled_avg_price` on a single-fill order, or a reconciled remainder), `sent_bad`/`absent` (no usable price), `derived_unavailable` (the remainder's price could not be derived honestly). A stream event never borrows the order's cumulative average for a partial fill.
 - A reconciled fill whose order has no usable `filled_avg_price` is not stored; the next reconciliation pass (adapter connect) retries it. Otherwise the missing QUANTITY is always stored. Its price is `(avg*broker_qty - sum(local price*qty)) / missing_qty`, labelled `derived`, when every local leg has a usable price and the result lies within 10% of the order's average (`REMAINDER_PRICE_MAX_REL_DEVIATION`); otherwise it is stored at `0.0` with `derived_unavailable`, so exit sizing and duplicate-order protection still see the quantity.
 - Every PnL reader treats a `sent_bad`/`absent`/`derived_unavailable` (or non-positive) price as unknown: API rows carry `actual_price: null` and `slippage: null`, and live stats report `total_pnl: null`, `pnl_complete: false` and `price_unknown_count`; the frontend shows "incomplete" instead of a number.
