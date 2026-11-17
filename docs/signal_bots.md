@@ -70,6 +70,8 @@ pro Bot.
        folgenden Kerze geschlossen (der Flip ist erst beim Schluss der Flip-Kerze bekannt). Ist die
        Flip-Kerze die letzte Kerze der Daten, wird die Position wie jede andere am Datenende
        geschlossen (`end_of_data`).
+    - Ein Signal ohne `stop_loss` wird abgelehnt: vor TP1 ist der Stop der einzige Schutz,
+      der Workflow setzt keinen eigenen.
     - Stop und TP1 in derselben Kerze: Stop zuerst (Konvention des Adapters,
       `resolve_same_bar_exit`); dann gibt es kein TP1.
     - Supertrend: dieselbe Implementierung wie der Processor (`calculate_supertrend`), mit
