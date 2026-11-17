@@ -5380,7 +5380,11 @@ def _backtest_is_ruined(backtest: BacktestRecord, stats: dict[str, Any]) -> bool
     for point in curve:
         try:
             equity = float(point.get("equity")) if isinstance(point, dict) else math.nan
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            # OverflowError: a JSON integer outside float64 range (10**400) is
+            # stored JSON that cannot be read as an account value. Same rule as
+            # None/text: unable to read it, so unable to prove the account
+            # survived.
             equity = math.nan
         if not (math.isfinite(equity) and equity > 0):
             logger.warning(
