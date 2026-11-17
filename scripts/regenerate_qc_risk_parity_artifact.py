@@ -43,6 +43,9 @@ from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, Trad
 
 DEFAULT_OUTPUT = Path("data/backtests/risk_parity_quantconnect_reimplementation.json")
 DEFAULT_SOURCE = Path("ohlcv/yfinance/equity/US")
+# Statistics convention of the checked-in QC reference (risk_parity_reference.json note):
+# LEAN calendar-day returns, Sharpe/Sortino net of the average 2016-2024 risk-free rate.
+PARITY_RISK_FREE_RATE = 0.025
 
 
 def _load_local_prices(data_dir: Path, source: Path, start: str, end: str) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -183,7 +186,13 @@ def regenerate(*, data_dir: Path, source: Path, output: Path, start: str, end: s
     original = risk_parity.download_prices
     risk_parity.download_prices = local_prices
     try:
-        result = risk_parity.run_backtest(start_date=start, end_date=end, initial_cash=1_000_000.0)
+        result = risk_parity.run_backtest(
+            start_date=start,
+            end_date=end,
+            initial_cash=1_000_000.0,
+            lean_statistics=True,
+            risk_free_rate=PARITY_RISK_FREE_RATE,
+        )
     finally:
         risk_parity.download_prices = original
 
