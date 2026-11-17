@@ -501,21 +501,17 @@ class PromotionEvidence:
         ]
 
 
-def out_of_sample_evidence_from_result(result_path: Path | str) -> OutOfSampleEvidence:
-    """Read the out-of-sample evidence out of an optimization result file.
-
-    Nothing here is typed in by the promoter: the verdict, the test window and
-    the trade count are taken from the file the optimizer wrote (#164), and the
-    file's SHA256 is recorded so the ledger names exactly one result.
-    """
-    path = Path(result_path)
+def _read_optimization_result(path: Path) -> Mapping[str, Any]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise InvalidPromotionError(f"optimization result is unreadable: {path}") from exc
     if not isinstance(payload, Mapping):
         raise InvalidPromotionError(f"optimization result is not a JSON object: {path}")
+    return payload
 
+
+def _overfitting_verdict(payload: Mapping[str, Any]) -> bool:
     three_way = payload.get("three_way")
     overfitting = three_way.get("overfitting") if isinstance(three_way, Mapping) else None
     if not isinstance(overfitting, Mapping) or not isinstance(overfitting.get("passed"), bool):
@@ -524,6 +520,11 @@ def out_of_sample_evidence_from_result(result_path: Path | str) -> OutOfSampleEv
             "(three_way.overfitting.passed); re-run the optimization with the "
             "three-way split"
         )
+    return overfitting["passed"]
+
+
+def _test_segment(payload: Mapping[str, Any]) -> tuple[Mapping[str, Any], int]:
+    """The untouched final test window and its trade count."""
     test_period = payload.get("final_test_period")
     test_stats = payload.get("final_test_stats")
     if not isinstance(test_period, Mapping) or not isinstance(test_stats, Mapping):
@@ -536,6 +537,20 @@ def out_of_sample_evidence_from_result(result_path: Path | str) -> OutOfSampleEv
         trades = int(trades)
     if isinstance(trades, bool) or not isinstance(trades, int):
         raise InvalidPromotionError("optimization result has no final_test_stats.total_trades")
+    return test_period, trades
+
+
+def out_of_sample_evidence_from_result(result_path: Path | str) -> OutOfSampleEvidence:
+    """Read the out-of-sample evidence out of an optimization result file.
+
+    Nothing here is typed in by the promoter: the verdict, the test window and
+    the trade count are taken from the file the optimizer wrote (#164), and the
+    file's SHA256 is recorded so the ledger names exactly one result.
+    """
+    path = Path(result_path)
+    payload = _read_optimization_result(path)
+    passed = _overfitting_verdict(payload)
+    test_period, trades = _test_segment(payload)
     strategy = payload.get("strategy")
     strategy_path = str(strategy.get("path") or "") if isinstance(strategy, Mapping) else ""
     if not strategy_path.strip():
@@ -557,7 +572,7 @@ def out_of_sample_evidence_from_result(result_path: Path | str) -> OutOfSampleEv
             "test_start": str(test_period.get("start") or ""),
             "test_end": str(test_period.get("end") or ""),
             "test_trade_count": trades,
-            "overfitting_passed": overfitting["passed"],
+            "overfitting_passed": passed,
         }
     )
 
