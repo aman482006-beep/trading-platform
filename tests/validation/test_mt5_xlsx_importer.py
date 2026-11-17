@@ -357,16 +357,18 @@ class TestBrokerClock:
         assert sp500_on_broker_clock.raw_metadata["source_timezone"] is None
 
     def test_source_timezone_and_broker_clock_are_mutually_exclusive(self, importer):
+        path = _sp500_path()
         with pytest.raises(ValueError, match="mutually exclusive"):
             importer.load(
-                _sp500_path(),
+                path,
                 source_timezone="Europe/Athens",
                 broker_clock="dukascopy_mt5_index",
             )
 
     def test_unknown_broker_clock_is_rejected(self, importer):
+        path = _sp500_path()
         with pytest.raises(ValueError, match="Unknown broker_clock"):
-            importer.load(_sp500_path(), broker_clock="europe_athens")
+            importer.load(path, broker_clock="europe_athens")
 
     def test_to_iso_refuses_a_server_time_the_clock_skipped(self):
         # 2024-04-06 02:30 server time never happened on this broker. The clock
