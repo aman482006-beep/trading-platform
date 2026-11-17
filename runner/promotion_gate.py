@@ -25,8 +25,10 @@ are reused here. One ledger can hold several promotions of the same file, one
 per parameter set.
 
 Everything fails closed. A missing file, a missing, unreadable or malformed
-ledger, an unknown field shape, evidence that no longer meets the *current*
-thresholds: all of them mean ``experimental``. The evidence is re-validated on
+ledger, a required field that is missing or of the wrong type, evidence that no
+longer meets the *current* thresholds: all of them mean ``experimental``. Keys
+the reader does not know are ignored; only the thresholds file refuses unknown
+keys, because a typo there would silently leave a default in force. The evidence is re-validated on
 every check, so a ledger edited by hand to say something the checks would have
 refused does not pass either.
 

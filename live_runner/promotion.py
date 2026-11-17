@@ -30,9 +30,9 @@ What is hashed and which parameters are bound
   applies per-deployment strategy parameters, so the defaults are exactly what
   the strategy trades with. Deployment ``settings`` (risk limits, selection
   metadata, auth overrides, ...) do not parameterise the strategy and are not
-  bound. A deployment that nevertheless carries ``settings["strategy_parameters"]``
-  is refused on a real-money account: it would look like an override the gate
-  checked while nothing applies it. Optimised parameters are promoted by
+  bound. Any deployment, strategy or signal bot, that carries
+  ``settings["strategy_parameters"]`` is refused on a real-money account: it
+  would look like an override the gate checked while nothing applies it. Optimised parameters are promoted by
   writing them into ``STRATEGY_META`` (which also changes the hashed file).
 
 Anything that cannot be resolved on a real-money account is refused: no file,
@@ -283,18 +283,18 @@ def deployment_promotion_target(
     strategies_dir: Path | str | None = None,
 ) -> PromotionTarget:
     """Resolve what ``deployment`` trades. Raises ``PromotionTargetError``."""
+    if STRATEGY_PARAMETERS_KEY in (deployment.settings or {}):
+        # Nothing applies this override, for a signal bot or a strategy alike.
+        raise PromotionTargetError(
+            f"settings.{STRATEGY_PARAMETERS_KEY} is not applied by the live runner; "
+            "promote the parameters by writing them into STRATEGY_META"
+        )
     processor_name = deployment_signal_processor_name(deployment)
     if processor_name:
         processor_config = (deployment.signal_config or {}).get("signal_processor_config")
         if processor_config is not None and not isinstance(processor_config, Mapping):
             raise PromotionTargetError("signal_processor_config must be a mapping")
         return signal_bot_target(processor_name, processor_config)
-
-    if STRATEGY_PARAMETERS_KEY in (deployment.settings or {}):
-        raise PromotionTargetError(
-            f"settings.{STRATEGY_PARAMETERS_KEY} is not applied by the live runner; "
-            "promote the parameters by writing them into STRATEGY_META"
-        )
     return strategy_target(deployment.strategy_name, strategies_dir=strategies_dir)
 
 

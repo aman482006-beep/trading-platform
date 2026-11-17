@@ -598,6 +598,20 @@ def test_per_deployment_strategy_parameters_are_refused_on_real_money(
         enforce_promotion_gate(deployment, real_money=True)
 
 
+def test_per_deployment_strategy_parameters_are_refused_on_a_signal_bot_too(
+    bots_root: Path,
+) -> None:
+    # Inert for a signal bot as for a strategy: it must not look applied either.
+    deployment = strategy_deployment(
+        "ramjet",
+        signal_source="discord",
+        signal_config={"signal_processor": "ramjet"},
+        settings={"strategy_parameters": DEFAULTS},
+    )
+    with pytest.raises(StrategyNotPromotedError, match="not applied by the live runner"):
+        enforce_promotion_gate(deployment, real_money=True)
+
+
 def test_real_money_after_a_file_change_is_refused(strategies_dir: Path) -> None:
     promote_strategy_file(strategies_dir)
     path = strategies_dir / STRATEGY_NAME / f"{STRATEGY_NAME}.py"
