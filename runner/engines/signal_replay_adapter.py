@@ -130,6 +130,11 @@ class ReplaySignal:
 _FLIP_PHASE_BEFORE_TP1 = "before_tp1"
 _FLIP_PHASE_AWAIT_GREEN = "await_green"
 _FLIP_PHASE_ACTIVE = "active"
+#: Fill convention of the flip leg (the only exit that is not at a level or at
+#: the signal bar's close): decided at the flip bar's close, filled at the next
+#: bar's open. Recorded per trade so the run-level ``signal_exit_fill`` is not
+#: read as covering it.
+FLIP_EXIT_FILL = "next_bar_open"
 
 
 @dataclass(slots=True)
@@ -163,7 +168,17 @@ class _FlipState:
             "tp1_skipped_time": iso(self.tp1_skipped_time),
             "activation_time": iso(self.activation_time),
             "flip_bar_time": iso(self.flip_bar_time),
+            "flip_exit_fill": FLIP_EXIT_FILL,
         }
+
+
+def _unchecked_window(
+    frame: pd.DataFrame, position: "_OpenPosition", end_timestamp: pd.Timestamp
+) -> pd.DataFrame:
+    """Bars after the position's last checked bar, up to and including ``end_timestamp``."""
+    return frame[
+        (frame["timestamp"] > position.last_checked_at) & (frame["timestamp"] <= end_timestamp)
+    ]
 
 
 @dataclass(slots=True)
@@ -547,9 +562,7 @@ class SignalReplayAdapter:
             position.last_checked_at = end_timestamp
             return None
 
-        window = frame[
-            (frame["timestamp"] > position.last_checked_at) & (frame["timestamp"] <= end_timestamp)
-        ]
+        window = _unchecked_window(frame, position, end_timestamp)
         if window.empty:
             position.last_checked_at = end_timestamp
             return None
@@ -604,9 +617,7 @@ class SignalReplayAdapter:
     ) -> Trade | None:
         """Walk the bars up to ``end_timestamp`` through the flip workflow."""
         assert position.flip is not None
-        window = frame[
-            (frame["timestamp"] > position.last_checked_at) & (frame["timestamp"] <= end_timestamp)
-        ]
+        window = _unchecked_window(frame, position, end_timestamp)
         if window.empty:
             position.last_checked_at = end_timestamp
             return None
@@ -666,27 +677,10 @@ class SignalReplayAdapter:
         low = float(bar["low"])
         stop_price = float(position.stop_loss) if position.stop_loss is not None else None
         if flip.phase == _FLIP_PHASE_BEFORE_TP1:
-            event = resolve_same_bar_exit(
-                direction=position.direction,
-                high=high,
-                low=low,
-                stop_price=stop_price,
-                take_profit_price=flip.plan.tp1_price,
+            return self._check_flip_bar_before_tp1(
+                position, bar_time=bar_time, index=index, high=high, low=low, stop_price=stop_price
             )
-            if event == "stop":
-                return self._close_flip_at_stop(position, bar_time, index)
-            if event != "tp":
-                return None
-            trade = self._take_tp1(position, bar_time, index)
-            if trade is not None:
-                return trade
-            # The TP1 bar after the TP1 fill is dead for the workflow: its
-            # close is not read (no activation, no flip) and its range is not
-            # checked against the stop moved on it — the next bar's intrabar
-            # pass (point 2) is the first one that sees that stop. The
-            # Supertrend evaluation therefore starts on the bar after it.
-            return None
-        elif (
+        if (
             resolve_same_bar_exit(
                 direction=position.direction,
                 high=high,
@@ -709,6 +703,39 @@ class SignalReplayAdapter:
         elif flip.phase == _FLIP_PHASE_ACTIVE and not green:
             flip.exit_pending = True
             flip.flip_bar_time = bar_time
+        return None
+
+    def _check_flip_bar_before_tp1(
+        self,
+        position: _OpenPosition,
+        *,
+        bar_time: pd.Timestamp,
+        index: int,
+        high: float,
+        low: float,
+        stop_price: float | None,
+    ) -> Trade | None:
+        """Intrabar step of a flip position that has not reached TP1 yet."""
+        flip = position.flip
+        assert flip is not None
+        event = resolve_same_bar_exit(
+            direction=position.direction,
+            high=high,
+            low=low,
+            stop_price=stop_price,
+            take_profit_price=flip.plan.tp1_price,
+        )
+        if event == "stop":
+            return self._close_flip_at_stop(position, bar_time, index)
+        if event != "tp":
+            return None
+        trade = self._take_tp1(position, bar_time, index)
+        if trade is not None:
+            return trade
+        # The TP1 bar after the TP1 fill is dead for the workflow: its close is
+        # not read (no activation, no flip) and its range is not checked against
+        # the stop moved on it — the next bar's intrabar pass is the first one
+        # that sees that stop. The Supertrend evaluation starts on the bar after.
         return None
 
     def _take_tp1(
@@ -766,6 +793,8 @@ class SignalReplayAdapter:
             breakeven = float(position.entry_price)
             if position.stop_loss is None or abs(breakeven - float(position.stop_loss)) > 1e-12:
                 position.stop_loss = breakeven
+                # trailing_updates counts every stop move, so for a flip position
+                # it is the breakeven move (the only stop move the workflow makes).
                 position.trailing_updates += 1
         return None
 

@@ -488,6 +488,9 @@ def test_flip_exit_fills_at_the_open_before_the_stop_is_evaluated(monkeypatch) -
 
     assert trade.exits[-1].reason == "supertrend_flip"
     assert trade.exits[-1].price == 103.0
+    # The run-level signal_exit_fill="close" describes ordinary signal exits;
+    # the flip leg is the one that fills at the next open, and says so per trade.
+    assert trade.meta["supertrend_flip"]["flip_exit_fill"] == "next_bar_open"
 
 
 def test_breakeven_stop_before_the_flip_bar_wins(monkeypatch) -> None:
