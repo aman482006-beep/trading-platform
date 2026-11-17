@@ -942,12 +942,12 @@ export interface BacktestMetadataItem {
   strategy_name: string;
   symbols: string[];
   timeframe: string;
-  total_return: number;
+  total_return: number | null;
   sharpe_ratio: number | null;
   psr: number | null;
   p_value: number | null;
   cagr: number | null;
-  max_drawdown: number;
+  max_drawdown: number | null;
   trade_count: number;
   win_rate: number | null;
   start_date: string;
