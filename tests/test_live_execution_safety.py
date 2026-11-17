@@ -4328,28 +4328,67 @@ def test_ctrader_relative_sl_tp_snaps_to_symbol_price_grid(digits: int, grid: in
     request = adapter._build_new_order_request(signal, symbol_id=9)
     assert request.relativeStopLoss % grid == 0
     assert request.relativeTakeProfit % grid == 0
-    # Snapping moves a distance by at most half a tick.
+    # With raw distances >= one tick, snapping moves a distance by at most half a tick.
     assert abs(request.relativeStopLoss - 962_751) <= grid / 2
     assert abs(request.relativeTakeProfit - 962_749) <= grid / 2
 
 
-def test_ctrader_relative_sl_tp_never_rounds_a_distance_to_zero() -> None:
-    """A distance under half a tick is sent as one tick, not 0 (0 means 'no TP')."""
-    module, adapter = _make_ctrader_request_builder_adapter()
-    adapter._symbol_props["ETHUSD"] = module.SymbolScale(
-        volume_per_qty=1.0, price_digits=2, min_volume=1, lot_size=100.0, source="broker"
-    )
-    signal = LiveSignal(
+def _ethusd_signal(stop_loss: float, take_profit: float | None) -> LiveSignal:
+    metadata: dict = {"qty": 1.0, "stop_loss": stop_loss}
+    if take_profit is not None:
+        metadata["take_profit"] = take_profit
+    return LiveSignal(
         deployment_id="dep-1",
         symbol="ETHUSD",
         action="buy",
         theoretical_price=1925.50,
         timestamp=datetime.now(timezone.utc),
-        metadata={"qty": 1.0, "stop_loss": 1925.496, "take_profit": 1925.504},
+        metadata=metadata,
     )
-    request = adapter._build_new_order_request(signal, symbol_id=9)
-    assert request.relativeStopLoss == 1000
+
+
+def _seed_digits(module, adapter, digits: int) -> None:
+    adapter._symbol_props["ETHUSD"] = module.SymbolScale(
+        volume_per_qty=1.0, price_digits=digits, min_volume=1, lot_size=100.0, source="broker"
+    )
+
+
+def test_ctrader_sub_tick_take_profit_is_sent_as_one_tick_never_zero() -> None:
+    """A TP under one tick is sent as one tick, not 0 (0 means 'no TP'). Widening a
+    take-profit does not add risk."""
+    module, adapter = _make_ctrader_request_builder_adapter()
+    _seed_digits(module, adapter, 2)
+    request = adapter._build_new_order_request(
+        _ethusd_signal(1925.50 - 5.0, 1925.504), symbol_id=9
+    )
     assert request.relativeTakeProfit == 1000
+
+
+def test_ctrader_sub_tick_stop_loss_is_refused_not_widened() -> None:
+    """The risk engine sized qty from the requested stop distance; widening a sub-tick
+    stop to a full tick would exceed the per-trade risk, so it fails closed."""
+    module, adapter = _make_ctrader_request_builder_adapter()
+    _seed_digits(module, adapter, 2)
+    for stop in (1925.496, 1925.50 - 0.009):
+        with pytest.raises(ValueError, match="below one tick"):
+            adapter._build_new_order_request(_ethusd_signal(stop, 1925.50 + 5.0), symbol_id=9)
+    # Exactly one tick is accepted.
+    request = adapter._build_new_order_request(_ethusd_signal(1925.49, 1925.60), symbol_id=9)
+    assert request.relativeStopLoss == 1000
+
+
+@pytest.mark.parametrize("digits", [6, 8, 10])
+def test_ctrader_relative_sl_tp_handles_price_digits_above_five(digits: int) -> None:
+    """Symbols finer than the 1/100000 protocol unit keep grid 1 and int64 fields."""
+    module, adapter = _make_ctrader_request_builder_adapter()
+    _seed_digits(module, adapter, digits)
+    request = adapter._build_new_order_request(
+        _ethusd_signal(1925.50 - 9.62751, 1925.50 + 9.62749), symbol_id=9
+    )
+    assert isinstance(request.relativeStopLoss, int)
+    assert isinstance(request.relativeTakeProfit, int)
+    assert request.relativeStopLoss == 962_751
+    assert request.relativeTakeProfit == 962_749
 
 
 def test_ctrader_xau_order_volume_uses_ounce_scale() -> None:

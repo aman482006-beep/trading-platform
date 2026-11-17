@@ -169,8 +169,9 @@ class SymbolScale:
     ``volume_per_qty``: broker volume units per risk-engine qty unit.
     The qty unit is 0.01 lots, so ``volume_per_qty = lotSize / 100``
     (FX: 100000/100 = 1000, pinned by contract tests).
-    ``price_digits``: broker-reported symbol price decimals retained as symbol
-    metadata; relative SL/TP always uses the fixed protocol divisor.
+    ``price_digits``: broker-reported symbol price decimals. Relative SL/TP units
+    always use the fixed protocol divisor; ``price_digits`` only sizes the price-grid
+    the distance is snapped to (``10 ** (5 - price_digits)`` units, 1 if finer).
     ``min_volume``: broker minimum order volume (fail-closed floor).
     ``source``: "broker" (ProtoOASymbol props) or "fallback" (static table).
     ``step_volume``: broker volume increment (``stepVolume``). Exits round DOWN
@@ -2362,6 +2363,13 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         1/100000 of a price unit (123000 means 1.23), where for BUY
         stopLoss = entryPrice - relativeStopLoss and takeProfit
         = entryPrice + relativeTakeProfit (reversed for SELL).
+
+        The broker also rejects a distance finer than the symbol's price precision
+        (``Relative stop loss has invalid precision``), so each distance is snapped
+        to the symbol grid of ``10 ** (5 - price_digits)`` units (1 when the symbol
+        is finer than 5 digits). A take-profit under one tick is sent as one tick
+        (0 would mean "no TP"); a stop-loss under one tick is refused, because
+        widening it would exceed the risk the position was sized for.
         """
         reference_price = float(signal.theoretical_price)
         if not math.isfinite(reference_price) or reference_price <= 0:
@@ -2375,9 +2383,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         # precision (``Relative stop loss has invalid precision``): on a 2-digit symbol
         # (ETHUSD, XAUUSD, indices) it must be a multiple of 1000 protocol units, on a
         # 3-digit one a multiple of 100. Sent unrounded, every such order is rejected.
-        grid = 10 ** max(0, int(math.log10(scale)) - symbol_scale.price_digits)
+        grid = 10 ** max(0, round(math.log10(scale)) - symbol_scale.price_digits)
 
-        def _distance(price: float) -> int:
+        def _distance(price: float, *, is_stop: bool) -> int:
             if math.isnan(price) or math.isinf(price) or price <= 0:
                 raise ValueError(
                     f"Invalid SL/TP price for {signal.symbol}: {price!r}; "
@@ -2396,6 +2404,12 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     f"SL/TP distance for {signal.symbol} resolves to {raw!r} "
                     f"(below one 1/{scale} price unit); refusing to submit."
                 )
+            if is_stop and raw < grid * (1 - 1e-9):  # float noise at exactly one tick
+                raise ValueError(
+                    f"SL distance for {signal.symbol} is below one tick of the symbol "
+                    f"price grid ({raw!r} < {grid} protocol units); refusing to submit "
+                    "rather than widen the stop beyond the sized risk."
+                )
             # Distance is signed by direction at the protocol level; the value
             # sent is always the positive magnitude in 1/scale price units, snapped
             # to the symbol's price grid (never below one tick).
@@ -2412,7 +2426,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         if take_profit is None:
             # C1: explicit unbounded policy — stop-only order. cTrader treats
             # a zero relativeTakeProfit as "no take profit".
-            return (_distance(stop_loss), 0)
+            return (_distance(stop_loss, is_stop=True), 0)
         take_outward = take_profit - reference_price if buy else reference_price - take_profit
         if take_outward <= 0:
             raise ValueError(
@@ -2420,7 +2434,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 f"{signal.symbol} ({signal.action}): take_profit={take_profit!r}, "
                 f"reference={reference_price!r}; refusing to submit."
             )
-        return (_distance(stop_loss), _distance(take_profit))
+        return (_distance(stop_loss, is_stop=True), _distance(take_profit, is_stop=False))
 
     async def _submit_new_order_request(self, request: Any) -> Any:
         try:
