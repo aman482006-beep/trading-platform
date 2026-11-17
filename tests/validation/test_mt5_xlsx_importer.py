@@ -8,6 +8,7 @@ from typing import Any
 import pandas as pd
 import pytest
 
+from shared.broker_clock import DUKASCOPY_MT5_INDEX
 from shared.models import VALID_DIRECTIONS
 from validation.importers._pairing import group_position_fills
 from validation.importers.mt5_xlsx import MT5XLSXImporter
@@ -366,6 +367,13 @@ class TestBrokerClock:
     def test_unknown_broker_clock_is_rejected(self, importer):
         with pytest.raises(ValueError, match="Unknown broker_clock"):
             importer.load(_sp500_path(), broker_clock="europe_athens")
+
+    def test_to_iso_refuses_a_server_time_the_clock_skipped(self):
+        # 2024-04-06 02:30 server time never happened on this broker. The clock
+        # refuses it; the loader must not fall back to returning the raw string
+        # as if it were an ISO UTC instant.
+        with pytest.raises(ValueError, match="never shows the server wall time"):
+            MT5XLSXImporter._to_iso("2024.04.06 02:30:00", None, DUKASCOPY_MT5_INDEX)
 
 
 class TestDirectionRequiresTypColumn:

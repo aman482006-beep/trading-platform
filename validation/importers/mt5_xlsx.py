@@ -921,20 +921,18 @@ class MT5XLSXImporter(BaseImporter):
         for fmt in ("%Y.%m.%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
             try:
                 dt = datetime.strptime(text, fmt)
-                if broker_clock is not None:
-                    return (
-                        broker_clock.to_utc([pd.Timestamp(dt)])[0]
-                        .isoformat()
-                        .replace("+00:00", "Z")
-                    )
-                if tz:
-                    dt = dt.replace(tzinfo=tz)
-                    dt = dt.astimezone(timezone.utc)
-                else:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                return dt.isoformat().replace("+00:00", "Z")
             except ValueError:
                 continue
+            # Only the format probe is guarded. A wall time the broker clock refuses
+            # (ValueError: skipped hour) must propagate, not fall through to `return text`.
+            if broker_clock is not None:
+                return broker_clock.to_utc([pd.Timestamp(dt)])[0].isoformat().replace("+00:00", "Z")
+            if tz:
+                dt = dt.replace(tzinfo=tz)
+                dt = dt.astimezone(timezone.utc)
+            else:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.isoformat().replace("+00:00", "Z")
         # If parsing fails, return as-is (tests will catch obvious issues)
         return text
 
