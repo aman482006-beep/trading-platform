@@ -32,6 +32,13 @@ from shared.trailing import (
 )
 
 
+def _prepare_order(signal: LiveSignal):
+    """Run order preparation with an adapter that must never be touched."""
+    return asyncio.run(
+        daemon.prepare_order_with_risk(_UntouchableAdapter(), _deployment(), signal)
+    )
+
+
 def _deployment(signal_config: dict | None = None) -> LiveDeploymentConfig:
     return LiveDeploymentConfig(
         strategy_name="ramjet-live",
@@ -114,6 +121,29 @@ def test_malformed_sl_config_is_rejected(config) -> None:
     with pytest.raises(ValueError, match="trailing_sl_config"):
         validate_trailing_sl_config(
             config, supported=KNOWN_TRAILING_MODES, context="test"
+        )
+
+
+@pytest.mark.parametrize(
+    "percent",
+    [None, "abc", 0.0, 1.0, -0.02, 1.5, float("nan"), float("inf"), float("-inf")],
+)
+def test_percent_mode_requires_a_finite_percent_in_open_unit_interval(percent) -> None:
+    """Review finding: NaN passed every comparison and silently untrailed the stop."""
+    with pytest.raises(ValueError, match="percent"):
+        validate_trailing_sl_config(
+            {"mode": "percent", "percent": percent},
+            supported=REPLAY_SUPPORTED_TRAILING_MODES,
+            context="test",
+        )
+
+
+def test_percent_mode_without_percent_key_is_rejected() -> None:
+    with pytest.raises(ValueError, match="percent"):
+        validate_trailing_sl_config(
+            {"mode": "percent"},
+            supported=REPLAY_SUPPORTED_TRAILING_MODES,
+            context="test",
         )
 
 
@@ -260,6 +290,16 @@ def test_live_deployment_accepts_mode_none_and_no_override() -> None:
     assert _deployment().signal_config == {}
 
 
+def test_override_check_passes_a_processor_config_without_trailing_mode() -> None:
+    """A deployment that sets other processor keys inherits the processor default."""
+    assert (
+        validate_live_deployment_trailing_override(
+            {"signal_processor_config": {"atr_period": 14}}, context="test"
+        )
+        is None
+    )
+
+
 def test_deployment_override_check_ignores_unrelated_shapes() -> None:
     validate_live_deployment_trailing_override(None, context="test")
     validate_live_deployment_trailing_override({"signal_processor_config": "x"}, context="test")
@@ -386,9 +426,7 @@ def _live_signal(metadata: dict) -> LiveSignal:
 def test_order_preparation_refuses_trailing_before_touching_the_broker(trailing_cfg) -> None:
     signal = _live_signal({"trailing_sl_config": trailing_cfg, "stop_loss": 95.0})
     with pytest.raises(ValueError, match="not supported"):
-        asyncio.run(
-            daemon.prepare_order_with_risk(_UntouchableAdapter(), _deployment(), signal)
-        )
+        _prepare_order(signal)
 
 
 def test_order_preparation_lets_mode_none_through_to_sizing(monkeypatch) -> None:
@@ -401,9 +439,7 @@ def test_order_preparation_lets_mode_none_through_to_sizing(monkeypatch) -> None
     monkeypatch.setattr(daemon, "_broker_exposure_estimate", _exposure)
     signal = _live_signal({"trailing_sl_config": {"mode": "none"}, "stop_loss": 95.0})
     with pytest.raises(RuntimeError, match="stop after the gate"):
-        asyncio.run(
-            daemon.prepare_order_with_risk(_UntouchableAdapter(), _deployment(), signal)
-        )
+        _prepare_order(signal)
     assert reached.sizing
 
 
@@ -423,8 +459,9 @@ def test_order_preparation_refuses_trailing_the_adapter_cannot_execute(
 
     monkeypatch.setattr(daemon, "_broker_exposure_estimate", _exposure)
     signal = _live_signal({"trailing_sl_config": trailing_cfg, "stop_loss": 95.0})
+    deployment = _deployment()
     with pytest.raises(ValueError, match="not supported"):
-        asyncio.run(daemon.prepare_order_with_risk(adapter, _deployment(), signal))
+        asyncio.run(daemon.prepare_order_with_risk(adapter, deployment, signal))
 
 
 def test_order_preparation_lets_percent_through_on_a_trailing_adapter(monkeypatch) -> None:
@@ -438,9 +475,181 @@ def test_order_preparation_lets_percent_through_on_a_trailing_adapter(monkeypatc
     signal = _live_signal(
         {"trailing_sl_config": {"mode": "percent", "percent": 0.02}, "stop_loss": 95.0}
     )
+    deployment = _deployment()
     with pytest.raises(RuntimeError, match="stop after the gate"):
-        asyncio.run(daemon.prepare_order_with_risk(_ALPACA_LIKE, _deployment(), signal))
+        asyncio.run(daemon.prepare_order_with_risk(_ALPACA_LIKE, deployment, signal))
     assert reached.sizing
+
+# ── stored rows: a bad row must not break listing ────────────────────────────
+
+
+STORED_ID = "6f1f0c52-2f0e-4e0e-9a55-3f6f2c3a1b7d"
+
+
+def _stored_row(signal_config: dict):
+    from shared.database import LiveDeploymentModel
+
+    return LiveDeploymentModel(
+        id=STORED_ID,
+        strategy_name="ramjet-live",
+        account_id="acct-1",
+        symbols_json=["AAPL"],
+        timeframe="5m",
+        status="ACTIVE",
+        signal_config_json=signal_config,
+    )
+
+
+def test_stored_row_with_unsupported_trailing_mode_still_loads() -> None:
+    """Review finding: a poisoned stored row must not make the whole list raise.
+
+    The write-path validator still rejects the same config (see above); only the
+    read path skips it, and the daemon refuses such signals at signal time.
+    """
+    loaded = _stored_row(
+        {"signal_processor_config": {"trailing_mode": "supertrend_flip"}}
+    ).to_live_deployment()
+    assert str(loaded.id) == STORED_ID
+    assert loaded.signal_config["signal_processor_config"]["trailing_mode"] == "supertrend_flip"
+
+
+def test_stored_row_load_logs_an_error_for_unsupported_trailing_mode(monkeypatch) -> None:
+    import live_runner.daemon as daemon_module
+
+    deployment = _stored_row(
+        {"signal_processor_config": {"trailing_mode": "supertrend_flip"}}
+    ).to_live_deployment()
+    errors: list[tuple] = []
+    monkeypatch.setattr(
+        daemon_module,
+        "logger",
+        SimpleNamespace(error=lambda msg, *args, **kwargs: errors.append((msg, args, kwargs))),
+    )
+    monkeypatch.setattr(daemon_module, "list_live_accounts", lambda: [])
+    monkeypatch.setattr(daemon_module, "list_live_deployments", lambda: [deployment])
+
+    _accounts, loaded = asyncio.run(daemon_module._load_db_accounts_and_deployments())
+
+    assert [str(d.id) for d in loaded] == [STORED_ID]
+    assert len(errors) == 1
+    msg, args, kwargs = errors[0]
+    assert "unsupported trailing mode" in msg
+    assert "supertrend_flip" in str(args)
+    assert kwargs["extra"]["data"]["deployment_id"] == STORED_ID
+
+
+# ── trailing needs a trailable timeframe (#150: never trade untrailed) ───────
+
+_UNTRAILABLE = ["1d", "4h", "1w"]
+
+
+@pytest.mark.parametrize("timeframe", _UNTRAILABLE)
+def test_broker_aware_override_check_rejects_percent_on_an_untrailable_timeframe(
+    timeframe: str,
+) -> None:
+    with pytest.raises(ValueError, match="cannot be executed live on timeframe"):
+        validate_live_deployment_trailing_override(
+            _PERCENT, context="test", broker="alpaca", timeframe=timeframe
+        )
+    validate_live_deployment_trailing_override(
+        _PERCENT, context="test", broker="alpaca", timeframe="1h"
+    )
+    validate_live_deployment_trailing_override(
+        {"signal_processor_config": {"trailing_mode": "none"}},
+        context="test",
+        broker="alpaca",
+        timeframe=timeframe,
+    )
+
+
+@pytest.mark.parametrize("timeframe", _UNTRAILABLE)
+def test_creating_a_percent_deployment_on_an_untrailable_timeframe_is_refused(
+    isolated_db, timeframe: str
+) -> None:
+    database, _engine, _data_dir = isolated_db
+    database.ensure_live_account("acct-alpaca", "alpaca")
+    refused = LiveDeploymentConfig(
+        strategy_name="ramjet-live",
+        account_id="acct-alpaca",
+        symbols=["AAPL"],
+        timeframe=timeframe,
+        signal_config=_PERCENT,
+    )
+    with pytest.raises(ValueError, match="cannot be executed live on timeframe"):
+        database.create_live_deployment(refused)
+    assert database.get_live_deployment(str(refused.id)) is None
+
+
+@pytest.mark.parametrize("timeframe", _UNTRAILABLE)
+def test_yaml_percent_deployment_on_an_untrailable_timeframe_is_refused(
+    tmp_path, timeframe: str
+) -> None:
+    from live_runner.config_parser import parse_live_deployments_config
+
+    config = tmp_path / "live.yaml"
+    config.write_text(
+        f"""
+accounts:
+  - id: alp
+    broker: alpaca
+deployments:
+  - strategy_name: ramjet-live
+    account_id: alp
+    symbols: [AAPL]
+    timeframe: {timeframe}
+    signal_config:
+      signal_processor_config:
+        trailing_mode: percent
+""",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="cannot be executed live on timeframe"):
+        parse_live_deployments_config(config)
+
+
+_ALPACA_SERVING = SimpleNamespace(
+    broker_name="alpaca",
+    supports_stop_amendment=True,
+    supports_market_data_timeframe=lambda timeframe: timeframe
+    in {"1m", "5m", "15m", "30m", "1h", "1d"},
+)
+
+
+@pytest.mark.parametrize("timeframe", _UNTRAILABLE)
+def test_processor_gate_refuses_a_percent_entry_on_an_untrailable_timeframe(
+    monkeypatch, timeframe: str
+) -> None:
+    monkeypatch.setattr(
+        daemon,
+        "get_signal_processor",
+        lambda name, config: _Processor({"mode": "percent", "percent": 0.02}),
+    )
+    monkeypatch.setattr(daemon, "_build_processor_market_data", lambda signal, timeframe: None)
+    signal = TradeSignal(
+        action="buy", symbol="AAPL", entry_price=100.0, stop_loss=None,
+        take_profit=None, timeframe=timeframe, metadata={},
+    )
+    deployment = _deployment({"signal_processor": "ramjet"})
+    deployment.timeframe = timeframe
+    with pytest.raises(ValueError, match="cannot be executed live on timeframe"):
+        daemon._apply_signal_processor(signal, deployment, adapter=_ALPACA_SERVING)
+
+
+@pytest.mark.parametrize("timeframe", _UNTRAILABLE)
+def test_order_preparation_refuses_a_percent_entry_on_an_untrailable_timeframe(
+    monkeypatch, timeframe: str
+) -> None:
+    async def _exposure(adapter, deployment):
+        raise AssertionError("sizing was reached past the trailing gate")
+
+    monkeypatch.setattr(daemon, "_broker_exposure_estimate", _exposure)
+    signal = _live_signal(
+        {"trailing_sl_config": {"mode": "percent", "percent": 0.02}, "stop_loss": 95.0}
+    )
+    deployment = _deployment()
+    deployment.timeframe = timeframe
+    with pytest.raises(ValueError, match="cannot be executed live on timeframe"):
+        asyncio.run(daemon.prepare_order_with_risk(_ALPACA_SERVING, deployment, signal))
 
 
 # ── #168: a complete supertrend_flip config is still refused live ────────────

@@ -41,7 +41,7 @@ import asyncio
 import contextlib
 import math
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -58,6 +58,8 @@ from shared.trailing import (
     TRAILING_MODE_NONE,
     TRAILING_SL_CONFIG_METADATA_KEY,
     live_supported_trailing_modes,
+    live_trailing_timeframes,
+    validate_live_trailing_timeframe,
     validate_trailing_sl_config,
 )
 
@@ -73,6 +75,22 @@ TRAILING_BAR_LOOKBACK = 50
 #: Retry backoff after a failed pass or a bar that is not published yet.
 TRAILING_RETRY_INITIAL_SECONDS = 15.0
 TRAILING_RETRY_MAX_SECONDS = 300.0
+#: A failure that keeps repeating for one position (a pyramided bracket, a
+#: malformed stored config, an unusable bar, a long data outage) is not
+#: transient. Once failures have lasted this long WITHOUT a single success
+#: (measured from the first of the consecutive failures, so the pass rate of a
+#: fast timeframe does not shorten it) the position is given up on: one CRITICAL
+#: alert and no more retries or alerts. The broker-side stop stays in force.
+TRAILING_GIVE_UP_AFTER_SECONDS = 40 * 60
+#: A given-up position is still probed this often (no alert): the first pass
+#: that succeeds resumes trailing and logs INFO. Failures that no retry can fix
+#: (an unservable timeframe, a missing capability) are not probed.
+TRAILING_GIVEN_UP_PROBE_SECONDS = 15 * 60
+#: How long after a bar boundary a not-yet-published bar is treated as "late"
+#: and retried with backoff (capped at one bar). Beyond it the feed is closed
+#: (night, weekend, holiday), not late: the pass waits for the next boundary
+#: instead of hammering the broker every few minutes.
+TRAILING_BAR_GRACE_SECONDS = 900
 
 EntrySignalLoader = Callable[[list[str], list[str]], dict[str, dict[str, Any]]]
 
@@ -95,13 +113,68 @@ def adapter_live_trailing_modes(adapter: Any) -> frozenset[str]:
     return live_supported_trailing_modes(broker, supports_stop_amendment=can_amend)
 
 
+def adapter_live_trailing_timeframes(adapter: Any) -> frozenset[str]:
+    """Signal timeframes the live path can trail on through this adapter instance.
+
+    The per-broker table in ``shared.trailing`` AND the adapter's own market-data
+    capability must both allow a timeframe; anything unknown resolves to none.
+    """
+    if adapter is None:
+        return frozenset()
+    try:
+        timeframes = live_trailing_timeframes(getattr(adapter, "broker_name", ""))
+        serves = getattr(adapter, "supports_market_data_timeframe", None)
+        if callable(serves):
+            timeframes = frozenset(item for item in timeframes if serves(item))
+    except Exception:
+        return frozenset()
+    return timeframes
+
+
+def validate_adapter_trailing_timeframe(
+    trailing_cfg: Any, timeframe: Any, *, adapter: Any, context: str
+) -> None:
+    """#150: refuse an entry whose trailing cannot run on its timeframe (never trade untrailed)."""
+    if not isinstance(trailing_cfg, Mapping):
+        return
+    validate_live_trailing_timeframe(
+        trailing_cfg.get("mode"),
+        timeframe,
+        supported_timeframes=adapter_live_trailing_timeframes(adapter),
+        context=context,
+    )
+
+
+@dataclass
+class _Outage:
+    """A run of consecutive failures and whether it has been given up on."""
+
+    failures: int = 0
+    first_failure_at: datetime | None = None
+    #: Given up on (see ``TRAILING_GIVE_UP_AFTER_SECONDS``); probed, not retried.
+    given_up: bool = False
+    #: No retry can fix it: never probed.
+    permanent: bool = False
+    next_probe_at: datetime | None = None
+
+    def probe_blocked(self, moment: datetime) -> bool:
+        if not self.given_up:
+            return False
+        return self.permanent or self.next_probe_at is None or moment < self.next_probe_at
+
+
 @dataclass
 class _Trail:
     """In-memory progress of one trailed position. Safe to lose."""
 
     signal_id: str
     last_bar_time: datetime | None = None
-    consecutive_failures: int = 0
+    outage: _Outage = field(default_factory=_Outage)
+    stop_qty_warned: bool = False
+
+    @property
+    def consecutive_failures(self) -> int:
+        return self.outage.failures
 
 
 @dataclass
@@ -109,10 +182,20 @@ class _AccountSchedule:
     last_slot: int | None = None
     retry_at: datetime | None = None
     retry_delay: float = TRAILING_RETRY_INITIAL_SECONDS
+    #: Failures of the account-wide stop listing, counted once per account.
+    stops_outage: _Outage = field(default_factory=_Outage)
 
 
 class _TrailingFailure(Exception):
-    """A pass over one position could not complete; it is surfaced and retried."""
+    """A pass over one position could not complete; it is surfaced and retried.
+
+    ``permanent`` marks a failure no retry can fix (a configuration the adapter
+    can never serve): the position is given up on at once.
+    """
+
+    def __init__(self, message: str, *, permanent: bool = False) -> None:
+        super().__init__(message)
+        self.permanent = permanent
 
 
 def _normalize_symbol(value: object) -> str:
@@ -138,6 +221,12 @@ def _position_qty(position: Mapping[str, Any]) -> float:
     if not math.isfinite(qty):
         raise _TrailingFailure(f"broker position qty is not finite ({qty!r})")
     return qty
+
+
+_RETRY_MESSAGE = (
+    "Live trailing stop could not be updated; the previous broker-side stop stays in "
+    "force and the update is retried"
+)
 
 
 class LiveTrailingStopManager:
@@ -211,14 +300,16 @@ class LiveTrailingStopManager:
                     {"account_id": account_id, "adapter": type(adapter).__name__},
                 )
                 needs_retry = True
-            if needs_retry:
-                schedule.retry_at = moment + timedelta(seconds=schedule.retry_delay)
-                schedule.retry_delay = min(
-                    schedule.retry_delay * 2.0, TRAILING_RETRY_MAX_SECONDS
-                )
-            else:
-                schedule.retry_at = None
-                schedule.retry_delay = TRAILING_RETRY_INITIAL_SECONDS
+            self._schedule_retry(schedule, needs_retry, moment)
+
+    @staticmethod
+    def _schedule_retry(schedule: _AccountSchedule, needs_retry: bool, moment: datetime) -> None:
+        if needs_retry:
+            schedule.retry_at = moment + timedelta(seconds=schedule.retry_delay)
+            schedule.retry_delay = min(schedule.retry_delay * 2.0, TRAILING_RETRY_MAX_SECONDS)
+        else:
+            schedule.retry_at = None
+            schedule.retry_delay = TRAILING_RETRY_INITIAL_SECONDS
 
     @staticmethod
     def _is_due(
@@ -256,16 +347,7 @@ class LiveTrailingStopManager:
         deployments: list[LiveDeploymentConfig],
         moment: datetime,
     ) -> bool:
-        get_positions = getattr(adapter, "get_positions", None)
-        if not callable(get_positions):
-            raise _TrailingFailure(
-                f"{type(adapter).__name__} cannot report positions to trail"
-            )
-        positions: dict[str, Mapping[str, Any]] = {}
-        for row in await get_positions():
-            symbol = _normalize_symbol(row.get("symbol"))
-            if symbol:
-                positions[symbol] = row
+        positions = await self._read_positions(adapter)
 
         # Cleanup: a position that is gone (stop/TP hit, exit signal, manual
         # close) has nothing left to trail.
@@ -281,9 +363,12 @@ class LiveTrailingStopManager:
 
         needs_retry = False
         stops: list[ProtectiveStop] | None = None
+        stops_unavailable = False
         for symbol, position in positions.items():
             key = (account_id, symbol)
             entry = entry_signals.get(symbol)
+            if self._is_given_up(key, entry, moment):
+                continue
             context = {
                 "account_id": account_id,
                 "symbol": symbol,
@@ -293,12 +378,19 @@ class LiveTrailingStopManager:
             }
             try:
                 trailing_cfg = self._trailing_config(adapter, entry, position, context)
-                if trailing_cfg is None:
+                if trailing_cfg is None or entry is None:
                     self._trails.pop(key, None)
                     continue
-                assert entry is not None
+                if stops is None and not stops_unavailable:
+                    # One account-wide read shared by every position: a failure
+                    # is one failure of the account, not one per position.
+                    stops, wants_retry = await self._read_stops(
+                        account_id, adapter, moment, context
+                    )
+                    stops_unavailable = stops is None
+                    needs_retry |= wants_retry
                 if stops is None:
-                    stops = list(await adapter.list_protective_stops())
+                    continue
                 needs_retry |= await self._trail_position(
                     key=key,
                     adapter=adapter,
@@ -313,18 +405,141 @@ class LiveTrailingStopManager:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                trail = self._trails.get(key)
-                if trail is not None:
-                    trail.consecutive_failures += 1
-                    context["consecutive_failures"] = trail.consecutive_failures
-                self._surface(
-                    "Live trailing stop could not be updated; the previous "
-                    "broker-side stop stays in force and the update is retried",
-                    exc,
-                    context,
-                )
-                needs_retry = True
+                needs_retry |= self._record_failure(key, entry, exc, context, moment)
         return needs_retry
+
+    @staticmethod
+    async def _read_positions(adapter: BaseLiveAdapter) -> dict[str, Mapping[str, Any]]:
+        get_positions = getattr(adapter, "get_positions", None)
+        if not callable(get_positions):
+            raise _TrailingFailure(
+                f"{type(adapter).__name__} cannot report positions to trail"
+            )
+        positions: dict[str, Mapping[str, Any]] = {}
+        for row in await get_positions():
+            symbol = _normalize_symbol(row.get("symbol"))
+            if symbol:
+                positions[symbol] = row
+        return positions
+
+    def _is_given_up(
+        self, key: tuple[str, str], entry: Mapping[str, Any] | None, moment: datetime
+    ) -> bool:
+        """Whether this pass leaves a given-up position alone (no probe due)."""
+        trail = self._trails.get(key)
+        return (
+            trail is not None
+            and entry is not None
+            and trail.signal_id == str(entry["signal_id"])
+            and trail.outage.probe_blocked(moment)
+        )
+
+    async def _read_stops(
+        self,
+        account_id: str,
+        adapter: BaseLiveAdapter,
+        moment: datetime,
+        context: Mapping[str, Any],
+    ) -> tuple[list[ProtectiveStop] | None, bool]:
+        """The account's protective stops, or ``None`` when unavailable this pass."""
+        outage = self._schedules[account_id].stops_outage
+        if outage.probe_blocked(moment):
+            return None, False
+        account_context = {
+            "account_id": account_id,
+            "adapter": type(adapter).__name__,
+            "scope": "account protective-stop listing",
+        }
+        try:
+            stops = list(await adapter.list_protective_stops())
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return None, self._record_outage(outage, exc, account_context, moment)
+        self._resume(outage, account_context)
+        return stops, False
+
+    @staticmethod
+    def _resume(outage: _Outage, context: Mapping[str, Any]) -> None:
+        """A pass succeeded: end the failure run; say so if it had been given up on."""
+        if outage.given_up:
+            logger.info(
+                "Live trailing stop resumed after a given-up failure recovered",
+                extra={"data": dict(context)},
+            )
+        outage.failures = 0
+        outage.first_failure_at = None
+        outage.given_up = False
+        outage.permanent = False
+        outage.next_probe_at = None
+
+    def _record_outage(
+        self,
+        outage: _Outage,
+        exc: BaseException,
+        context: dict[str, Any],
+        moment: datetime,
+        *,
+        permanent: bool = False,
+    ) -> bool:
+        """Count one failed pass; returns whether an early retry is wanted.
+
+        Give-up is based on the time since the first of the consecutive failures,
+        never on the number of passes: a 1m deployment visits every minute and
+        would otherwise give up in a fraction of the outage the limit is meant to
+        ride out. A given-up outage is probed at a low rate and stays quiet.
+        """
+        if outage.given_up:
+            outage.next_probe_at = moment + timedelta(seconds=TRAILING_GIVEN_UP_PROBE_SECONDS)
+            logger.warning(
+                "Live trailing stop probe still failing; staying given up",
+                extra={"data": {**context, "error": repr(exc)}},
+            )
+            return False
+        if outage.first_failure_at is None:
+            outage.first_failure_at = moment
+        outage.failures += 1
+        context["consecutive_failures"] = outage.failures
+        elapsed = (moment - outage.first_failure_at).total_seconds()
+        if permanent or elapsed >= TRAILING_GIVE_UP_AFTER_SECONDS:
+            outage.given_up = True
+            outage.permanent = permanent
+            outage.next_probe_at = moment + timedelta(seconds=TRAILING_GIVEN_UP_PROBE_SECONDS)
+            self._surface(
+                "Live trailing stop given up on for this position; the broker-side stop "
+                "stays at its last level and is no longer amended"
+                + (
+                    " or retried until the position or its entry signal changes"
+                    if permanent
+                    else f" until a probe (every {TRAILING_GIVEN_UP_PROBE_SECONDS // 60} min) "
+                    "succeeds or the position or its entry signal changes"
+                ),
+                exc,
+                context,
+                critical=True,
+            )
+            return False
+        self._surface(_RETRY_MESSAGE, exc, context)
+        return True
+
+    def _record_failure(
+        self,
+        key: tuple[str, str],
+        entry: Mapping[str, Any] | None,
+        exc: BaseException,
+        context: dict[str, Any],
+        moment: datetime,
+    ) -> bool:
+        """Surface one failed pass; returns whether an early retry is wanted."""
+        trail = self._trails.get(key)
+        if entry is not None and (trail is None or trail.signal_id != str(entry["signal_id"])):
+            trail = _Trail(signal_id=str(entry["signal_id"]))
+            self._trails[key] = trail
+        if trail is None:
+            self._surface(_RETRY_MESSAGE, exc, context)
+            return True
+        permanent = isinstance(exc, _TrailingFailure) and exc.permanent
+        return self._record_outage(trail.outage, exc, context, moment, permanent=permanent)
 
     def _trailing_config(
         self,
@@ -355,8 +570,13 @@ class LiveTrailingStopManager:
         qty = _position_qty(position)
         if math.isclose(qty, 0.0, rel_tol=0.0, abs_tol=1e-12):
             return None
-        entry_is_long = entry.get("action") == "buy"
-        if entry_is_long != (qty > 0):
+        action = entry.get("action")
+        if action not in ("buy", "sell"):
+            raise _TrailingFailure(
+                f"entry signal action {action!r} is neither 'buy' nor 'sell'; "
+                "cannot tell which side to trail"
+            )
+        if (action == "buy") != (qty > 0):
             return None
         return dict(trailing_cfg)
 
@@ -387,74 +607,43 @@ class LiveTrailingStopManager:
         bar_seconds = _timeframe_seconds(timeframe)
         if not bar_seconds:
             raise _TrailingFailure(
-                f"deployment timeframe {timeframe!r} has no bar length to trail on"
+                f"deployment timeframe {timeframe!r} has no bar length to trail on",
+                permanent=True,
             )
-        bar_length = timedelta(seconds=bar_seconds)
 
         action = "buy" if entry.get("action") == "buy" else "sell"
         reducing_side = "sell" if action == "buy" else "buy"
-        symbol_stops = [
-            stop for stop in stops if stop.symbol == symbol and stop.side == reducing_side
-        ]
-        if len(symbol_stops) != 1:
-            raise _TrailingFailure(
-                f"expected exactly one amendable protective stop for {symbol}, "
-                f"found {len(symbol_stops)}; not amending any of them"
-            )
-        current = symbol_stops[0]
+        current = self._single_stop(stops, symbol, reducing_side)
         context["stop_order_id"] = current.order_id
         context["current_stop"] = current.stop_price
+        self._warn_on_stop_quantity(trail, current, position, context)
 
-        get_market_data = getattr(adapter, "get_market_data", None)
-        if not callable(get_market_data):
-            raise _TrailingFailure(
-                f"{type(adapter).__name__} provides no market data to trail on"
-            )
+        get_market_data = self._market_data_source(adapter, timeframe)
         frame = await get_market_data(symbol, timeframe=timeframe, limit=TRAILING_BAR_LOOKBACK)
         bars = self._new_closed_bars(
             frame,
-            bar_length=bar_length,
+            bar_length=timedelta(seconds=bar_seconds),
             moment=moment,
             entered_at=entry["timestamp"],
             after=trail.last_bar_time,
         )
-        # The bar that closed at the last boundary. If it is not published yet
-        # (feed delay, market closed) the pass is retried with backoff instead
-        # of waiting a whole bar.
-        expected_open = datetime.fromtimestamp(
-            (moment.timestamp() // bar_seconds) * bar_seconds, tz=timezone.utc
-        ) - bar_length
         newest_seen = bars[-1][0] if bars else trail.last_bar_time
-        awaiting_bar = newest_seen is None or newest_seen < expected_open
+        awaiting_bar = self._is_awaiting_bar(newest_seen, moment, bar_seconds)
         if not bars:
+            # The data was served: a failure run (and a give-up) is over.
+            self._resume(trail.outage, context)
             return awaiting_bar
 
-        # Same arithmetic as the replay adapter: one engine call per bar
-        # close, starting from the stop the broker currently holds.
-        # The percent arithmetic does not read the entry price; the model only
-        # requires a positive one, so a broker row without it falls back to
-        # the first bar close rather than blocking the trail.
-        try:
-            entry_price = float(position.get("entry_price") or 0.0)
-        except (TypeError, ValueError):
-            entry_price = 0.0
-        if not math.isfinite(entry_price) or entry_price <= 0:
-            entry_price = bars[0][1]
-        signal = TradeSignal(
+        target = self._trail_target(
+            adapter=adapter,
             action=action,
             symbol=symbol,
-            entry_price=entry_price,
-            stop_loss=current.stop_price,
-            take_profit=None,
             timeframe=timeframe,
-            metadata={TRAILING_SL_CONFIG_METADATA_KEY: dict(trailing_cfg)},
+            trailing_cfg=trailing_cfg,
+            position=position,
+            current=current,
+            bars=bars,
         )
-        for _bar_time, close in bars:
-            self._risk_engine.apply_trailing_stop(signal, market_price=close)
-        target = signal.stop_loss
-        if target is None:
-            raise _TrailingFailure("trailing produced no stop")
-        target = adapter.round_stop_price(current, float(target))
         improves = (
             target > current.stop_price if reducing_side == "sell" else target < current.stop_price
         )
@@ -476,8 +665,126 @@ class LiveTrailingStopManager:
         # needed): a failed amendment leaves these bars unprocessed, so the
         # retry recomputes the same target.
         trail.last_bar_time = bars[-1][0]
-        trail.consecutive_failures = 0
+        self._resume(trail.outage, context)
         return awaiting_bar
+
+    @staticmethod
+    def _market_data_source(adapter: BaseLiveAdapter, timeframe: str) -> Callable[..., Any]:
+        get_market_data = getattr(adapter, "get_market_data", None)
+        if not callable(get_market_data):
+            raise _TrailingFailure(
+                f"{type(adapter).__name__} provides no market data to trail on",
+                permanent=True,
+            )
+        serves = getattr(adapter, "supports_market_data_timeframe", None)
+        if (callable(serves) and not serves(timeframe)) or str(
+            timeframe
+        ).strip().lower() not in adapter_live_trailing_timeframes(adapter):
+            # No retry can make the broker serve this timeframe.
+            raise _TrailingFailure(
+                f"{type(adapter).__name__} cannot serve {timeframe!r} market data, so a "
+                "percent trail on this timeframe can never run",
+                permanent=True,
+            )
+        return get_market_data
+
+    @staticmethod
+    def _is_awaiting_bar(
+        newest_seen: datetime | None, moment: datetime, bar_seconds: int
+    ) -> bool:
+        """Whether the bar that closed at the last boundary is missing but may still arrive.
+
+        If it is not published yet the pass is retried with backoff instead of waiting a
+        whole bar, but only while that is plausibly feed delay: past the grace window the
+        market is closed, and the next boundary visit tries again.
+        """
+        last_close = datetime.fromtimestamp(
+            (moment.timestamp() // bar_seconds) * bar_seconds, tz=timezone.utc
+        )
+        expected_open = last_close - timedelta(seconds=bar_seconds)
+        within_grace = (moment - last_close).total_seconds() < min(
+            bar_seconds, TRAILING_BAR_GRACE_SECONDS
+        )
+        return (newest_seen is None or newest_seen < expected_open) and within_grace
+
+    def _trail_target(
+        self,
+        *,
+        adapter: BaseLiveAdapter,
+        action: str,
+        symbol: str,
+        timeframe: str,
+        trailing_cfg: dict[str, Any],
+        position: Mapping[str, Any],
+        current: ProtectiveStop,
+        bars: list[tuple[datetime, float]],
+    ) -> float:
+        """The broker-tick-rounded stop after one engine call per new bar close.
+
+        Same arithmetic as the replay adapter, starting from the stop the broker holds.
+        The percent arithmetic does not read the entry price; the model only requires a
+        positive one, so a broker row without it falls back to the first bar close rather
+        than blocking the trail.
+        """
+        try:
+            entry_price = float(position.get("entry_price") or 0.0)
+        except (TypeError, ValueError):
+            entry_price = 0.0
+        if not math.isfinite(entry_price) or entry_price <= 0:
+            entry_price = bars[0][1]
+        signal = TradeSignal(
+            action=action,
+            symbol=symbol,
+            entry_price=entry_price,
+            stop_loss=current.stop_price,
+            take_profit=None,
+            timeframe=timeframe,
+            metadata={TRAILING_SL_CONFIG_METADATA_KEY: dict(trailing_cfg)},
+        )
+        for _bar_time, close in bars:
+            self._risk_engine.apply_trailing_stop(signal, market_price=close)
+        if signal.stop_loss is None:
+            raise _TrailingFailure("trailing produced no stop")
+        return adapter.round_stop_price(current, float(signal.stop_loss))
+
+    @staticmethod
+    def _single_stop(
+        stops: list[ProtectiveStop], symbol: str, reducing_side: str
+    ) -> ProtectiveStop:
+        symbol_stops = [
+            stop for stop in stops if stop.symbol == symbol and stop.side == reducing_side
+        ]
+        if len(symbol_stops) != 1:
+            raise _TrailingFailure(
+                f"expected exactly one amendable protective stop for {symbol}, "
+                f"found {len(symbol_stops)}; not amending any of them"
+            )
+        return symbol_stops[0]
+
+    @staticmethod
+    def _warn_on_stop_quantity(
+        trail: _Trail,
+        stop: ProtectiveStop,
+        position: Mapping[str, Any],
+        context: Mapping[str, Any],
+    ) -> None:
+        """Warn once when the stop covers more than the position still holds.
+
+        An amendment moves the price only; the stop's quantity is never changed. After a
+        partial exit a bracket stop leg can still be sized to the original entry. What the
+        broker does when it triggers (cap, oversell, reject) is not verified, so this is
+        reported, not corrected.
+        """
+        if trail.stop_qty_warned or stop.qty is None:
+            return
+        held = abs(_position_qty(position))
+        if stop.qty > held + 1e-9:
+            trail.stop_qty_warned = True
+            logger.warning(
+                "Protective stop quantity exceeds the open position; trailing moves the "
+                "stop price only and does not resize it",
+                extra={"data": {**context, "stop_qty": stop.qty, "position_qty": held}},
+            )
 
     @staticmethod
     def _new_closed_bars(
@@ -523,8 +830,14 @@ class LiveTrailingStopManager:
     # ── failure surfacing ────────────────────────────────────────────────
 
     @staticmethod
-    def _surface(message: str, exc: BaseException, context: Mapping[str, Any]) -> None:
-        logger.error(
+    def _surface(
+        message: str,
+        exc: BaseException,
+        context: Mapping[str, Any],
+        *,
+        critical: bool = False,
+    ) -> None:
+        (logger.critical if critical else logger.error)(
             message,
             extra={"data": {**context, "error": repr(exc)}},
         )

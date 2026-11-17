@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from live_runner.base_adapter import BaseLiveAdapter
+from live_runner.base_adapter import BaseLiveAdapter, LiveQuote
 from live_runner.daemon import submit_order_with_risk
 from risk.config import RiskConfig
 from risk.engine import RiskEngine
@@ -512,6 +512,19 @@ class _DummyAdapter(BaseLiveAdapter):
     async def get_balance(self) -> tuple[float, float]:
         return 100_000.0, 100_000.0
 
+    async def get_pip_value(self, symbol):
+        # #146: a USD-quoted share in a USD account moves 1.0 per 1.0.
+        from live_runner.base_adapter import LivePipValue
+
+        return LivePipValue(
+            value=1.0, units_per_qty=1.0, conversion_rate=1.0,
+            quote_asset="USD", account_asset="USD", source="test",
+        )
+
+    async def get_quote(self, symbol: str) -> LiveQuote:
+        # #125 entry-deviation gate: a quote at the signal entry passes.
+        return LiveQuote(bid=100.0, ask=100.0, timestamp=datetime.now(timezone.utc), source="test")
+
 
 def test_submit_order_with_risk_applies_qty_before_submit():
     adapter = _DummyAdapter()
@@ -585,14 +598,16 @@ class TestIssueC1FallbackGuards:
         """
         signal = self._signal(trailing_sl_config={"mode": "supertrend_flip"})
         signal.stop_loss = 98.0
+        engine = self._engine()
         with pytest.raises(ValueError, match="supertrend_flip"):
-            self._engine().apply_trailing_stop(signal, market_price=101.0)
+            engine.apply_trailing_stop(signal, market_price=101.0)
 
     def test_unknown_trailing_mode_rejected(self) -> None:
         signal = self._signal(trailing_sl_config={"mode": "martingale_trail"})
         signal.stop_loss = 98.0
+        engine = self._engine()
         with pytest.raises(ValueError, match="Unknown trailing stop mode"):
-            self._engine().apply_trailing_stop(signal, market_price=101.0)
+            engine.apply_trailing_stop(signal, market_price=101.0)
 
     def test_none_trailing_mode_keeps_initial_stop(self) -> None:
         """#150: mode 'none' means initial stop only — no trailing, no error."""
@@ -601,6 +616,27 @@ class TestIssueC1FallbackGuards:
         result = self._engine().apply_trailing_stop(signal, market_price=101.0)
         assert result == pytest.approx(98.0)
         assert signal.stop_loss == pytest.approx(98.0)
+
+    @pytest.mark.parametrize("percent", [float("nan"), float("inf"), 0.0, 1.0, None])
+    def test_percent_trailing_mode_rejects_non_finite_or_out_of_range_percent(
+        self, percent
+    ) -> None:
+        """A NaN percent passed the old range check and left the stop untrailed."""
+        signal = self._signal(trailing_sl_config={"mode": "percent", "percent": percent})
+        signal.stop_loss = 98.0
+        engine = self._engine()
+        with pytest.raises(ValueError, match="percent"):
+            engine.apply_trailing_stop(signal, market_price=101.0)
+        assert signal.stop_loss == pytest.approx(98.0)
+
+    @pytest.mark.parametrize("malformed", [{}, "", [], "percent"])
+    def test_malformed_trailing_sl_config_rejected(self, malformed) -> None:
+        """Survivor: a falsy/malformed config must not fall back to 'no trailing'."""
+        signal = self._signal(trailing_sl_config=malformed)
+        signal.stop_loss = 98.0
+        engine = self._engine()
+        with pytest.raises(ValueError, match="trailing_sl_config"):
+            engine.apply_trailing_stop(signal, market_price=101.0)
 
     def test_percent_trailing_mode_still_trails(self) -> None:
         signal = self._signal(trailing_sl_config={"mode": "percent", "percent": 0.02})

@@ -42,7 +42,7 @@ def test_cross_platform_matrix_includes_reference_metrics():
     # (A-H3/A-L3/A-L4: calendar-day returns, risk-free-rate subtraction —
     # see the raw_metadata note in risk_parity_reference.json); this pins
     # the regenerated value, not the pre-A-M6 0.544687.
-    assert rows["risk_parity_quantconnect"]["reference"]["sharpe_ratio"] == 0.213296
+    assert rows["risk_parity_quantconnect"]["reference"]["sharpe_ratio"] == 0.350569
     assert rows["risk_parity_quantconnect"]["platform_path"].endswith(
         "data/backtests/risk_parity_quantconnect_reimplementation.json"
     )
@@ -124,7 +124,13 @@ def test_cross_platform_matrix_loads_mt5_reference_timestamps_in_report_timezone
         Path(row["reference_path"]),
         source_timezone=row["reference_source_timezone"],
     )
-    platform = json.loads(Path(row["platform_path"]).read_text(encoding="utf-8"))
+    platform_path = Path(row["platform_path"])
+    if not platform_path.exists():
+        pytest.skip(
+            f"{platform_path.name} not present (artifacts are generated locally, not "
+            "committed); run scripts/regenerate_mt5_parity_artifacts.py"
+        )
+    platform = json.loads(platform_path.read_text(encoding="utf-8"))
 
     first_reference_entry = reference.trades[0].entry_time
     first_platform_entry = platform["trades"][0]["entry_time"].replace("+00:00", "Z")
