@@ -154,7 +154,7 @@ Persistiert wird auf der Signal-Metadata: `entry_quote_bid`, `entry_quote_ask`,
 `entry_deviation_direction` (`toward_stop_loss` / `away_from_stop_loss` / `none`),
 `max_entry_deviation_sl_fraction`, `entry_gate_rejection_rule` (`None` bei
 akzeptierten Signalen; abgelehnte werden noch nicht persistiert, nur geloggt).
-Payload-Werte unter diesen Keys werden überschrieben. Ein Schema für Quote-Snapshots (auch abgelehnter Signale) ist #134.
+Bei Entries werden Payload-Werte unter diesen Keys überschrieben; bei Exits (die kein Gate durchlaufen) werden sie entfernt. Ein Schema für Quote-Snapshots (auch abgelehnter Signale) ist #134.
 
 ## Broker-Raster (Alpaca)
 

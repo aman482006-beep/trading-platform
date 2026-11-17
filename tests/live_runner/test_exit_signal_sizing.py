@@ -369,6 +369,37 @@ def test_prepare_sizes_an_exit_from_the_own_ledger(monkeypatch) -> None:
     assert "take_profit" not in prepared.metadata
 
 
+def test_exit_drops_spoofed_entry_gate_fields(monkeypatch) -> None:
+    """The entry-deviation gate never runs on an exit, so a payload can't stamp it.
+
+    Entries overwrite these keys with the gate's own figures; an exit has no gate
+    result, so a payload value under one of them would otherwise be persisted as
+    if the gate had accepted it.
+    """
+    from live_runner.daemon import (
+        _ENTRY_QUOTE_METADATA_KEYS,
+        _trade_signal_to_live_signal,
+        prepare_order_with_risk,
+    )
+
+    deployment = _deployment(allow_short=True)
+    _patch_ledger(monkeypatch, deployment, 10.0)
+    adapter = _Adapter([{"symbol": "AAPL", "qty": 10.0}])
+    trade_signal = _exit_trade_signal()
+    spoofed = {key: "spoofed" for key in _ENTRY_QUOTE_METADATA_KEYS}
+    trade_signal = dataclasses.replace(
+        trade_signal, metadata={**trade_signal.metadata, **spoofed}
+    )
+    live = _trade_signal_to_live_signal(trade_signal, deployment)
+    assert all(live.metadata.get(key) == "spoofed" for key in _ENTRY_QUOTE_METADATA_KEYS)
+
+    prepared, qty = asyncio.run(prepare_order_with_risk(adapter, deployment, live))
+
+    assert qty == pytest.approx(10.0)
+    for key in _ENTRY_QUOTE_METADATA_KEYS:
+        assert key not in prepared.metadata, key
+
+
 def test_prepare_takes_the_close_side_from_the_position(monkeypatch) -> None:
     from live_runner.daemon import _trade_signal_to_live_signal, prepare_order_with_risk
 

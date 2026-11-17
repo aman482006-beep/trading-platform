@@ -1588,6 +1588,10 @@ async def prepare_exit_intent_order(
     # every exit the same way whichever producer it came from. A side the
     # executed instruction does not name must not survive from the payload.
     metadata.pop(EXIT_POSITION_SIDE_KEY, None)
+    # The entry-deviation gate never runs on an exit: a payload value under its
+    # keys would be persisted as if the gate had judged this signal.
+    for key in _ENTRY_QUOTE_METADATA_KEYS:
+        metadata.pop(key, None)
     metadata.update(exit_intent_metadata(instruction))
     metadata["qty"] = float(target_qty)
     metadata["explicit_qty"] = float(target_qty)
