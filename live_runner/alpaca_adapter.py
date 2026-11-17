@@ -27,6 +27,8 @@ from live_runner.base_adapter import (
     EXIT_ONLY_RISK_SIZING_MODE,
     BaseLiveAdapter,
     ControlOutcome,
+    LivePipValue,
+    LiveQuote,
     coerce_positive_live_qty,
     is_unbounded_tp,
     order_not_submitted,
@@ -663,6 +665,21 @@ def resolve_alpaca_credentials(
     return _alpaca_block_credentials(blocks[0])
 
 
+#: Crypto quote currencies Alpaca lists besides USD. A slash-less symbol
+#: ending in one of these (``ETHBTC``) is a non-USD pair (#146).
+_NON_USD_CRYPTO_QUOTES = ("USDT", "USDC", "BTC", "ETH")
+
+
+def _alpaca_quote_asset(symbol: str) -> str:
+    """Quote currency of an Alpaca symbol: USD for equities and ``*/USD``."""
+    if "/" in symbol:
+        return symbol.rsplit("/", 1)[1] or "unknown"
+    for quote in _NON_USD_CRYPTO_QUOTES:
+        if len(symbol) > len(quote) + 1 and symbol.endswith(quote):
+            return quote
+    return "USD"
+
+
 class AlpacaLiveAdapter(BaseLiveAdapter):
     """Live adapter for Alpaca trading + trade update streaming."""
 
@@ -1157,10 +1174,20 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         metadata = dict(signal.metadata or {})
         if str(metadata.get("risk_sizing_mode") or "") == EXIT_ONLY_RISK_SIZING_MODE:
             return signal, qty
-        if classify_alpaca_symbol(signal.symbol) == "crypto":
+        kind = classify_alpaca_symbol(signal.symbol)
+        if kind == "crypto":
             raise ValueError(
                 f"Alpaca does not support bracket/OTO orders for crypto ({signal.symbol}); "
                 f"refusing to submit before persistence (signal_id={signal.id})."
+            )
+        if kind != "us_equity":
+            # Fail closed: an unclassifiable symbol (a pair outside CRYPTO_QUOTES such as
+            # BTC-EUR, an option, a malformed symbol) could be a crypto/non-equity that Alpaca
+            # rejects only after the row is persisted (B-8).
+            raise ValueError(
+                f"Cannot verify {signal.symbol} is a US equity; Alpaca bracket/OTO orders are "
+                f"only supported for US equities, refusing to submit before persistence "
+                f"(signal_id={signal.id})."
             )
         if metadata.get("extended_hours"):
             raise ValueError(
@@ -1462,6 +1489,42 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         equity = _to_float(getattr(account, "equity", None), default=balance)
         return balance, equity
 
+    async def get_pip_value(self, symbol: str) -> LivePipValue:
+        """One share (or coin) moves the USD account by 1.0 per 1.0 USD move (#146).
+
+        Alpaca qty is in shares/coins and every supported symbol is quoted in
+        USD, so the value is 1.0 once the account itself is in USD. Refuses
+        (the daemon then refuses the entry) when the account currency is not
+        USD, or the symbol is a pair quoted in anything else (``ETH/BTC``,
+        ``BTC/USDT``): those would need a conversion this adapter does not do.
+        """
+        normalized_symbol = str(symbol or "").strip().upper()
+        if not normalized_symbol:
+            raise ValueError("symbol is required for an Alpaca pip value")
+        quote_asset = _alpaca_quote_asset(normalized_symbol)
+        if quote_asset != "USD":
+            raise ValueError(
+                f"Alpaca symbol {normalized_symbol} is quoted in {quote_asset}, not USD; "
+                "refusing to size it without a conversion rate."
+            )
+        if not self._connected or self._trading_client is None:
+            await self.connect()
+        account = await asyncio.to_thread(self._trading_client.get_account)
+        currency = str(getattr(account, "currency", "") or "").strip().upper()
+        if currency != "USD":
+            raise ValueError(
+                f"Alpaca account currency is {currency or 'unknown'!r}, not USD; "
+                "refusing to size with a 1.0 USD pip value."
+            )
+        return LivePipValue(
+            value=1.0,
+            units_per_qty=1.0,
+            conversion_rate=1.0,
+            quote_asset="USD",
+            account_asset="USD",
+            source="alpaca_usd_unit",
+        )
+
     async def get_market_data(
         self,
         symbol: str,
@@ -1579,6 +1642,49 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 f"newest bar {newest.isoformat()} exceeds {max_age}"
             )
         return frame
+
+    async def get_quote(self, symbol: str) -> LiveQuote:
+        """Latest top-of-book quote for the #125 entry-deviation gate.
+
+        Same IEX feed as :meth:`get_market_data`. A missing quote or a missing
+        or non-numeric side raises instead of returning an invented price; the
+        daemon additionally rejects zero, non-finite and crossed quotes.
+        """
+        from alpaca.data.requests import StockLatestQuoteRequest
+
+        normalized_symbol = str(symbol or "").strip().upper()
+        if not normalized_symbol:
+            raise ValueError("symbol is required for an Alpaca quote")
+        if not self._connected or self._historical_data_client is None:
+            raise RuntimeError("Alpaca adapter must be connected before requesting a quote")
+        request = StockLatestQuoteRequest(symbol_or_symbols=[normalized_symbol], feed="iex")
+        response = await asyncio.to_thread(
+            self._historical_data_client.get_stock_latest_quote, request
+        )
+        quote = response.get(normalized_symbol) if isinstance(response, Mapping) else None
+        if quote is None:
+            raise ValueError(f"Alpaca returned no quote for {normalized_symbol}")
+        prices: dict[str, float] = {}
+        for side in ("bid_price", "ask_price"):
+            raw = getattr(quote, side, None)
+            try:
+                if raw is None or isinstance(raw, bool):
+                    raise TypeError(side)
+                prices[side] = float(raw)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(
+                    f"Alpaca quote for {normalized_symbol} has no usable {side}: {raw!r}"
+                ) from exc
+        # The quote's own time, never now(): an after-hours "latest" quote can
+        # be hours old, and the daemon's freshness rule must see that.
+        timestamp = getattr(quote, "timestamp", None)
+        return LiveQuote(
+            bid=prices["bid_price"],
+            ask=prices["ask_price"],
+            timestamp=timestamp if isinstance(timestamp, datetime) else None,
+            source="alpaca_iex_latest_quote",
+            timestamp_source="broker",
+        )
 
     # ── Operator safety controls ──────────────────────────────────────────────────────────────
     #

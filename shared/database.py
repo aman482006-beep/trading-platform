@@ -1842,9 +1842,9 @@ def _make_live_executions_commission_nullable(connection: Connection) -> bool:
     the ``signal_id`` foreign key), copy, drop, rename, restore the indexes.
 
     The data step runs only together with the rebuild, so it happens once. It turns ``0.0`` into
-    NULL on every Alpaca row whose zero is not a provable known zero: crypto in either spelling
-    (``BTC/USD``, ``BTCUSD``), an orphan whose signal, deployment or account row is missing (its
-    broker is unknowable), and any symbol `shared.alpaca_symbols` cannot classify as an equity
+    NULL on every Alpaca row whose zero is not a provable known zero: crypto in any accepted
+    spelling (``BTC/USD``, ``BTC-USD``, ``BTCUSD``), an orphan whose signal, deployment or account
+    row is missing (its broker is unknowable), and any symbol `shared.alpaca_symbols` cannot classify as an equity
     (an option, a malformed symbol) - fail closed. Before #124 both Alpaca paths hard-coded
     ``0.0`` - alpaca-py has no commission field - while crypto fills do carry a fee. Alpaca equity zeros are a known zero and
     stay; other brokers' rows are not touched. The NULLs inside the backfill lookback get their
@@ -3918,7 +3918,12 @@ def _normalized_symbol_filter(symbols: list[str]) -> list[str]:
 
 def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentConfig:
     from live_runner.stockkit_routing import validate_stockkit_deployment_route
+    from risk.live import entry_gate_settings
 
+    # Entry-gate settings (#125) are refused at creation, not first at
+    # dispatch: a value such as max_entry_deviation_sl_fraction=25 would
+    # otherwise sit in the database until the first signal is rejected.
+    entry_gate_settings(deployment.settings)
     init_db()
     with get_session() as session:
         account = session.get(LiveAccountModel, deployment.account_id)

@@ -21,7 +21,7 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import pytest
 
-from live_runner.base_adapter import BaseLiveAdapter, is_order_not_submitted
+from live_runner.base_adapter import BaseLiveAdapter, LiveQuote, is_order_not_submitted
 from risk.config import RiskConfig
 from risk.engine import RiskEngine
 from risk.models import TradeSignal
@@ -73,7 +73,17 @@ def test_position_size_scales_inversely_with_pip_value():
         pip_value=1.0,
         current_exposure=0.0,
     )
-    sized_pip_10 = _engine().calculate_position_size(
+    # A cap of 100 % of balance does not bind for either pip value, so the
+    # comparison sees the raw sizing formula (#146: the cap now counts
+    # notional as size * entry * pip, so the default 20 % would bind both).
+    uncapped = _engine(max_notional_per_trade=1.0)
+    uncapped_pip_1 = uncapped.calculate_position_size(
+        signal=TradeSignal(**signal_kwargs, metadata={}),
+        account_balance=10_000.0,
+        pip_value=1.0,
+        current_exposure=0.0,
+    )
+    sized_pip_10 = uncapped.calculate_position_size(
         signal=TradeSignal(**signal_kwargs, metadata={}),
         account_balance=10_000.0,
         pip_value=10.0,
@@ -82,6 +92,10 @@ def test_position_size_scales_inversely_with_pip_value():
 
     # Notional cap binds: 0.2 * 10k = 2000 / entry 100 = 20 shares.
     assert sized_pip_1.position_size == pytest.approx(20.0)
+    # Uncapped: 1 % of 10k = 100 / (2 * pip). pip 1 -> 50 (notional 5,000);
+    # pip 10 -> 5 (notional 5 * 100 * 10 = 5,000). Dropping `* pip` gives 50,
+    # capped to 10,000 / (100 * 10) = 10.
+    assert uncapped_pip_1.position_size == pytest.approx(50.0)
     assert sized_pip_10.position_size == pytest.approx(5.0)
 
 
@@ -166,6 +180,21 @@ class _PositionsAdapter(BaseLiveAdapter):
 
     async def get_positions(self) -> list[dict[str, Any]]:
         return list(self.positions)
+
+    async def get_pip_value(self, symbol):
+        # #146: a USD-quoted share in a USD account moves 1.0 per 1.0.
+        from live_runner.base_adapter import LivePipValue
+
+        return LivePipValue(
+            value=1.0, units_per_qty=1.0, conversion_rate=1.0,
+            quote_asset="USD", account_asset="USD", source="test",
+        )
+
+    async def get_quote(self, symbol: str) -> LiveQuote:
+        # #125 entry-deviation gate: every entry in this module is at 100, so
+        # a quote there passes; the gate itself is pinned in
+        # tests/test_live_sizing_single_resolver.py.
+        return LiveQuote(bid=100.0, ask=100.0, timestamp=datetime.now(timezone.utc), source="test")
 
 
 class _NoPositionsAdapter(_PositionsAdapter):
@@ -5108,7 +5137,7 @@ def test_alpaca_extended_hours_bracket_is_refused_before_persistence(monkeypatch
     assert saved == []
 
 
-@pytest.mark.parametrize("symbol", ["BTC/USD", "ETHUSD"])
+@pytest.mark.parametrize("symbol", ["BTC/USD", "ETHUSD", "BTC-USD", "ETH-USDT"])
 def test_alpaca_crypto_bracket_entry_is_refused_before_persistence(monkeypatch, symbol):
     # Alpaca crypto has no bracket/OTO orders; refuse instead of a post-persist 422.
     adapter, submitted, saved = _alpaca_bracket_adapter(monkeypatch)
@@ -5116,6 +5145,21 @@ def test_alpaca_crypto_bracket_entry_is_refused_before_persistence(monkeypatch, 
 
     submission = adapter.submit_order(signal, qty=11.4)
     with pytest.raises(ValueError, match="crypto"):
+        asyncio.run(submission)
+
+    assert submitted == []
+    assert saved == []
+
+
+@pytest.mark.parametrize("symbol", ["BTC-EUR", "BTC-GBP", "AAPL261120C00200000", "AAPL!"])
+def test_alpaca_unclassifiable_bracket_entry_is_refused_before_persistence(monkeypatch, symbol):
+    # Fail closed: only a provable US equity may reach a BRACKET submit. A non-CRYPTO_QUOTES
+    # hyphen pair (BTC-EUR) or an option must not persist and then 422 at the broker (B-8).
+    adapter, submitted, saved = _alpaca_bracket_adapter(monkeypatch)
+    signal = _alpaca_entry("buy", 3000.0, 2900.0, 3200.0).model_copy(update={"symbol": symbol})
+
+    submission = adapter.submit_order(signal, qty=11.4)
+    with pytest.raises(ValueError, match="US equity"):
         asyncio.run(submission)
 
     assert submitted == []
