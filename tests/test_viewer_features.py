@@ -7733,31 +7733,22 @@ def test_viewer_routes_without_response_model_keep_object_schema(path, method):
 
 
 def _write_duplicate_portfolio_file(portfolios_dir, portfolio_id: str, created_at: str) -> None:
-    (portfolios_dir / f"{portfolio_id}.json").write_text(
-        json.dumps(
-            {
-                "id": portfolio_id,
-                "name": "Duplicate Portfolio",
-                "account_capital": 100000.0,
-                "created_at": created_at,
-                "components": [
-                    {
-                        "component_id": "component-001",
-                        "strategy_name": "Strategy A",
-                        "symbol": "AAPL",
-                        "timeframe": "1h",
-                        "weight": 1.0,
-                        "risk_config": {},
-                        "settings": {},
-                        "backtest_id": "",
-                    }
-                ],
-                "trades": [],
-                "combined_stats": {},
-            }
-        ),
-        encoding="utf-8",
-    )
+    # Only the fields the duplicate fingerprint reads (components, capital).
+    component = {
+        "strategy_name": "Strategy A",
+        "symbol": "AAPL",
+        "timeframe": "1h",
+        "weight": 1.0,
+        "backtest_id": "",
+    }
+    payload = {
+        "id": portfolio_id,
+        "name": "Duplicate Portfolio",
+        "account_capital": 100000.0,
+        "created_at": created_at,
+        "components": [component],
+    }
+    (portfolios_dir / f"{portfolio_id}.json").write_text(json.dumps(payload), encoding="utf-8")
 
 
 def _duplicate_group_fake(alive: set[str], created: dict[str, str]):
