@@ -149,15 +149,9 @@ def test_replay_executes_supertrend_flip() -> None:
 def test_replay_rejects_supertrend_flip_without_its_parameters() -> None:
     """A bare {"mode": "supertrend_flip"} names the workflow without its
     parameters; it is refused, never run with invented defaults."""
-    adapter = SignalReplayAdapter(fee_params={"fees": "zero"}, default_timeframe="1m")
+    signals = [_trailing_replay_signal({"mode": "supertrend_flip"})]
     with pytest.raises(ValueError, match="supertrend_flip"):
-        adapter.run(
-            signals=[_trailing_replay_signal({"mode": "supertrend_flip"})],
-            ohlcv_by_symbol={"AAPL": _one_bar_frame()},
-            timeframe="1m",
-            backtest_start="2026-01-01",
-            backtest_end="2026-01-01",
-        )
+        _run_replay(signals)
 
 
 def test_replay_rejects_a_signal_at_signal_time_before_the_engine_backstop() -> None:

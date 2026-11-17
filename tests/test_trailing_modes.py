@@ -690,8 +690,9 @@ def test_order_preparation_refuses_a_complete_supertrend_flip_config(
             "tp1_exit_percent": 0.5,
         }
     )
+    deployment = _deployment()
     with pytest.raises(ValueError, match="'supertrend_flip' is not supported"):
-        asyncio.run(daemon.prepare_order_with_risk(adapter, _deployment(), signal))
+        asyncio.run(daemon.prepare_order_with_risk(adapter, deployment, signal))
 
 
 @pytest.mark.parametrize("broker", ["alpaca", "ctrader", None, "ibkr"])

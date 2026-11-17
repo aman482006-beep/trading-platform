@@ -658,8 +658,9 @@ def _without(key: str) -> dict:
 )
 def test_incomplete_or_invalid_flip_config_rejects_the_run(trailing, metadata, match) -> None:
     frame = _frame([ENTRY_BAR, TP1_BAR, _flat()])
+    signals = [_signal(trailing=trailing, metadata=metadata)]
     with pytest.raises(ValueError, match=match):
-        _run(frame, signals=[_signal(trailing=trailing, metadata=metadata)])
+        _run(frame, signals=signals)
 
 
 def test_missing_tp1_exit_percent_is_not_defaulted() -> None:
@@ -670,13 +671,17 @@ def test_missing_tp1_exit_percent_is_not_defaulted() -> None:
 
 
 def test_flip_workflow_is_long_only() -> None:
+    frame = _frame([ENTRY_BAR, _flat()])
+    signals = [_signal(action="sell", take_profit=None)]
     with pytest.raises(ValueError, match="long entries only"):
-        _run(_frame([ENTRY_BAR, _flat()]), signals=[_signal(action="sell", take_profit=None)])
+        _run(frame, signals=signals)
 
 
 def test_a_take_profit_other_than_tp1_is_ambiguous_and_rejected() -> None:
+    frame = _frame([ENTRY_BAR, _flat()])
+    signals = [_signal(take_profit=140.0)]
     with pytest.raises(ValueError, match="differs from tp1_price"):
-        _run(_frame([ENTRY_BAR, _flat()]), signals=[_signal(take_profit=140.0)])
+        _run(frame, signals=signals)
 
 
 def test_plan_is_parsed_from_config_and_metadata() -> None:
