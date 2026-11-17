@@ -1859,6 +1859,19 @@ async def prepare_order_with_risk(
     else:
         resolved_pip = _coerce_live_float(pip_value, field_name="pip_value", minimum=0.0)
         pip_metadata = _pip_value_record(resolved_pip, source="caller")
+        # The override is a trusted channel that bypasses the broker lookup and
+        # its freshness checks (#146); make every use visible in the logs.
+        logger.warning(
+            "Caller-supplied pip_value override in use; the broker pip value is NOT consulted",
+            extra={
+                "data": {
+                    "deployment_id": str(deployment.id),
+                    "account_id": deployment.account_id,
+                    "symbol": signal.symbol,
+                    "pip_value": resolved_pip,
+                }
+            },
+        )
     sized_signal = size_live_signal_for_submission(
         signal,
         deployment,

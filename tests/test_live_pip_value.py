@@ -826,13 +826,55 @@ def test_a_trusted_caller_pip_value_skips_the_lookup():
     assert prepared.metadata["pip_value_units_per_qty"] is None
 
 
-def test_exit_only_orders_need_no_pip_value():
+def test_a_caller_pip_value_override_is_logged_as_a_warning(caplog):
+    adapter = _Adapter(error=AssertionError("must not be called"))
+    deployment = _deployment()
+    signal = _equity_signal(deployment)
+
+    with caplog.at_level(logging.WARNING):
+        _prepare(adapter, deployment, signal, pip_value=2.0)
+
+    records = [r for r in caplog.records if "pip_value override" in r.getMessage()]
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+    assert records[0].data["pip_value"] == 2.0
+    assert records[0].data["symbol"] == "AAPL"
+
+
+def test_the_broker_pip_value_path_logs_no_override_warning(caplog):
+    adapter = _Adapter(pip=_pip())
+    deployment = _deployment()
+
+    with caplog.at_level(logging.WARNING):
+        _prepare(adapter, deployment, _equity_signal(deployment))
+
+    assert not [r for r in caplog.records if "pip_value override" in r.getMessage()]
+
+
+def _own_ledger(monkeypatch, deployment: LiveDeploymentConfig, qty: float) -> None:
+    """The deployment's own filled ledger, without a database (#121 exits size from it)."""
+    monkeypatch.setattr(
+        daemon,
+        "get_account_net_filled_qty_by_deployment",
+        lambda account_id, symbol: {str(deployment.id): qty},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        daemon, "list_live_deployment_unfilled_exit_orders", lambda *_a, **_k: [], raising=False
+    )
+    monkeypatch.setattr(
+        daemon, "_list_other_deployments_unfilled_exits", lambda *_a, **_k: [], raising=False
+    )
+
+
+def test_exit_only_orders_need_no_pip_value(monkeypatch):
     class _Book(_Adapter):
         async def get_positions(self) -> list[dict[str, Any]]:
             return [{"symbol": "AAPL", "qty": 3.0}]
 
     adapter = _Book(error=AssertionError("must not be called"))
     deployment = _deployment()
+    _own_ledger(monkeypatch, deployment, 3.0)
     signal = LiveSignal(
         deployment_id=str(deployment.id), symbol="AAPL", action="sell",
         theoretical_price=100.0, timestamp=datetime.now(timezone.utc),
@@ -844,7 +886,7 @@ def test_exit_only_orders_need_no_pip_value():
     assert qty == pytest.approx(3.0)
 
 
-def test_exit_only_close_ignores_payload_pip_value_keys():
+def test_exit_only_close_ignores_payload_pip_value_keys(monkeypatch):
     # A payload copy of the pip-value record must not reach the adapter on a close:
     # cTrader's submit-time scale guard would otherwise refuse the close (#146).
     class _Book(_Adapter):
@@ -853,6 +895,7 @@ def test_exit_only_close_ignores_payload_pip_value_keys():
 
     adapter = _Book(error=AssertionError("must not be called"))
     deployment = _deployment()
+    _own_ledger(monkeypatch, deployment, 3.0)
     signal = LiveSignal(
         deployment_id=str(deployment.id), symbol="AAPL", action="sell",
         theoretical_price=100.0, timestamp=datetime.now(timezone.utc),
