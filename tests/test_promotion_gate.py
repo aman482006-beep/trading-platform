@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -330,6 +331,25 @@ def test_paper_run_ending_in_the_future_is_refused(strategies_dir: Path) -> None
         )
 
 
+def test_out_of_sample_segment_ending_in_the_future_is_refused(strategies_dir: Path) -> None:
+    """A test window that has not happened yet cannot have produced its trades."""
+    now = datetime.now(timezone.utc)
+    evidence = good_evidence(now=now)
+    future_oos = replace(
+        evidence.out_of_sample, test_end=(now + timedelta(days=10)).isoformat()
+    )
+    with pytest.raises(InvalidPromotionError, match="test segment ends in the future"):
+        promote(
+            strategies_dir / STRATEGY_NAME / f"{STRATEGY_NAME}.py",
+            kind="strategy",
+            parameters=DEFAULTS,
+            evidence=replace(evidence, out_of_sample=future_oos),
+            promoted_by="Fred",
+            root=strategies_dir,
+            now=now,
+        )
+
+
 def test_evidence_from_mapping_refuses_missing_parts() -> None:
     complete = good_evidence().to_dict()
     for part in ("out_of_sample", "paper_trading", "parity"):
@@ -404,6 +424,12 @@ def _rewrite_record(strategies_dir: Path, mutate) -> None:
         (lambda r: r["evidence"]["paper_trading"].update(trade_count=5), "thresholds"),
         (lambda r: r["evidence"]["out_of_sample"].update(overfitting_passed=False), "thresholds"),
         (lambda r: r["evidence"]["out_of_sample"].update(test_trade_count="60"), "malformed"),
+        (
+            lambda r: r["evidence"]["out_of_sample"].update(
+                test_end=(datetime.now(timezone.utc) + timedelta(days=10)).isoformat()
+            ),
+            "future",
+        ),
         (lambda r: r.update(kind="signal_bot"), "different kind"),
         (lambda r: r.update(file="beta/beta.py"), "different file"),
         (
@@ -501,6 +527,7 @@ def test_out_of_sample_evidence_reads_the_final_holdout_not_the_validation_windo
         kind="strategy",
         file_name=f"{STRATEGY_NAME}.py",
         parameters_sha256=parameters_hash(DEFAULTS),
+        now=datetime.now(timezone.utc),
     )
     assert any("10 trades in the test segment" in problem for problem in problems)
     assert any("test segment is 45.0 days" in problem for problem in problems)

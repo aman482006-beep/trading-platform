@@ -303,18 +303,20 @@ class OutOfSampleEvidence:
         kind: str,
         file_name: str,
         parameters_sha256: str,
+        now: datetime,
     ) -> list[str]:
         found: list[str] = []
         if self.overfitting_passed is not True:
             found.append("out of sample: the overfitting verdict did not pass")
         try:
-            days = _duration_days(
-                _parse_instant(self.test_start, "test_start"),
-                _parse_instant(self.test_end, "test_end"),
-            )
+            start = _parse_instant(self.test_start, "test_start")
+            end = _parse_instant(self.test_end, "test_end")
         except InvalidPromotionError as exc:
             found.append(f"out of sample: {exc}")
         else:
+            if end > now + _FUTURE_SKEW:
+                found.append("out of sample: the test segment ends in the future")
+            days = _duration_days(start, end)
             if days < thresholds.min_test_segment_days:
                 found.append(
                     f"out of sample: test segment is {days:.1f} days, "
@@ -486,7 +488,11 @@ class PromotionEvidence:
     ) -> list[str]:
         return [
             *self.out_of_sample.problems(
-                thresholds, kind=kind, file_name=file_name, parameters_sha256=parameters_sha256
+                thresholds,
+                kind=kind,
+                file_name=file_name,
+                parameters_sha256=parameters_sha256,
+                now=now,
             ),
             *self.paper_trading.problems(thresholds, now=now),
             *self.parity.problems(thresholds),
