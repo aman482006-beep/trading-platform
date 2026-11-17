@@ -6,6 +6,11 @@ up strategy could show a respectable Sharpe. Maintainer decision (option C):
 truncate the curve at the first non-positive equity point, set ``ruined`` and
 ``ruin_time``, and publish Sharpe, Sortino, PSR and p-value as ``None``,
 listed in ``undefined_metrics``.
+
+#250 extends the same contract to a point no metric can read (``None``,
+non-numeric text, an integer outside float64 range): it is ruin, its value is
+normalised to NaN, and the endpoint figures that NaN would make unmeasurable
+are published as null instead of as NaN (which is not valid JSON).
 """
 
 from __future__ import annotations
