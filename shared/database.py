@@ -1961,6 +1961,69 @@ def _make_live_executions_commission_nullable(connection: Connection) -> bool:
     return True
 
 
+_CTRADER_COMMISSION_COST_MIGRATION = "ctrader_commission_positive_cost_v1"
+
+
+def _migrate_ctrader_commission_to_cost(connection: Connection) -> bool:
+    """Convert existing cTrader ``live_executions.commission`` rows to a positive cost (#205).
+
+    Before the sign fix, cTrader rows stored ``ProtoOADeal.commission`` raw: a charge is a NEGATIVE
+    cash flow. The convention is now a positive cost for every broker (net = gross - commission), so
+    each cTrader row becomes ``abs`` of its stored value (maintainer decision 2026-11-16). Only
+    accounts whose broker is ``ctrader`` are touched, NULL (unknown) and zero stay as they are, and
+    a row whose broker cannot be determined (orphan) is left alone.
+
+    ``abs`` is not safe to repeat blindly once the fixed adapter runs: a rebate is stored as a
+    NEGATIVE cost and a second pass would turn it into a charge. So the conversion is recorded in
+    ``schema_data_migrations`` and runs exactly once; ``init_db`` runs on every process start.
+
+    Returns True when the conversion ran. No-ops when it is already recorded.
+    """
+    connection.execute(
+        text(
+            "CREATE TABLE IF NOT EXISTS schema_data_migrations ("
+            "name TEXT NOT NULL PRIMARY KEY, applied_at TEXT NOT NULL)"
+        )
+    )
+    already_applied = connection.execute(
+        text("SELECT 1 FROM schema_data_migrations WHERE name = :name"),
+        {"name": _CTRADER_COMMISSION_COST_MIGRATION},
+    ).first()
+    if already_applied is not None:
+        return False
+
+    converted = 0
+    # Recorded even when the table is absent: a table created later only ever holds rows from the
+    # fixed adapter, and a converting re-run would turn their rebates into charges.
+    if _table_column_names(connection, "live_executions"):
+        converted = int(
+            connection.execute(
+                text(
+                    "UPDATE live_executions SET commission = abs(commission) "
+                    "WHERE commission < 0 AND signal_id IN ("
+                    "SELECT s.id FROM live_signals s "
+                    "JOIN live_deployments d ON d.id = s.deployment_id "
+                    "JOIN live_accounts a ON a.id = d.account_id "
+                    "WHERE lower(a.broker) = 'ctrader')"
+                )
+            ).rowcount
+            or 0
+        )
+    connection.execute(
+        text("INSERT INTO schema_data_migrations (name, applied_at) VALUES (:name, :now)"),
+        {
+            "name": _CTRADER_COMMISSION_COST_MIGRATION,
+            "now": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    logger.info(
+        "Converted %s cTrader live_executions commission(s) from the raw broker sign to a "
+        "positive cost",
+        converted,
+    )
+    return True
+
+
 def _migrate_live_executions_dedupe_key(connection: Connection) -> None:
     """Add the dedupe_key column and its unique index to live_executions."""
     execution_column_names = _table_column_names(connection, "live_executions")
@@ -2378,6 +2441,9 @@ def _migrate_schema() -> None:
         _add_live_executions_actual_price_observed(connection)
         # Last: the rebuild copies every column, so the additive ones must already exist.
         _make_live_executions_commission_nullable(connection)
+        # Independent of the rebuild (both run in one transaction); the rebuild copies whatever
+        # sign the rows hold, so the order is not load-bearing.
+        _migrate_ctrader_commission_to_cost(connection)
 
 
 def _find_existing_live_signal(

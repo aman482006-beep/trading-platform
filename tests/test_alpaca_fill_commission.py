@@ -618,6 +618,8 @@ def _build_legacy_database(isolated_db_no_schema):
             ("ex-equity", "sig-equity", 0.0, "alpaca:exec:e"),
             ("ex-ctrader", "sig-ctrader", 1.5, "ctrader:deal:1"),
             ("ex-ctrader-zero", "sig-ctrader", 0.0, "ctrader:deal:2"),
+            # Old raw broker sign: a charge is negative (#205).
+            ("ex-ctrader-neg", "sig-ctrader", -3.5, "ctrader:deal:3"),
         ]
         for execution_id, signal_id, commission, key in executions:
             connection.execute(
@@ -651,7 +653,16 @@ def test_legacy_not_null_commission_column_is_migrated_to_nullable(isolated_db_n
         index_names = {
             row[1] for row in connection.execute(text("PRAGMA index_list(live_executions)"))
         }
-    assert set(commissions) == {"ex-crypto", "ex-equity", "ex-ctrader", "ex-ctrader-zero"}
+    assert set(commissions) == {
+        "ex-crypto",
+        "ex-equity",
+        "ex-ctrader",
+        "ex-ctrader-zero",
+        "ex-ctrader-neg",
+    }
+    # The nullable rebuild and the sign conversion compose: the legacy negative charge survives
+    # the table rebuild and becomes a positive cost.
+    assert commissions["ex-ctrader-neg"] == 3.5
     # The 0.0 on an Alpaca crypto row was always the hard-coded fallback, never a stated fee.
     assert commissions["ex-crypto"] is None
     assert commissions["ex-equity"] == 0.0, "an equity 0.0 is a known zero and stays"
