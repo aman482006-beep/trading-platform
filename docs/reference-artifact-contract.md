@@ -25,7 +25,7 @@ conventions, and QuantConnect rebalance fills.
 2. Keep header metrics distinct from recomputed trade metrics, equity metrics,
    and attribution metrics.
 3. Treat timestamps as source-local until an importer explicitly records the
-   source timezone and UTC conversion.
+   source timezone or broker clock and the UTC conversion.
 4. Do not overwrite valid stored metrics with malformed imported fields.
 5. Do not infer execution semantics from summary metrics when trade-level or
    tick-level evidence is missing.
@@ -194,7 +194,7 @@ Cross-platform matrix rows should disclose:
 
 - reference framework and path,
 - platform artifact path,
-- source timezone for imported timestamps,
+- source timezone or broker clock for imported timestamps,
 - metric basis for each compared value,
 - missing artifacts,
 - known evidence limitations.

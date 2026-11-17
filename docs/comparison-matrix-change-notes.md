@@ -6,6 +6,40 @@ whenever a protected baseline file changes parity-sensitive behavior. Each entry
 records the old and new `deltas[]` values of the comparison matrix for the
 committed comparison cases, plus the remaining limitations.
 
+## #203 — comparison matrix reads MT5 reports on the broker clock
+
+- Changed behavior, protected files:
+  - `validation/importers/mt5_xlsx.py`: `load(..., broker_clock=...)` converts
+    report timestamps through the named broker clock (`BrokerClock.to_utc`),
+    mutually exclusive with `source_timezone`; `raw_metadata` records
+    `broker_clock` (`source_timezone` is `null` then). A report time the clock
+    skipped (2024-04-06 02:00-03:00 server) raises; it is no longer returned as
+    the raw string.
+  - `validation/statistics/cross_platform.py`: each MT5 case names the clock its
+    platform run used (`dukascopy_mt5_forex` for EURUSD, `dukascopy_mt5_index`
+    for NAS100/SP500, the same as `COMPARISON_CASES`); the row publishes
+    `reference_broker_clock` in place of `reference_source_timezone`.
+  - `scripts/analyze_mt5_parity.py`: reads each report on its case clock and
+    buckets sessions and years on that clock's server time.
+  - Tests: `tests/test_broker_clock.py`, `tests/validation/test_mt5_xlsx_importer.py`,
+    `tests/validation/test_cross_platform_metrics.py`, `tests/test_analyze_mt5_parity.py`.
+- Why: MT5 prints `TimeCurrent()`, the broker's server wall clock. That clock has
+  three offset epochs; `Europe/Athens` matches only one of them. Evidence and
+  examples: `strategy-comparisons/intraday_volatility_breakout/audit/README.md`.
+  Example: SP500 server 2024-04-01 17:15 is 15:15Z on the broker clock, 14:15Z
+  under Athens.
+- Before/after matrix: **not produced in this change**, for the same reason as
+  #186 (the platform artifacts in `data/backtests/` are not committed). Matrix
+  metrics come from the XLSX header stats and are unchanged; what moves is the UTC
+  instant of each reference trade timestamp (1 h for the affected epochs).
+- Remaining limitations:
+  - `scripts/generate_golden_files.py` still calls `importer.load(path)` with no
+    clock, so the committed goldens in `tests/fixtures/validation/goldens/` carry
+    server wall time labelled as UTC. The goldens are checked for shape only, not
+    timestamps. Re-generating them on the broker clock is a separate change.
+  - `scripts/analyze_mt5_parity.py` hardcoded `MT5_SOURCE_TIMEZONE = "Europe/Athens"`
+    before this change; that constant is removed.
+
 ## #186 — MT5 parity: server-clock D1 bars and explicit broker clocks
 
 - Changed behavior, protected files:
@@ -33,7 +67,8 @@ committed comparison cases, plus the remaining limitations.
   - The matrix still reads MT5 XLSX times as `Europe/Athens`
     (`validation/statistics/cross_platform.py`). That is 1 h off for the index
     history in summer 2018–2023 and in US-only DST weeks from 2024-04; it affects
-    day boundaries in the matrix, not the trade counts. Follow-up.
+    day boundaries in the matrix, not the trade counts. **Resolved in #203**
+    (see above).
   - The artifact-dependent guards skip, with a reason, when the artifacts are
     absent. This is by design: no CI download of multi-GB data.
 
