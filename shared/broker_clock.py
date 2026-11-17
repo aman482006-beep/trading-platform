@@ -222,13 +222,15 @@ def _utc(value: str) -> pd.Timestamp:
 # Profiles
 # ---------------------------------------------------------------------------
 
+_NEW_YORK = "America/New_York"
+
 #: The canonical "New York close" clock: UTC+2/+3 on US DST dates, no exceptions.
 NY_CLOSE = BrokerClock(
     name="ny_close",
     description=(
         "America/New_York + 7 h (UTC+2 / UTC+3 on US DST dates); 00:00 server = 17:00 New York."
     ),
-    segments=(ClockSegment(None, "America/New_York", 7, weekend_d1_bars=True),),
+    segments=(ClockSegment(None, _NEW_YORK, 7, weekend_d1_bars=True),),
 )
 
 # Dukascopy-demo-mt5-1 strategy-tester history, derived from the IntradayVolatilityBreakout
@@ -271,7 +273,7 @@ def _dukascopy_segments(legacy_zone: str, legacy_shift: int) -> tuple[ClockSegme
         ),
         ClockSegment(
             _DUKASCOPY_CURRENT_START,
-            "America/New_York",
+            _NEW_YORK,
             7,
             weekend_d1_bars=True,
             note="New York close",
@@ -285,7 +287,7 @@ def _dukascopy_segments(legacy_zone: str, legacy_shift: int) -> tuple[ClockSegme
         ),
         ClockSegment(
             _DUKASCOPY_2024_LATE_SWITCH_END,
-            "America/New_York",
+            _NEW_YORK,
             7,
             weekend_d1_bars=True,
             note="New York close",

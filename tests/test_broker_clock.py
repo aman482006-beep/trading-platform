@@ -348,17 +348,30 @@ def test_resolve_broker_clock():
         resolve_broker_clock("Europe/Athens")
 
 
-def test_clock_segments_are_validated():
-    with pytest.raises(ValueError, match="no segments"):
-        BrokerClock("empty", ())
-    with pytest.raises(ValueError, match="open-ended"):
-        BrokerClock("bad", (ClockSegment(pd.Timestamp("2020-01-01", tz="UTC"), "UTC", 2, True),))
-    with pytest.raises(ValueError, match="strictly increasing"):
-        BrokerClock(
-            "bad",
+@pytest.mark.parametrize(
+    ("segments", "message"),
+    [
+        ((), "no segments"),
+        ((ClockSegment(pd.Timestamp("2020-01-01", tz="UTC"), "UTC", 2, True),), "open-ended"),
+        (
             (
                 ClockSegment(None, "UTC", 2, True),
                 ClockSegment(pd.Timestamp("2021-01-01", tz="UTC"), "UTC", 3, True),
                 ClockSegment(pd.Timestamp("2020-01-01", tz="UTC"), "UTC", 2, True),
             ),
-        )
+            "strictly increasing",
+        ),
+        (
+            (
+                ClockSegment(None, "UTC", 2, True),
+                ClockSegment(pd.Timestamp("2021-01-01", tz="UTC"), "UTC", 3, True),
+                ClockSegment(pd.Timestamp("2021-01-01", tz="UTC"), "UTC", 2, True),
+            ),
+            "strictly increasing",
+        ),
+    ],
+    ids=["no-segments", "first-not-open", "decreasing-start", "duplicate-start"],
+)
+def test_clock_segments_are_validated(segments, message):
+    with pytest.raises(ValueError, match=message):
+        BrokerClock("bad", segments)

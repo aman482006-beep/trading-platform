@@ -1,7 +1,7 @@
 # Strategy-Test-Audit: IntradayVolatilityBreakout (MT5 ↔ Platform)
 
 Branch: `strategy-test-audit`. Ziel: MT5-Code (`../IntradayVolatilityBreakout.mq5`,
-Referenz-Runs in `/home/ubuntu/trading-platform-references/`) gegen die
+Referenz-Runs im Verzeichnis `$TRADING_PLATFORM_REFERENCES` bzw. `--reference-dir`) gegen die
 Platform-Strategie (`strategies/intraday_volatility_breakout/`, native Engine)
 verifizieren, bis Trade-Listen und Stats (nahezu) identisch sind.
 
@@ -16,11 +16,19 @@ verifizieren, bis Trade-Listen und Stats (nahezu) identisch sind.
 Kontrakte (auf den Cent verifiziert): EURUSD 1 Lot = 100.000, Indices 1 Lot = 1.
 XLSX = EUR-Account (500 € Risk, Swaps, USD→EUR-Konvertierung), Logs = USD-Runs.
 
-Reproduktion der Referenz-Seite:
+Reproduktion der Referenz-Seite (vom Repo-Root aufrufen):
 
 ```bash
-.venv/bin/python strategy-comparisons/intraday_volatility_breakout/audit/parse_mt5_reference.py --out /tmp/audit_ref
+python strategy-comparisons/intraday_volatility_breakout/audit/parse_mt5_reference.py --reference-dir <Referenz-Verzeichnis> --out data/intraday_volatility_breakout_audit
 ```
+
+`--out` ist optional (Default: der Audit-Ordner selbst) und muss innerhalb des
+Arbeitsverzeichnisses oder des Audit-Ordners liegen (Guard in
+`_resolve_output_dir`, absichtlich nicht aufgeweicht); `data/` ist
+git-ignoriert. Das Referenz-Verzeichnis kommt aus `--reference-dir` oder
+`$TRADING_PLATFORM_REFERENCES` (Flag gewinnt); ohne beides bricht das Skript
+mit Exit-Code 2 und Meldung auf stderr ab. Das Skript lässt sich auch aus
+`audit/` heraus mit relativem Pfad aufrufen.
 
 (Skript failt laut bei jeder Inkonsistenz: Deal-Sequenz, Volumen-Paarung,
 Final-Balance-Delta, XLSX↔Log-Keys.)
@@ -42,8 +50,8 @@ SL-Exits centgenau, Lots exakt, Time-Exits = 22:55-Open (+Spread bei SHORT).
 
 ## Gefundene Abweichungen (alle belegt, Fixes im Branch)
 
-1. **ATR-Historie** (kein Codefehler): CSV-Wilder (6 Wochen) vs. MT5-Wilder
-   (8 Jahre) → median ~5 % Level-Diff. Neu: `warmup_start` (Adapter/Engine).
+1. **ATR-Historie** (kein Codefehler): CSV-Wilder (6 Wochen) vs. MT5-SMA
+   (8 Jahre; die Wilder-Annahme war falsch, siehe Abschnitt „Volle Historie“) → median ~5 % Level-Diff. Neu: `warmup_start` (Adapter/Engine).
 2. **`entry_open` bei Lücken**: MT5-`iBarShift` nimmt nächste Bar (28.04. USATECH:
    16:29 statt 16:32) → Fix in Strategie + Tests.
 3. **`trade_direction` vor Reverse-Swap** erlaubte falsche Seiten
@@ -151,3 +159,8 @@ Behoben: die Vergleichsmatrix importiert die Reports jetzt über denselben
 `scripts/analyze_mt5_parity.py` nutzt denselben Weg: Report-Import und
 Session-/Jahres-Bucketing laufen auf der Broker-Serverzeit des jeweiligen
 Symbols statt auf `Europe/Athens`.
+
+## Plattform-Artefakte
+`score_parity.py` liest die Plattform-Artefakte aus `data/backtests/`. Diese sind nicht im Repo
+(zu gross, `data/` ist gitignored) und werden lokal mit `scripts/regenerate_mt5_parity_artifacts.py`
+erzeugt; fehlt eines, bricht `score_parity.py` mit einer klaren Meldung ab. Alternativ `--artifact <symbol>=<pfad>`.

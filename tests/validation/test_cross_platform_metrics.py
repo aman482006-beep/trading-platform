@@ -127,7 +127,13 @@ def test_cross_platform_matrix_reads_mt5_reference_timestamps_on_the_broker_cloc
         Path(row["reference_path"]),
         broker_clock=row["reference_broker_clock"],
     )
-    platform = json.loads(Path(row["platform_path"]).read_text(encoding="utf-8"))
+    platform_path = Path(row["platform_path"])
+    if not platform_path.exists():
+        pytest.skip(
+            f"{platform_path.name} not present (artifacts are generated locally, not "
+            "committed); run scripts/regenerate_mt5_parity_artifacts.py"
+        )
+    platform = json.loads(platform_path.read_text(encoding="utf-8"))
     reference_entries = {trade.entry_time for trade in reference.trades}
     platform_entries = {
         trade["entry_time"].replace("+00:00", "Z") for trade in platform["trades"]

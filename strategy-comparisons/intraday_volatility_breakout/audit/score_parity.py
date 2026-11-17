@@ -65,6 +65,12 @@ def load_platform(path: pathlib.Path, key: str, clock_name: str) -> pd.DataFrame
     clock = resolve_broker_clock(clock_name)
     if clock is None:
         raise SystemExit("a broker clock is required to put platform trades on server time")
+    if not path.exists():
+        raise SystemExit(
+            f"platform artifact {path} not found. The MT5-parity artifacts are not "
+            "committed; generate them with scripts/regenerate_mt5_parity_artifacts.py "
+            "(multi-GB data run) or pass --artifact <symbol>=<path>."
+        )
     trades = json.loads(path.read_text(encoding="utf-8"))["trades"]
     rows = []
     for trade in trades:
@@ -86,6 +92,9 @@ def load_platform(path: pathlib.Path, key: str, clock_name: str) -> pd.DataFrame
     )
     pf["entry_server"] = clock.to_server_time(pf["entry_utc"])
     pf["exit_server"] = clock.to_server_time(pf["exit_utc"])
+    unknown = sorted(set(pf["dir"]) - {"LONG", "SHORT"})
+    if unknown:
+        raise SystemExit(f"{path}: unknown trade direction(s) {unknown}; expected LONG or SHORT")
     sign = pf["dir"].map({"LONG": 1.0, "SHORT": -1.0})
     pf["pnl_px"] = (pf["exit"] - pf["entry"]) * sign * pf["qty"] * CONTRACT[key]
     return pf
@@ -96,7 +105,14 @@ def score(key: str, mt5: pd.DataFrame, pf: pd.DataFrame) -> tuple[dict, pd.DataF
         frame["date"] = frame["entry_server"].dt.normalize()
         frame["n"] = frame.groupby(["date", "dir"]).cumcount()
     merged = mt5.merge(
-        pf, on=["date", "dir", "n"], how="outer", suffixes=("_mt5", "_pf"), indicator=True
+        pf,
+        on=["date", "dir", "n"],
+        how="outer",
+        suffixes=("_mt5", "_pf"),
+        indicator=True,
+        # (date, dir, n) is unique on each side by construction (cumcount), so a
+        # many-to-many match would be a bug in the pairing, not in the data.
+        validate="one_to_one",
     )
     both = merged[merged["_merge"] == "both"]
     same_minute = both["entry_server_mt5"].dt.floor("min") == both["entry_server_pf"].dt.floor(

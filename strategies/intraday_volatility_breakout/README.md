@@ -146,3 +146,11 @@ Evidenz und Parität pro Symbol: `strategy-comparisons/intraday_volatility_break
 
 ## Backtest-Ergebnis (Referenz)
 *Noch nicht erstellt — wird in einem späteren Schritt des Konvertierungs-Protokolls ergänzt.*
+
+## Parity-Artefakte (lokal erzeugt, nicht im Repo)
+Die Backtest-Ergebnisse `data/backtests/intraday_volatility_breakout_{eurusd_h1,nas100_m15,sp500_m1}.json`
+(sowie `risk_parity_quantconnect_reimplementation.json`) sind gross und werden **nicht** eingecheckt
+(`data/` ist gitignored). Sie werden lokal mit `scripts/regenerate_mt5_parity_artifacts.py`
+erzeugt (Lauf ueber mehrere GB Marktdaten). Dass die davon abhaengigen Guards in CI ueberspringen, ist Absicht: es gibt keinen CI-Download dieser Daten. Fehlen sie, ueberspringen die davon abhaengigen Tests
+mit Hinweis (`tests/test_mt5_parity_artifacts_fresh.py`, MT5-Zeitstempel-Test in
+`tests/validation/test_cross_platform_metrics.py`); die Vergleichsmatrix markiert sie als `missing_artifacts`.
