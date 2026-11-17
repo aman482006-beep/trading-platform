@@ -13,8 +13,8 @@ The rules, deliberately narrow so anything else is ``unknown`` (and readers fail
   three letters. The hyphen is also the share-class separator (``BF-B``), but a share-class suffix
   is one or two letters and can never be a quote, so the two cannot collide.
 * Without a separator, a symbol of at least six letters that ends in a known quote
-  (``CRYPTO_QUOTES``, longest first) after a base of at least three letters is crypto. Every Alpaca crypto base has at
-  least three letters, and no US equity ticker has six.
+  (``CRYPTO_QUOTES``, longest first) after a base of at least three letters is crypto. Every
+  Alpaca crypto base has at least three letters, and no US equity ticker has six.
 * One to five letters, optionally with a one- or two-letter share-class suffix (``BRK.B``,
   ``BF-B``), is a US equity - including ``USD``, an ETF named like a quote.
 * Everything else (an OCC option symbol, an empty or malformed string) is ``unknown``.
