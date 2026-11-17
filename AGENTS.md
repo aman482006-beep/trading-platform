@@ -13,7 +13,7 @@ Do NOT weaken, remove, bypass or rewrite a test just to achieve a passing result
 
 `scripts/gate-tests.sh` runs the checks whose silent failure would make a green result a lie (the import-origin guard, the output-path guard, the test-suite data-dir isolation guard, the runner's own tests, F-lint on the scripts that mutate data). It fails a gate that has no command and exits 2 when the roster does not match what ran. `PYTHON=... scripts/gate-tests.sh` picks the interpreter; `--list` prints the roster. It is a fast subset, not a replacement for the test suite; CI runs both.
 
-The suite never touches the repo's `data/`: `tests/conftest.py` forces `DATA_DIR`/`TRADING_DATA_DIR` to a per-process temp dir and fails the session if the repo `data/` changed. Tests must write under `tmp_path` or `DATA_DIR`, never a hardcoded `data/`.
+The suite never touches the repo's `data/`: `tests/conftest.py` forces `DATA_DIR`/`TRADING_DATA_DIR` to a per-process temp dir and fails the session if the repo `data/` changed. Tests must write under `tmp_path` or `DATA_DIR`, never a hardcoded `data/`. The guard watches only the time between session start and finish, and it cannot tell which process changed `data/`: stop a running viewer/daemon in the checkout, or run the suite from a separate checkout. Because `DATA_DIR` is now a throwaway directory, local dataset-backed strategy tests need an explicit read-only opt-in: `TP_TEST_OHLCV_DIR=/path/to/ohlcv` (otherwise they skip with a message naming this variable).
 
 ## Issues
 
