@@ -71,6 +71,12 @@ from live_runner.stockkit_routing import (
     resolve_deployment_stockkit_route,
     validate_stockkit_deployment_route,
 )
+from live_runner.trailing_stops import (
+    LiveTrailingStopManager,
+    adapter_live_trailing_modes,
+    run_trailing_stops_loop,
+    validate_adapter_trailing_timeframe,
+)
 from risk import RiskConfig, RiskEngine, TradeSignal
 from risk.live import (
     entry_deviation_sl_fraction,
@@ -114,7 +120,6 @@ from shared.models import (
 )
 from shared.sentry import capture_exception, initialize_sentry
 from shared.trailing import (
-    LIVE_SUPPORTED_TRAILING_MODES,
     TRAILING_SL_CONFIG_METADATA_KEY,
     validate_live_deployment_trailing_override,
     validate_trailing_sl_config,
@@ -235,6 +240,22 @@ def _adapter_is_demo(adapter: BaseLiveAdapter) -> bool:
         getattr(adapter, "demo", None) is True
         or getattr(adapter, "paper", None) is True
     )
+
+
+def _trailing_eligible_adapters(
+    adapters: Mapping[str, BaseLiveAdapter],
+) -> dict[str, BaseLiveAdapter]:
+    """Adapters whose broker-side stops the trailing loop (#167) may amend.
+
+    The same bar every order has to clear: connected, and provably
+    demo/paper. The real-money hard block therefore also covers stop
+    amendments, not only new orders.
+    """
+    return {
+        account_id: adapter
+        for account_id, adapter in list(adapters.items())
+        if _adapter_is_ready(adapter) and _adapter_is_demo(adapter)
+    }
 
 
 def _parse_bool_env(value: str | None, *, default: bool = True) -> bool:
@@ -792,6 +813,8 @@ def _build_processor_market_data(
 def _apply_signal_processor(
     signal: TradeSignal,
     deployment: LiveDeploymentConfig,
+    *,
+    adapter: BaseLiveAdapter | None = None,
 ) -> TradeSignal:
     processor_name = _deployment_signal_processor_name(deployment)
     if not processor_name:
@@ -817,13 +840,24 @@ def _apply_signal_processor(
     }
     processed = processor.process_signal(raw_signal=raw_signal, market_data=market_data)
     # #150 fail closed at signal time: a processed signal that asks for a
-    # trailing mode the live path cannot execute (live trailing does not
-    # exist yet, #167) is rejected here — the signal is not traded, instead
-    # of running with the requested trailing silently dropped. The caller
-    # logs the refusal and skips the signal.
+    # trailing mode the live path cannot execute through THIS adapter is
+    # rejected here — the signal is not traded, instead of running with the
+    # requested trailing silently dropped. Live support is per broker and
+    # needs the adapter's stop-amendment capability (#167); without an
+    # adapter only mode "none" passes. The caller logs the refusal and skips
+    # the signal.
     validate_trailing_sl_config(
         (processed.metadata or {}).get(TRAILING_SL_CONFIG_METADATA_KEY),
-        supported=LIVE_SUPPORTED_TRAILING_MODES,
+        supported=adapter_live_trailing_modes(adapter),
+        context=(
+            f"live deployment '{deployment.strategy_name}' ({deployment.id}) "
+            f"signal processor '{processor_name}'"
+        ),
+    )
+    validate_adapter_trailing_timeframe(
+        (processed.metadata or {}).get(TRAILING_SL_CONFIG_METADATA_KEY),
+        timeframe,
+        adapter=adapter,
         context=(
             f"live deployment '{deployment.strategy_name}' ({deployment.id}) "
             f"signal processor '{processor_name}'"
@@ -1841,14 +1875,21 @@ async def prepare_order_with_risk(
             signal,
             instruction=None if is_exit_intent(metadata) else FULL_EXIT,
         )
-    # #150 fail closed at the last chokepoint before the broker: the live path
-    # never trails (#167), so an entry signal carrying a trailing config its
-    # mode cannot satisfy here is refused — never submitted untrailed. This
-    # gate also covers signals that reach submission without a signal
-    # processor (the processor path is gated in _apply_signal_processor).
+    # #150 fail closed at the last chokepoint before the broker: an entry
+    # signal carrying a trailing config this adapter cannot execute (#167:
+    # per-broker table + the adapter's stop-amendment capability) is refused —
+    # never submitted untrailed. This gate also covers signals that reach
+    # submission without a signal processor (the processor path is gated in
+    # _apply_signal_processor).
     validate_trailing_sl_config(
         metadata.get(TRAILING_SL_CONFIG_METADATA_KEY),
-        supported=LIVE_SUPPORTED_TRAILING_MODES,
+        supported=adapter_live_trailing_modes(adapter),
+        context=f"live deployment '{deployment.strategy_name}' ({deployment.id}) order submission",
+    )
+    validate_adapter_trailing_timeframe(
+        metadata.get(TRAILING_SL_CONFIG_METADATA_KEY),
+        _deployment_signal_timeframe(deployment),
+        adapter=adapter,
         context=f"live deployment '{deployment.strategy_name}' ({deployment.id}) order submission",
     )
     # Feed broker truth into sizing so max_positions / max_total_exposure actually
@@ -2412,6 +2453,7 @@ async def _prepare_discord_signal_for_submission(
     *,
     signal_timeframe: str,
     wait_enabled: bool,
+    adapter: BaseLiveAdapter | None = None,
 ) -> TradeSignal | None:
     """Apply the pre-wait gates and, when enabled, the candle-close wait.
 
@@ -2465,7 +2507,9 @@ async def _prepare_discord_signal_for_submission(
             # Entry processors (ATR/SL/TP, BUY-only gates) shape entries. An exit
             # closes what exists; Nitro's BUY-only processor would refuse every
             # close on a Nitro deployment (#121).
-            normalized_signal = _apply_signal_processor(normalized_signal, deployment)
+            normalized_signal = _apply_signal_processor(
+                normalized_signal, deployment, adapter=adapter
+            )
     except ValueError as exc:
         logger.warning(
             "Signal processor rejected discord signal",
@@ -2553,6 +2597,7 @@ async def _submit_normalized_discord_signal(
         trade_signal,
         signal_timeframe=signal_timeframe,
         wait_enabled=wait_enabled,
+        adapter=adapter,
     )
     if prepared is None:
         return
@@ -4992,6 +5037,7 @@ async def sync_deployments_loop(
     *,
     accounts_env: Path = DEFAULT_ACCOUNTS_ENV,
     interval_seconds: int = DEPLOYMENT_POLL_INTERVAL_SECONDS,
+    deployment_snapshot: list[LiveDeploymentConfig] | None = None,
 ) -> None:
     known_deployment_statuses: dict[str, str] = {}
     # Seeded from the database, not empty. Every restart used to re-run cancel
@@ -5024,6 +5070,11 @@ async def sync_deployments_loop(
                 # selected credential signature actually changed.
                 _clear_discord_auth_blocked_accounts()
             accounts, deployments = await _load_db_accounts_and_deployments()
+            if deployment_snapshot is not None:
+                # Shared with the trailing-stop loop (#167) so it never has to
+                # query deployments itself. Replaced in place: the reader
+                # holds this same list object.
+                deployment_snapshot[:] = deployments
             validate_live_account_routes(accounts)
             changed_ctrader_account_ids = _refresh_ctrader_blocked_state_for_accounts(
                 accounts, accounts_env_values
@@ -5131,12 +5182,14 @@ async def run_daemon(
     await asyncio.to_thread(_recover_failed_services)
     await scheduler.start()
 
+    deployment_snapshot: list[LiveDeploymentConfig] = []
     sync_task = asyncio.create_task(
         sync_deployments_loop(
             active_adapters,
             active_listener_tasks,
             active_discord_tasks,
             accounts_env=accounts_env,
+            deployment_snapshot=deployment_snapshot,
         ),
         name="deployment-sync-loop",
     )
@@ -5150,11 +5203,21 @@ async def run_daemon(
         name="service-sync-loop",
     )
     balance_task = asyncio.create_task(_poll_balances(active_adapters), name="balance-poller")
+    trailing_task = asyncio.create_task(
+        run_trailing_stops_loop(
+            LiveTrailingStopManager(),
+            eligible_adapters=lambda: _trailing_eligible_adapters(active_adapters),
+            current_deployments=lambda: list(deployment_snapshot),
+        ),
+        name="trailing-stops-loop",
+    )
     commission_task = asyncio.create_task(
         _backfill_commissions_loop(active_adapters), name="commission-backfill"
     )
     try:
-        await asyncio.gather(sync_task, service_sync_task, balance_task, commission_task)
+        await asyncio.gather(
+            sync_task, service_sync_task, balance_task, trailing_task, commission_task
+        )
     except asyncio.CancelledError:
         logger.info("Live daemon cancelled")
         raise
@@ -5171,7 +5234,13 @@ async def run_daemon(
         # B2: cancel EVERYTHING (sync + balance loops leaked before) and
         # await the cancels — fire-and-forget cancel() leaves pending tasks
         # and "Task was destroyed" warnings behind.
-        for task in (sync_task, service_sync_task, balance_task, commission_task):
+        for task in (
+            sync_task,
+            service_sync_task,
+            balance_task,
+            trailing_task,
+            commission_task,
+        ):
             if not task.done():
                 task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -5179,6 +5248,7 @@ async def run_daemon(
                 sync_task,
                 service_sync_task,
                 balance_task,
+                trailing_task,
                 commission_task,
                 return_exceptions=True,
             )

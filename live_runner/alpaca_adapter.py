@@ -5,7 +5,7 @@ import inspect
 import math
 import os
 import re
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
 from typing import Any
@@ -13,7 +13,7 @@ from uuid import UUID
 
 import pandas as pd
 from alpaca.trading.enums import OrderClass
-from alpaca.trading.requests import StopLossRequest, TakeProfitRequest
+from alpaca.trading.requests import ReplaceOrderRequest, StopLossRequest, TakeProfitRequest
 
 from live_runner.alpaca_fees import (
     COMMISSION_BACKFILL_LOOKBACK,
@@ -29,6 +29,7 @@ from live_runner.base_adapter import (
     ControlOutcome,
     LivePipValue,
     LiveQuote,
+    ProtectiveStop,
     coerce_positive_live_qty,
     is_unbounded_tp,
     order_not_submitted,
@@ -67,6 +68,9 @@ _ALPACA_ACC_RE = re.compile(r"^ALPACA_API_KEY_ACC(?P<index>\d+)$")
 
 _SL_METADATA_KEYS = ("stop_loss", "sl_price", "stop_price", "resolved_stop_loss")
 _TP_METADATA_KEYS = ("take_profit", "tp_price")
+#: Newest orders requested per lookup of held bracket stop legs (Alpaca's maximum is 500).
+_ALPACA_HELD_LEG_LOOKUP_LIMIT = 500
+
 #: Alpaca rejects sub-penny prices: two decimals at or above $1, four below
 #: ("sub-penny increment does not fulfill minimum pricing criteria", HTTP 422).
 _ALPACA_TICK_AT_OR_ABOVE_ONE = Decimal("0.01")
@@ -209,6 +213,52 @@ def _order_symbol(order: Any) -> str:
 def _order_side(order: Any) -> str:
     """The order's side as ``buy``/``sell``, whether it arrives as an enum or a string."""
     return _enum_text(_order_attr(order, "side", ""))
+
+
+def _order_type(order: Any) -> str:
+    """The order's type (``stop``, ``limit``, ...), from an enum or a string."""
+    raw = _order_attr(order, "order_type", None)
+    if raw is None or raw == "":
+        raw = _order_attr(order, "type", "")
+    text = str(getattr(raw, "value", raw) or "").strip().lower()
+    return text.rsplit(".", 1)[-1]
+
+
+def _stop_candidates(order: Any) -> Iterator[Any]:
+    """Orders that may be a position's working stop: the order, and a filled parent's held legs.
+
+    A leg of a parent that has not filled belongs to a pending entry and protects nothing
+    that is open yet; amending it would leave the position unprotected while the log says
+    the stop was trailed. A dead (cancelled/filled/expired) leg is not a protection either.
+    """
+    yield order
+    if _order_status(order) != "filled":
+        return
+    for leg in _order_legs(order):
+        if _order_status(leg) == "held":
+            yield leg
+
+
+def _protective_stop_of(
+    candidate: Any, parent: Any, reducing_sides: Mapping[str, str]
+) -> ProtectiveStop | None:
+    symbol = _order_symbol(candidate) or _order_symbol(parent)
+    if not symbol or reducing_sides.get(symbol) != _order_side(candidate):
+        return None
+    if _order_type(candidate) != "stop":
+        return None
+    order_id = _control_order_id(_order_attr(candidate, "id"))
+    stop_price = _to_float(_order_attr(candidate, "stop_price", None), default=0.0)
+    if order_id is None or not math.isfinite(stop_price) or stop_price <= 0:
+        return None
+    qty = _to_float(_order_attr(candidate, "qty", None), default=0.0)
+    return ProtectiveStop(
+        order_id=order_id,
+        symbol=symbol,
+        side=_order_side(candidate),
+        stop_price=stop_price,
+        qty=qty if math.isfinite(qty) and qty > 0 else None,
+    )
 
 
 def _alpaca_timeframe(value: str):
@@ -683,6 +733,8 @@ def _alpaca_quote_asset(symbol: str) -> str:
 class AlpacaLiveAdapter(BaseLiveAdapter):
     """Live adapter for Alpaca trading + trade update streaming."""
 
+    broker_name = "alpaca"
+
     def __init__(
         self,
         *,
@@ -723,6 +775,9 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         # NEW stream — a silent mute after disconnect/reconnect).
         self._subscribed_stream: Any | None = None
         self._connected = False
+        # #167: serialises stop amendments with the sweeps that cancel orders
+        # (see `_order_book_lock`). Bound to the loop that first uses it.
+        self._order_book_lock_state: tuple[asyncio.AbstractEventLoop, asyncio.Lock] | None = None
 
         if not self.api_key or not self.secret_key:
             raise ValueError(
@@ -1725,6 +1780,22 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             raise RuntimeError("Alpaca trading client is unavailable after connect.")
         return client
 
+    def _order_book_lock(self) -> asyncio.Lock:
+        """Lock held while this adapter replaces or cancels protective orders (#167).
+
+        A trailing-stop replace gives the stop a new order id. Without the lock it could land
+        between a sweep's order listing and its cancels: the sweep would then try to cancel the
+        replaced id and miss the new one, which could survive a flatten as an orphaned stop
+        (an orphaned sell stop opens a short). Holding one lock for the replace and for every
+        sweep makes each sweep see either the old stop or the new one, never a half-state.
+        """
+        loop = asyncio.get_running_loop()
+        state = getattr(self, "_order_book_lock_state", None)
+        if state is None or state[0] is not loop:
+            state = (loop, asyncio.Lock())
+            self._order_book_lock_state = state
+        return state[1]
+
     #: Alpaca's maximum page size for the orders listing (its default is 50).
     _OPEN_ORDERS_LIMIT = 500
 
@@ -1855,6 +1926,11 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         await asyncio.to_thread(cancel, order_id)
 
     async def cancel_open_orders(self) -> ControlOutcome:
+        """Cancel exposure-opening orders; see :meth:`_cancel_open_orders_locked`."""
+        async with self._order_book_lock():
+            return await self._cancel_open_orders_locked()
+
+    async def _cancel_open_orders_locked(self) -> ControlOutcome:
         """Cancel working orders that could open or extend exposure.
 
         SL/TP legs on a live position are deliberately left alone: the flatten
@@ -2116,6 +2192,13 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         return reason
 
     async def _flatten_symbol(self, client: Any, symbol: str, qty: float) -> str | None:
+        """Flatten one symbol; see :meth:`_flatten_symbol_locked`."""
+        async with self._order_book_lock():
+            return await self._flatten_symbol_locked(client, symbol, qty)
+
+    async def _flatten_symbol_locked(
+        self, client: Any, symbol: str, qty: float
+    ) -> str | None:
         """Cancel this symbol's working orders, then close its position.
 
         Returns ``None`` on success, or a short reason for the failure.
@@ -2250,6 +2333,11 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         )
 
     async def cancel_orphaned_protections(self) -> ControlOutcome:
+        """Cancel orders on flat symbols; see :meth:`_cancel_orphaned_protections_locked`."""
+        async with self._order_book_lock():
+            return await self._cancel_orphaned_protections_locked()
+
+    async def _cancel_orphaned_protections_locked(self) -> ControlOutcome:
         """Cancel working orders left on symbols with no open position.
 
         Called after a successful flatten, when every symbol is flat: what
@@ -2284,6 +2372,142 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             completed=completed,
             unidentified=tuple(unidentified),
             failed=tuple(failed),
+        )
+
+    # ── Stop amendment (live trailing stops, issue #167) ──────────────────────────────────────
+    #
+    # Alpaca's order replace (PATCH /v2/orders/{id}) is atomic from the position's point of
+    # view: the original order keeps working until the replacement is accepted, and stays in
+    # force when the replace is refused. That is what makes the capability safe to declare -
+    # the stop is never cancelled by this adapter in order to move it. The replace holds
+    # `_order_book_lock`, like every sweep that cancels orders, so a flatten never races it.
+
+    @property
+    def supports_stop_amendment(self) -> bool:
+        return True
+
+    def supports_market_data_timeframe(self, timeframe: str) -> bool:
+        """Whether :meth:`get_market_data` can serve ``timeframe`` (no retry can change that)."""
+        try:
+            _alpaca_timeframe(timeframe)
+        except ValueError:
+            return False
+        return True
+
+    async def list_protective_stops(self) -> list[ProtectiveStop]:
+        """Working plain stop orders on the reducing side of each open position.
+
+        Only ``stop`` orders count. A stop-limit or a broker-native trailing stop is not
+        something a ``stop_price`` replace can move safely, so it is not offered for
+        amendment; the caller then reports the position as having no amendable stop.
+        """
+        client = await self._require_trading_client()
+        reducing_sides = await self._protection_sides_by_symbol()
+        if not reducing_sides:
+            return []
+        orders = await self._list_open_orders(client)
+        orders.extend(await self._list_filled_parents_with_held_legs(client, set(reducing_sides)))
+        stops: dict[str, ProtectiveStop] = {}
+        for order in orders:
+            for candidate in _stop_candidates(order):
+                stop = _protective_stop_of(candidate, order, reducing_sides)
+                if stop is not None:
+                    stops[stop.order_id] = stop
+        return list(stops.values())
+
+    async def _list_filled_parents_with_held_legs(
+        self, client: Any, symbols: set[str]
+    ) -> list[Any]:
+        """Filled bracket parents whose stop leg is still ``held``.
+
+        Observed on Alpaca paper (2026-11-16): once a bracket entry fills, the stop leg
+        stays ``held`` and is absent from every ``status=open`` listing, nested or flat.
+        It is only reachable as a leg of the filled parent in a ``status=all`` listing,
+        and it can be replaced like any working stop. Only parents of symbols with an
+        open position are requested. A failure to list is not swallowed: a missing stop
+        would be reported as "no stop" for a position that does have one.
+        """
+        get_orders = getattr(client, "get_orders", None)
+        if not symbols or not callable(get_orders):
+            return []
+        from alpaca.trading.enums import QueryOrderStatus
+        from alpaca.trading.requests import GetOrdersRequest
+
+        request = GetOrdersRequest(
+            status=QueryOrderStatus.ALL,
+            symbols=sorted(symbols),
+            nested=True,
+            limit=_ALPACA_HELD_LEG_LOOKUP_LIMIT,
+        )
+        result = await asyncio.to_thread(get_orders, filter=request)
+        if not isinstance(result, (list, tuple)):
+            raise RuntimeError(
+                f"Alpaca order list has an unrecognised shape ({type(result).__name__}); "
+                "refusing to report a clean sweep"
+            )
+        if len(result) >= _ALPACA_HELD_LEG_LOOKUP_LIMIT:
+            # The listing is newest-first: a full page may have cut off the filled parent
+            # that owns the held stop leg, and "no stop" would then be a lie.
+            raise RuntimeError(
+                f"Alpaca returned {len(result)} orders, the page limit; "
+                "refusing to treat the list as complete"
+            )
+        return [
+            order
+            for order in result
+            if _order_status(order) == "filled"
+            and any(_order_status(leg) == "held" for leg in _order_legs(order))
+        ]
+
+    def round_stop_price(self, stop: ProtectiveStop, price: float) -> float:
+        value = float(price)
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(
+                f"Invalid stop price for {stop.symbol}: {price!r}; refusing to amend."
+            )
+        tick = _ALPACA_TICK_AT_OR_ABOVE_ONE if value >= 1.0 else _ALPACA_TICK_BELOW_ONE
+        # Away from the market: never tighter than the computed stop.
+        rounding = ROUND_FLOOR if stop.side == "sell" else ROUND_CEILING
+        # Float noise is removed first (101.96999999999998 is 101.97): flooring
+        # the raw float would otherwise give away a whole tick to a rounding
+        # artefact of the stop arithmetic.
+        rounded = float(Decimal(repr(round(value, 8))).quantize(tick, rounding=rounding))
+        if rounded <= 0:
+            raise ValueError(
+                f"Stop price for {stop.symbol} rounds to {rounded!r}; refusing to amend."
+            )
+        return rounded
+
+    async def amend_protective_stop(
+        self, stop: ProtectiveStop, new_stop_price: float
+    ) -> ProtectiveStop:
+        price = self.round_stop_price(stop, new_stop_price)
+        client = await self._require_trading_client()
+        replace = getattr(client, "replace_order_by_id", None)
+        if not callable(replace):
+            raise RuntimeError("Alpaca client cannot replace an order by id")
+        async with self._order_book_lock():
+            replaced = await asyncio.to_thread(
+                replace, stop.order_id, order_data=ReplaceOrderRequest(stop_price=price)
+            )
+        new_order_id = _control_order_id(_order_attr(replaced, "id"))
+        confirmed_price = _to_float(_order_attr(replaced, "stop_price", None), default=0.0)
+        if new_order_id is None or not math.isclose(
+            confirmed_price, price, rel_tol=0.0, abs_tol=1e-9
+        ):
+            # Not a confirmed amendment. The broker's own state decides what is in force; the
+            # caller re-reads it on its next pass instead of trusting this response.
+            raise RuntimeError(
+                f"Alpaca did not confirm the stop replacement for {stop.symbol} "
+                f"(order_id={new_order_id!r}, stop_price={confirmed_price!r}, "
+                f"requested={price!r})"
+            )
+        return ProtectiveStop(
+            order_id=new_order_id,
+            symbol=stop.symbol,
+            side=stop.side,
+            stop_price=confirmed_price,
+            qty=stop.qty,
         )
 
     async def get_positions(self) -> list[dict[str, Any]]:
