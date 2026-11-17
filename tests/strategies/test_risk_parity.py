@@ -896,3 +896,42 @@ def test_rebalance_value_equals_the_equity_curve_at_every_rebalance(monkeypatch)
     assert len(by_day) >= 3
     for day, value in by_day.items():
         assert value == pytest.approx(float(curve.loc[day]), rel=1e-6)
+
+
+def _flat_price_history(periods: int = 400) -> pd.DataFrame:
+    idx = pd.bdate_range("2015-08-04", periods=periods)
+    base = np.linspace(100.0, 110.0, periods)
+    return pd.DataFrame({t: base + i for i, t in enumerate(TICKERS)}, index=idx)
+
+
+def test_run_backtest_names_a_ticker_with_no_usable_close():
+    """An all-NaN column used to empty the return index and die on a bare IndexError."""
+    prices = _flat_price_history()
+    prices[TICKERS[-1]] = np.nan
+    with pytest.raises(ValueError, match=f"No usable close prices for {TICKERS[-1]}"):
+        run_backtest(start_date="2016-01-01", end_date="2016-06-01", prices=prices)
+
+
+def test_price_returns_logs_dropped_bars_with_count_and_range(caplog):
+    from scripts.run_risk_parity_backtest import _price_returns
+
+    prices = _flat_price_history(periods=20)
+    prices.iloc[5, 0] = np.nan  # one missing close drops bar 5 and the bar after it (pct_change)
+    with caplog.at_level("WARNING"):
+        returns = _price_returns(prices)
+    assert len(returns) == len(prices) - 1 - 2
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert "Dropped 2 return bars" in warnings[0]
+    assert str(prices.index[5].date()) in warnings[0]
+    assert str(prices.index[6].date()) in warnings[0]
+
+
+def test_price_returns_is_silent_on_complete_prices(caplog):
+    from scripts.run_risk_parity_backtest import _price_returns
+
+    prices = _flat_price_history(periods=20)
+    with caplog.at_level("WARNING"):
+        returns = _price_returns(prices)
+    assert len(returns) == len(prices) - 1
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]

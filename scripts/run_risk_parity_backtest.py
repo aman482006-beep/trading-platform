@@ -496,6 +496,38 @@ def _portfolio_performance_stats(
     }
 
 
+def _price_returns(prices: pd.DataFrame) -> pd.DataFrame:
+    """Daily returns on the bars where every ticker has a close, in ``TICKERS`` order.
+
+    ``fill_method=None``: a missing close drops that bar (and the next) from the return
+    index instead of being forward-filled into a fake 0% return. pandas 3 behaves this way
+    by default; pandas 2.x forward-fills, so pin it for both.
+
+    Refuses (``ValueError`` naming the ticker) a ticker with no usable close at all: otherwise
+    every bar is dropped and the backtest dies later on an empty return index. Logs a WARNING
+    with the count and date range of dropped bars, so a gap in the data is visible in the run.
+    """
+    for ticker in TICKERS:
+        if prices[ticker].notna().sum() == 0:
+            raise ValueError(
+                f"No usable close prices for {ticker} in the price history "
+                f"({prices.index[0].date()}..{prices.index[-1].date()}): every bar is NaN, "
+                "so no return bars can be formed"
+            )
+    raw = prices.pct_change(fill_method=None)
+    # The first row has no prior close by construction; it is not a dropped bar.
+    dropped_dates = raw.index[1:][raw.iloc[1:].isna().any(axis=1).to_numpy()]
+    if len(dropped_dates):
+        logger.warning(
+            "Dropped %d return bars with a missing close, %s to %s "
+            "(a missing close also drops the bar after it)",
+            len(dropped_dates),
+            dropped_dates[0].date(),
+            dropped_dates[-1].date(),
+        )
+    return raw.dropna()[TICKERS]
+
+
 def run_backtest(
     start_date: str = "2016-01-01",
     end_date: str = "2024-12-31",
@@ -530,11 +562,7 @@ def run_backtest(
         )
     if not 0 <= warm_up_days < len(prices):
         raise ValueError("warm_up_days must be non-negative and less than the number of price rows")
-    # ``fill_method=None``: a missing close drops that bar (and the next) from the return
-    # index instead of being forward-filled into a fake 0% return. pandas 3 behaves this way
-    # by default; pandas 2.x forward-fills, so pin it for both.
-    returns = prices.pct_change(fill_method=None).dropna()
-    returns = returns[TICKERS]  # ensure column order
+    returns = _price_returns(prices)
 
     lookback_corr = 120
     target_vol = 0.10
