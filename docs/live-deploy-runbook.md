@@ -8,6 +8,12 @@ Status: credential-gated as of 2026-07-13.
 - Alpaca account blocks `ACC1..3` (Nitro, RamJet, RocketFuel) contain paper endpoints only; IDs werden aus `.accounts.env` aufgeloest, nicht hier dokumentiert.
 - Discord bot tokens and channel IDs are set for Nitro, RamJet, and RocketFuel.
 - cTrader credentials are demo credentials if the cTrader smoke is run.
+- Trailing stops are not executed live yet (#167). A deployment whose
+  `signal_config.signal_processor_config.trailing_mode` is anything other than `none` is rejected
+  when it is created or parsed from YAML. A stored deployment that already has such a value still
+  loads (so it stays listed and can be stopped), the daemon logs an error for it at load, and each
+  of its signals is refused before it reaches the broker. See `shared/trailing.py` and
+  `docs/signal_bots.md`.
 
 ## Provisioning and Rotation
 
@@ -66,6 +72,39 @@ uv run python -m live_runner.preflight --config live_deployments.yaml --accounts
 uv run python scripts/live_smoke.py --mode discord-replay --reports-dir docs/reports
 ```
 
+The preflight prints exactly one JSON document on stdout (parseable with `jq`); its log lines go to stderr.
+
+`${VAR}` references in the deployment file expand here with the precedence every
+other live_runner component resolves configuration with: a key defined in
+`--accounts-env` wins - and a key present there but empty stays empty, so
+blanking it disables it - while the process environment fills only keys the file
+does not define. A reference that resolves nowhere fails the preflight and names
+the variable, so a literal `${...}` never reaches the daemon. Credentials
+themselves resolve from the file only, so a credential that exists only in the
+process environment is reported as missing rather than borrowed; aligning that
+with the daemon's env-filled credential resolution is an open decision, not a
+bug.
+
+An accounts env file that exists but cannot be read logs a warning and fails the
+preflight with missing credentials. A config that fails to parse or validate is
+reported, not crashed on: `deployment_errors` names the error type and the
+offending field, and never an expanded value - that value can be a credential,
+and `deployment_errors` is printed as JSON. This holds for every exception raised
+while parsing, not only validation errors. A YAML syntax error reports its
+problem and its line and column, never the source line, which can hold a literal
+secret. Redaction covers the values of every accounts env file key and every
+process-env key the config references through `${VAR}` or `$VAR`, so a secret
+that only lives in the process environment is reported as `${VAR}` too. Process-env
+keys the config never names are not redacted. The cTrader `CTRADER_DEMO` error,
+which quotes the rejected value, is redacted the same way: every accounts env file
+value is redacted there. A missing or unreadable config file is the one case that
+still crashes: the JSON document names the path, and the traceback goes to stderr
+and the log at ERROR. That traceback, like the JSON document, is redacted with
+every accounts env file value and every process-env value, because the config is
+not re-read after a crash and its references are unknown. Only the exception type
+remains in the JSON if the accounts env file cannot be resolved at all, and then
+no traceback is printed.
+
 ## Paper Broker Smoke
 
 For Alpaca smoke, first verify every Alpaca account resolves with `paper=True`.
@@ -75,6 +114,16 @@ For cTrader smoke, verify the configured cTrader credentials are demo credential
 uv run python scripts/live_smoke.py --mode alpaca --accounts-env .accounts.env --reports-dir docs/reports
 uv run python scripts/live_smoke.py --mode ctrader --accounts-env .accounts.env --reports-dir docs/reports
 ```
+
+Both cTrader smoke order paths - the order worker (`--mode ctrader-order-worker`) and the
+strategy-e2e worker (`--mode ctrader-e2e-worker`) - anchor on a live price (the close of the latest
+M1 trendbar) with a real stop-loss and take-profit 0.5 % away. Each fails with a clear message when
+the market is closed (no M1 bar in the last 30 minutes) rather than building an order on an
+invented price.
+
+The cTrader smoke registers the demo account in `live_accounts` if it is not there yet (a fresh
+database), because its parent deployment row has a foreign key to it. An account that already
+exists is left untouched.
 
 ## Demo Daemon
 

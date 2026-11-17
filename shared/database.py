@@ -43,6 +43,7 @@ from shared.logging import get_logger
 from shared.models import (
     PRICE_DERIVED,
     PRICE_DERIVED_UNAVAILABLE,
+    STORED_ROW_CONTEXT,
     BacktestMeta,
     BacktestResult,
     IndicatorSeries,
@@ -611,6 +612,16 @@ class LiveSignalModel(SQLModel, table=True):
         discord_msg_id = _normalize_optional_id(signal.metadata.get("discord_message_id"))
         broker_order_id = _normalize_optional_id(signal.metadata.get("broker_order_id")) or ""
         idempotency_key = _normalize_optional_id(signal.metadata.get("idempotency_key"))
+        metadata = dict(signal.metadata)
+        if BROKER_ORDER_CONFLICTS_KEY in metadata:
+            # The conflict ledger is the only writer of this key; a producer must not be able
+            # to pre-seed or forge the list of untracked broker orders.
+            logger.warning(
+                "Dropping producer-supplied %s from live signal metadata (signal_id=%s)",
+                BROKER_ORDER_CONFLICTS_KEY,
+                signal.id,
+            )
+            del metadata[BROKER_ORDER_CONFLICTS_KEY]
 
         return cls(
             id=str(signal.id),
@@ -627,7 +638,7 @@ class LiveSignalModel(SQLModel, table=True):
             broker_order_id=broker_order_id or "",
             discord_message_id=discord_msg_id,
             idempotency_key=idempotency_key,
-            metadata_json=signal.metadata,
+            metadata_json=metadata,
         )
 
     def to_live_signal(self) -> LiveSignal:
@@ -948,20 +959,30 @@ class LiveDeploymentModel(SQLModel, table=True):
     def to_live_deployment(self) -> LiveDeploymentConfig:
         source_type = str(self.signal_source_type or self.signal_source or "internal").lower()
         source_name = str(self.signal_source or source_type or "internal").lower()
-        return LiveDeploymentConfig(
-            id=self.id,
-            strategy_name=self.strategy_name,
-            account_id=self.account_id,
-            symbols=self.symbols_json or [],
-            timeframe=self.timeframe,
-            status=self.status,
-            stopped_enforced_at=self.stopped_enforced_at,
-            signal_source_type=source_type if source_type in {"internal", "discord"} else "internal",
-            signal_source_id=str(self.signal_source_id or "").strip() or None,
-            symbol_filter=normalize_symbols(self.symbol_filter_json),
-            signal_source=source_name if source_name in {"internal", "discord"} else "internal",
-            signal_config=self.signal_config_json or {},
-            settings=self.settings_json or {},
+        # Rehydrating a stored row must not raise on the write-path trailing
+        # check: one bad row would otherwise break every deployment listing.
+        # See STORED_ROW_CONTEXT in shared/models.py.
+        return LiveDeploymentConfig.model_validate(
+            {
+                "id": self.id,
+                "strategy_name": self.strategy_name,
+                "account_id": self.account_id,
+                "symbols": self.symbols_json or [],
+                "timeframe": self.timeframe,
+                "status": self.status,
+                "stopped_enforced_at": self.stopped_enforced_at,
+                "signal_source_type": (
+                    source_type if source_type in {"internal", "discord"} else "internal"
+                ),
+                "signal_source_id": str(self.signal_source_id or "").strip() or None,
+                "symbol_filter": normalize_symbols(self.symbol_filter_json),
+                "signal_source": (
+                    source_name if source_name in {"internal", "discord"} else "internal"
+                ),
+                "signal_config": self.signal_config_json or {},
+                "settings": self.settings_json or {},
+            },
+            context={STORED_ROW_CONTEXT: True},
         )
 
 
@@ -2368,10 +2389,35 @@ def _find_existing_live_signal_by_idempotency_key(
     ).first()
 
 
+# metadata_json key holding broker order ids that conflicted with a signal's tracked id.
+# Reserved for the conflict ledger: producer-supplied values under this key are dropped.
+BROKER_ORDER_CONFLICTS_KEY = "conflicting_broker_order_ids"
+
+
+def _conflicting_broker_order_ids(metadata: Mapping[str, Any]) -> list[str]:
+    """Return the recorded conflicting ids, tolerating any malformed stored shape."""
+    raw = metadata.get(BROKER_ORDER_CONFLICTS_KEY)
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        logger.warning(
+            "Ignoring malformed %s on live signal metadata (type=%s)",
+            BROKER_ORDER_CONFLICTS_KEY,
+            type(raw).__name__,
+        )
+        return []
+    return [str(item).strip() for item in raw if str(item).strip()]
+
+
 def _reconcile_existing_live_signal(
     session: Session, existing: LiveSignalModel, record: LiveSignalModel
 ) -> None:
-    """Backfill broker_order_id onto an existing duplicate signal."""
+    """Reconcile a duplicate delivery onto the stored signal and commit.
+
+    Backfills ``broker_order_id`` when the stored row lacks one, and records a different
+    broker order id carried by the duplicate in the conflict list
+    (``conflicting_broker_order_ids``) instead of replacing the tracked id.
+    """
     # Reconcile broker_order_id: if existing lacks it but new record has it, update
     new_broker_id = (record.broker_order_id or "").strip()
     existing_broker_id = (existing.broker_order_id or "").strip()
@@ -2388,9 +2434,30 @@ def _reconcile_existing_live_signal(
             record.discord_message_id,
         )
     elif new_broker_id and existing_broker_id and new_broker_id != existing_broker_id:
-        logger.warning(
-            "Conflicting broker_order_id for duplicate live signal (signal_id=%s)",
+        # A second, different broker order id for one logical signal: either a second broker
+        # order was placed or the ids were mapped wrongly. Either way a broker order may exist
+        # that the ledger does not track. The stored id is kept (never overwritten), but the
+        # conflicting id is persisted on the signal so operators and reconciliation can find
+        # and resolve it instead of it living only in a log line (issue #126).
+        # Take the write lock before reading the list: the copy loaded earlier in this session
+        # may be stale, and a concurrent duplicate must not commit between our read and write.
+        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        session.refresh(existing)
+        metadata = dict(existing.metadata_json or {})
+        conflicts = _conflicting_broker_order_ids(metadata)
+        if new_broker_id not in conflicts:
+            conflicts.append(new_broker_id)
+            metadata[BROKER_ORDER_CONFLICTS_KEY] = conflicts
+            existing.metadata_json = metadata
+            session.add(existing)
+        # Ends the write transaction opened above; a no-op commit when nothing changed.
+        session.commit()
+        logger.error(
+            "Conflicting broker_order_id for duplicate live signal: an untracked broker "
+            "order may exist (signal_id=%s, tracked=%s, conflicting=%s)",
             existing.id,
+            existing_broker_id,
+            new_broker_id,
         )
         return
     else:
@@ -2471,6 +2538,9 @@ def save_live_signal(signal: LiveSignal) -> tuple[str, bool]:
                 "Skipping concurrent duplicate live signal (discord_message_id=%s)",
                 discord_msg_id,
             )
+            # The loser may carry a broker id the winner lacks or contradicts; record it the
+            # same way as a sequential duplicate instead of dropping it.
+            _reconcile_existing_live_signal(session, existing, record)
             return str(existing.id), False
     return record_id, True
 
@@ -2985,6 +3055,230 @@ def get_live_signal_filled_qty(signal_id: str) -> float:
     return float(filled_qty or 0.0)
 
 
+def get_live_deployment_net_filled_qty(deployment_id: str, symbol: str) -> float:
+    """The deployment's own signed net filled quantity for ``symbol`` (#121).
+
+    This is the ledger an exit signal closes against: buy fills count positive,
+    sell fills negative, summed over every signal *this* deployment persisted for
+    the symbol. Another deployment's fills on the same (netted) broker position
+    are not included, so an exit closes only this deployment's share.
+
+    Only fills attributed to one of the deployment's own signals are counted.
+    Fills of broker-side child orders that are not persisted against a signal
+    (for example a bracket's SL/TP leg) are not in the ledger; callers cap the
+    result at the broker position for that reason.
+
+    Fails closed on a stored action other than buy/sell rather than guessing its
+    sign.
+    """
+    normalized_deployment_id = str(deployment_id or "").strip()
+    normalized_symbol = str(symbol or "").strip().upper()
+    if not normalized_deployment_id or not normalized_symbol:
+        raise ValueError("A deployment id and a symbol are required for the ledger quantity")
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            select(
+                LiveSignalModel.action,
+                func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0),
+            )
+            .join(LiveExecutionModel, LiveExecutionModel.signal_id == LiveSignalModel.id)
+            .where(LiveSignalModel.deployment_id == normalized_deployment_id)
+            .where(func.upper(LiveSignalModel.symbol) == normalized_symbol)
+            .group_by(LiveSignalModel.action)
+        ).all()
+    net = 0.0
+    for action, filled in rows:
+        normalized_action = str(action or "").strip().lower()
+        quantity = float(filled or 0.0)
+        if normalized_action == "buy":
+            net += quantity
+        elif normalized_action == "sell":
+            net -= quantity
+        else:
+            raise ValueError(
+                f"Live signal action {action!r} for deployment {normalized_deployment_id} "
+                f"({normalized_symbol}) has no known position sign; refusing to size an exit."
+            )
+    return net
+
+
+def get_account_net_filled_qty_by_deployment(account_id: str, symbol: str) -> dict[str, float]:
+    """Every deployment's signed net filled quantity for ``symbol`` on one account.
+
+    The ledger of each deployment whose ``account_id`` is ``account_id``, whatever
+    its status (a stopped deployment's holdings are still at the broker), as in
+    :func:`get_live_deployment_net_filled_qty`. Deployments without fills for the
+    symbol are absent. An exit compares the sum with the broker position before
+    trusting any one deployment's share of it (#121).
+
+    Fails closed on a stored action other than buy/sell.
+    """
+    normalized_account_id = str(account_id or "").strip()
+    normalized_symbol = str(symbol or "").strip().upper()
+    if not normalized_account_id or not normalized_symbol:
+        raise ValueError("An account id and a symbol are required for the account ledger")
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            select(
+                LiveSignalModel.deployment_id,
+                LiveSignalModel.action,
+                func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0),
+            )
+            .join(LiveExecutionModel, LiveExecutionModel.signal_id == LiveSignalModel.id)
+            .join(LiveDeploymentModel, LiveDeploymentModel.id == LiveSignalModel.deployment_id)
+            .where(LiveDeploymentModel.account_id == normalized_account_id)
+            .where(func.upper(LiveSignalModel.symbol) == normalized_symbol)
+            .group_by(LiveSignalModel.deployment_id, LiveSignalModel.action)
+        ).all()
+    ledgers: dict[str, float] = {}
+    for deployment_id, action, filled in rows:
+        normalized_action = str(action or "").strip().lower()
+        quantity = float(filled or 0.0)
+        if normalized_action == "buy":
+            signed = quantity
+        elif normalized_action == "sell":
+            signed = -quantity
+        else:
+            raise ValueError(
+                f"Live signal action {action!r} for deployment {deployment_id} "
+                f"({normalized_symbol}) has no known position sign; refusing to size an exit."
+            )
+        key = str(deployment_id)
+        ledgers[key] = ledgers.get(key, 0.0) + signed
+    return ledgers
+
+
+#: A filled quantity this close to the requested one counts as fully filled.
+_EXIT_FILL_TOLERANCE = 1e-9
+
+
+def list_live_deployment_unfilled_exit_orders(
+    deployment_id: str, symbol: str
+) -> list[dict[str, Any]]:
+    """This deployment's exit orders for ``symbol`` not known to be fully filled.
+
+    An exit order is a persisted signal whose metadata carries
+    ``risk_sizing_mode == "exit_only"``. It is listed unless its persisted fills
+    reach the quantity it asked for; one without a readable requested quantity
+    is listed too, because it cannot be shown to be done. Whether a listed order
+    is still *working* is the broker's to say - a cancelled or rejected one is
+    listed here as well (#121).
+
+    Each row: ``signal_id``, ``deployment_id``, ``broker_order_id`` (may be
+    empty), ``requested_qty`` (``None`` when unreadable), ``filled_qty`` and
+    ``action`` (``buy``/``sell``, the side the order closes).
+    """
+    normalized_deployment_id = str(deployment_id or "").strip()
+    normalized_symbol = str(symbol or "").strip().upper()
+    if not normalized_deployment_id or not normalized_symbol:
+        raise ValueError("A deployment id and a symbol are required for pending exits")
+    return _list_unfilled_exit_orders(
+        normalized_symbol, deployment_id=normalized_deployment_id
+    )
+
+
+def list_account_unfilled_exit_orders(
+    account_id: str, symbol: str, *, exclude_deployment_id: str | None = None
+) -> list[dict[str, Any]]:
+    """Exit orders for ``symbol`` of every deployment on one account not known to be filled.
+
+    Same rows and meaning as :func:`list_live_deployment_unfilled_exit_orders`,
+    across all deployments whose ``account_id`` is ``account_id`` (whatever their
+    status), optionally leaving out one deployment. Deployments on one account
+    share a netted broker position, so an exit of one is in flight for all of
+    them (#121).
+    """
+    normalized_account_id = str(account_id or "").strip()
+    normalized_symbol = str(symbol or "").strip().upper()
+    if not normalized_account_id or not normalized_symbol:
+        raise ValueError("An account id and a symbol are required for pending exits")
+    return _list_unfilled_exit_orders(
+        normalized_symbol,
+        account_id=normalized_account_id,
+        exclude_deployment_id=str(exclude_deployment_id or "").strip() or None,
+    )
+
+
+def _list_unfilled_exit_orders(
+    normalized_symbol: str,
+    *,
+    deployment_id: str | None = None,
+    account_id: str | None = None,
+    exclude_deployment_id: str | None = None,
+) -> list[dict[str, Any]]:
+    # Lazy: keeps shared/ free of an import-time dependency on live_runner.
+    from live_runner.base_adapter import EXIT_ONLY_RISK_SIZING_MODE
+
+    init_db()
+    with get_session() as session:
+        # Two queries rather than one grouped join: grouping by a JSON column is
+        # not portable across database dialects.
+        signal_query = (
+            select(
+                LiveSignalModel.id,
+                LiveSignalModel.deployment_id,
+                LiveSignalModel.broker_order_id,
+                LiveSignalModel.metadata_json,
+                LiveSignalModel.action,
+            )
+            .where(func.upper(LiveSignalModel.symbol) == normalized_symbol)
+        )
+        fill_query = (
+            select(
+                LiveExecutionModel.signal_id,
+                func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0),
+            )
+            .join(LiveSignalModel, LiveExecutionModel.signal_id == LiveSignalModel.id)
+            .where(func.upper(LiveSignalModel.symbol) == normalized_symbol)
+            .group_by(LiveExecutionModel.signal_id)
+        )
+        if deployment_id is not None:
+            signal_query = signal_query.where(LiveSignalModel.deployment_id == deployment_id)
+            fill_query = fill_query.where(LiveSignalModel.deployment_id == deployment_id)
+        if account_id is not None:
+            signal_query = signal_query.join(
+                LiveDeploymentModel, LiveDeploymentModel.id == LiveSignalModel.deployment_id
+            ).where(LiveDeploymentModel.account_id == account_id)
+            fill_query = fill_query.join(
+                LiveDeploymentModel, LiveDeploymentModel.id == LiveSignalModel.deployment_id
+            ).where(LiveDeploymentModel.account_id == account_id)
+        if exclude_deployment_id is not None:
+            signal_query = signal_query.where(
+                LiveSignalModel.deployment_id != exclude_deployment_id
+            )
+            fill_query = fill_query.where(LiveSignalModel.deployment_id != exclude_deployment_id)
+        signals = session.exec(signal_query).all()
+        fills = dict(session.exec(fill_query).all())
+    pending: list[dict[str, Any]] = []
+    for signal_id, signal_deployment_id, broker_order_id, metadata, action in signals:
+        metadata = metadata if isinstance(metadata, dict) else {}
+        if str(metadata.get("risk_sizing_mode") or "") != EXIT_ONLY_RISK_SIZING_MODE:
+            continue
+        filled_qty = float(fills.get(signal_id) or 0.0)
+        requested_qty: float | None
+        try:
+            requested_qty = abs(float(metadata.get("explicit_qty", metadata.get("qty"))))
+        except (TypeError, ValueError):
+            requested_qty = None
+        if requested_qty is not None and not math.isfinite(requested_qty):
+            requested_qty = None
+        if requested_qty is not None and filled_qty >= requested_qty - _EXIT_FILL_TOLERANCE:
+            continue
+        pending.append(
+            {
+                "signal_id": str(signal_id),
+                "deployment_id": str(signal_deployment_id),
+                "broker_order_id": str(broker_order_id or ""),
+                "requested_qty": requested_qty,
+                "filled_qty": filled_qty,
+                "action": str(action or "").strip().lower(),
+            }
+        )
+    return pending
+
+
 def set_live_signal_broker_order_id(signal_id: str, broker_order_id: str) -> bool:
     """Persist the broker order id on a signal right after submission (crash recovery)."""
     normalized_signal_id = str(signal_id or "").strip()
@@ -3036,6 +3330,47 @@ def get_live_signal_metadata(signal_id: str) -> dict[str, Any] | None:
             return None
         metadata = dict(record.metadata_json or {})
     return metadata
+
+
+def list_live_signal_broker_order_conflicts(limit: int = 200) -> list[dict[str, Any]]:
+    """Signals whose duplicate delivery carried a different broker order id.
+
+    Each row is a potentially untracked broker order: ``conflicting_broker_order_ids``
+    should be checked against the broker's open orders and positions.
+    """
+    init_db()
+    # Filter and cap in SQL so only conflicted rows are returned (the scan itself is still a
+    # full table scan; there is no index on the JSON key). The two-argument form of
+    # json_array_length reads the key inside the stored document: it is 0 for any non-array
+    # value (a string, number or object under the key) and NULL when the key is absent, so
+    # only signals holding a non-empty list pass. Unwrapping the value first with
+    # json_extract would hand a stored string to json_array_length as JSON text and raise
+    # "malformed JSON" for the whole query.
+    conflict_count = func.json_array_length(
+        LiveSignalModel.metadata_json, f"$.{BROKER_ORDER_CONFLICTS_KEY}"
+    )
+    with get_session() as session:
+        rows = session.exec(
+            select(LiveSignalModel)
+            .where(conflict_count > 0)
+            .order_by(LiveSignalModel.timestamp.desc())
+            .limit(max(1, int(limit)))
+        ).all()
+    conflicts: list[dict[str, Any]] = []
+    for row in rows:
+        ids = _conflicting_broker_order_ids(row.metadata_json or {})
+        if not ids:
+            continue
+        conflicts.append(
+            {
+                "signal_id": str(row.id),
+                "deployment_id": str(row.deployment_id),
+                "symbol": row.symbol,
+                "broker_order_id": row.broker_order_id,
+                "conflicting_broker_order_ids": ids,
+            }
+        )
+    return conflicts
 
 
 def get_live_signal_timestamp(signal_id: str) -> datetime | None:
@@ -3283,6 +3618,38 @@ def ensure_live_account(
             is_demo=is_demo,
         )
         return current.to_live_account()
+
+
+def register_live_account_if_absent(
+    account_id: str,
+    broker: str,
+    *,
+    name: str = "",
+    ctid: str | None = None,
+    broker_login: str | None = None,
+    is_demo: bool | None = None,
+) -> bool:
+    """Insert the account row only when it does not exist, and never modify an existing one.
+
+    The existence check and the insert share one session, so there is no gap in which another
+    writer can be overwritten: if a row appears before the insert, the insert fails on the primary
+    key and the error propagates, leaving that row exactly as it was. Returns ``True`` when this
+    call created the row.
+    """
+    init_db()
+    with get_session() as session:
+        if session.get(LiveAccountModel, account_id) is not None:
+            return False
+        _create_live_account_record(
+            session,
+            account_id,
+            broker,
+            name=name,
+            ctid=ctid,
+            broker_login=broker_login,
+            is_demo=is_demo,
+        )
+    return True
 
 
 def upsert_live_accounts(accounts: list[LiveAccountConfig]) -> None:
