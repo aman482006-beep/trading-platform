@@ -52,6 +52,7 @@ _guard.ensure_own_checkout("run_risk_parity_backtest")
 import shared  # noqa: F401
 from runner.risk_parity_optimizer import (
     _project_to_capped_simplex,
+    inverse_volatility_weights,
     resolve_weight_bounds,
 )
 from shared.constants import ensure_path_within_workspace
@@ -179,9 +180,10 @@ def calculate_risk_parity_weights(
     if result.success:
         weights = result.x
     else:
-        vols = np.sqrt(np.diag(cov))
-        inv_vols = 1.0 / vols
-        weights = inv_vols / np.sum(inv_vols)
+        # The module owns the fallback (and its refusal of a zero, negative or
+        # non-finite variance) so the runner and this script cannot disagree
+        # about what is acceptable input (#129).
+        weights = inverse_volatility_weights(cov)
     # #129: the inverse-vol fallback ignores the bounds and SLSQP can overshoot
     # them by float noise; project onto the capped simplex on every path.
     weights = _project_to_capped_simplex(
