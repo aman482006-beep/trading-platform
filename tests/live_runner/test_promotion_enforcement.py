@@ -298,6 +298,19 @@ def test_viewer_broker_reported_demo_flag_fails_closed(
     assert asyncio.run(viewer._broker_reported_demo_flag("a")) is expected
 
 
+def test_viewer_broker_verdict_is_fresh_not_the_30s_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A broker that reclassifies the account must be seen at once, not after the cache TTL."""
+    import viewer.main as viewer
+
+    answers = [[{"id": "a", "is_demo": True, "is_demo_asserted": True}]]
+    monkeypatch.setattr(viewer, "_discover_live_accounts_payload", lambda: answers[0])
+    # Warm the 30 s discovery cache with the account as demo.
+    viewer._cached_live_accounts_payload(force_refresh=True)
+
+    answers[0] = [{"id": "a", "is_demo": False, "is_demo_asserted": True}]
+    assert asyncio.run(viewer._broker_reported_demo_flag("a")) is False
+
+
 def _top_n(monkeypatch: pytest.MonkeyPatch, *, is_demo: bool | None, dry_run: bool = True):
     import viewer.main as viewer
 

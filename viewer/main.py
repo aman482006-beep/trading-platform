@@ -13321,13 +13321,16 @@ async def _broker_reported_demo_flag(account_id: str) -> bool | None:
     """What broker discovery says about ``account_id``: demo, not demo, or unknown.
 
     The promotion gate's real-money verdict for deployment create and the
-    cTrader top-N deploy (#165). It reads the same discovery payload the
-    activation path re-verifies against, never the stored account row. ``None``
-    means discovery failed, did not return the account, or did not assert the
-    flag; the gate treats that as real money.
+    cTrader top-N deploy (#165). It asks broker discovery directly, bypassing the
+    30 s discovery cache, so a broker that reclassifies the account is seen at
+    once, as activation's re-verification sees it. It never reads the stored
+    account row. ``None`` means discovery failed, did not return the account, or
+    did not assert the flag; the gate treats that as real money.
     """
     try:
-        discovered = await asyncio.to_thread(_cached_live_accounts_payload)
+        discovered = await asyncio.to_thread(
+            _cached_live_accounts_payload, force_refresh=True
+        )
     except Exception as exc:
         logger.warning(
             "Broker discovery failed; the promotion gate treats the account as real money",
