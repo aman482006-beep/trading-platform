@@ -81,6 +81,7 @@ os.environ.setdefault("LOG_DIR", str(LOG_DIR))
 from live_runner.ctrader_deployment import build_ctrader_deployment_plan
 from live_runner.stockkit_routing import validate_stockkit_deployment_route
 from risk.config import RiskConfig
+from risk.live import entry_gate_settings
 from runner.agent_process import build_backtest_child_env
 from runner.engines.signal_replay_adapter import ReplaySignal, SignalReplayAdapter
 from runner.grid_identity import data_staleness_reason, read_identity
@@ -3744,6 +3745,12 @@ def _backtest_summary_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _magnitude_or_none(value: object) -> float | None:
+    """Absolute value of a measured metric; ``None`` when it was not measured."""
+    measured = _optional_float(value)
+    return None if measured is None else abs(measured)
+
+
 def _backtest_all_item_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
     win_rate = _normalize_win_rate(meta.get("win_rate"))
     tags = [
@@ -3763,12 +3770,12 @@ def _backtest_all_item_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
         "strategy_slug": str(meta.get("strategy_name") or "unknown"),
         "symbols": [str(item) for item in meta.get("symbols", []) if str(item).strip()],
         "timeframe": normalize_timeframe(str(meta.get("timeframe") or "")),
-        "total_return": _safe_float(meta.get("total_return"), 0.0),
+        "total_return": _optional_float(meta.get("total_return")),
         "sharpe_ratio": _optional_float(meta.get("sharpe_ratio")),
         "psr": _optional_float(meta.get("psr")),
         "p_value": _optional_float(meta.get("p_value")),
         "cagr": _optional_float(meta.get("cagr")),
-        "max_drawdown": abs(_safe_float(meta.get("max_drawdown"), 0.0)),
+        "max_drawdown": _magnitude_or_none(meta.get("max_drawdown")),
         "trade_count": max(int(meta.get("trade_count", 0) or 0), 0),
         "win_rate": win_rate,
         "start_date": str(meta.get("start_date") or ""),
@@ -13461,9 +13468,11 @@ async def create_live_deployment_endpoint(
             signal_config=signal_config_payload,
             settings=payload.settings or {},
         )
+        # #125: refuse invalid entry-gate settings before anything is stored.
+        entry_gate_settings(deployment.settings)
     except ValueError as exc:
-        # Model-level config rejections (e.g. #150 trailing override) are
-        # client errors, not a 500.
+        # Model-level config rejections (e.g. #150 trailing override) and
+        # invalid gate settings are client errors, not a 500.
         raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
     _validate_live_deployment_route(deployment, account_payload)
     try:
