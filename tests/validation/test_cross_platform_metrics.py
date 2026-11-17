@@ -164,6 +164,34 @@ def test_cross_platform_mt5_cases_share_the_parity_artifacts_broker_clock(matrix
     assert actual == expected
 
 
+def test_comparison_matrix_parses_each_mt5_report_on_its_case_broker_clock(monkeypatch):
+    """The matrix's own parse uses the case clock, not only the test helpers' reloads.
+
+    Recording the kwargs of the importer call made inside ``build_comparison_matrix``
+    catches a regression to ``source_timezone="Europe/Athens"`` even when no
+    matrix statistic moves.
+    """
+    original_load = MT5XLSXImporter.load
+    recorded: dict[str, dict[str, object]] = {}
+
+    def recording_load(self, source, *args, **kwargs):
+        assert not args, "the matrix must name the clock by keyword"
+        recorded[Path(source).name] = kwargs
+        return original_load(self, source, *args, **kwargs)
+
+    monkeypatch.setattr(MT5XLSXImporter, "load", recording_load)
+
+    build_comparison_matrix(
+        comparisons_dir=PROJECT_ROOT / "strategy-comparisons",
+        reports_dir=PROJECT_ROOT / "reports",
+    )
+
+    assert recorded == {
+        f"{case['label']}.xlsx": {"broker_clock": case["broker_clock"]}
+        for case in COMPARISON_CASES
+    }
+
+
 def test_cross_platform_matrix_always_recomputes_canonical_stats(tmp_path):
     """#84: the audit matrix recomputes canonical stats — stored/curated
     numbers (and qc-parity attribution overrides) never win."""

@@ -137,6 +137,21 @@ def test_top_session_minutes_uses_broker_server_time_not_athens():
     assert _top_session_minutes(trades, 2, DUKASCOPY_MT5_INDEX) == [("17:45", 2), ("18:00", 1)]
 
 
+def test_top_session_minutes_returns_only_the_requested_number_of_minutes():
+    # Three distinct server minutes with counts 3, 2, 1 (no ties): limit=2 keeps the top two.
+    trades = [
+        _trade(entry_time="2025-03-17T14:45:00Z"),
+        _trade(entry_time="2025-03-18T14:45:00Z"),
+        _trade(entry_time="2025-03-19T14:45:00Z"),
+        _trade(entry_time="2025-03-20T15:00:00Z"),
+        _trade(entry_time="2025-03-21T15:00:00Z"),
+        _trade(entry_time="2025-03-17T13:30:00Z"),
+    ]
+
+    assert _top_session_minutes(trades, 2, DUKASCOPY_MT5_INDEX) == [("17:45", 3), ("18:00", 2)]
+    assert _top_session_minutes(trades, 1, DUKASCOPY_MT5_INDEX) == [("17:45", 3)]
+
+
 def test_top_session_minutes_keeps_the_legacy_fixed_offset_for_indices():
     # 2021-07-01 is in the legacy history: index CFDs ran on a fixed UTC+2 while
     # forex ran on Europe/Athens (UTC+3 that day). The two symbols differ by an hour
@@ -179,6 +194,18 @@ def test_every_report_has_a_broker_clock():
 def test_broker_clock_rejects_a_label_without_a_comparison_case():
     with pytest.raises(ValueError, match="no comparison case"):
         _broker_clock("GBPUSD_H1")
+
+
+def test_broker_clock_rejects_a_case_without_a_broker_clock(monkeypatch):
+    # Without a clock the importer would read server wall time as naive UTC (2-3 h off),
+    # so the case must be refused rather than resolved to None.
+    monkeypatch.setattr(
+        "scripts.analyze_mt5_parity._case_by_label",
+        lambda: {"NAS100_M15": {"label": "NAS100_M15", "output": "x.json"}},
+    )
+
+    with pytest.raises(ValueError, match="names no broker_clock"):
+        _broker_clock("NAS100_M15")
 
 
 def test_load_reference_reads_the_report_on_the_case_broker_clock(monkeypatch):
