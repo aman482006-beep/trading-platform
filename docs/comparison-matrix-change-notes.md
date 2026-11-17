@@ -40,6 +40,37 @@ committed comparison cases, plus the remaining limitations.
   - `scripts/analyze_mt5_parity.py` hardcoded `MT5_SOURCE_TIMEZONE = "Europe/Athens"`
     before this change; that constant is removed.
 
+## #188 — risk-parity QC reproduction (no look-ahead, start date, drifting weights)
+
+- Changed behavior, protected files:
+  - `scripts/run_risk_parity_backtest.py`: covariance/regime/SMA200 windows end at
+    the previous close (QC decides at 10:00); rebalancing starts at `start_date`
+    and the equity curve starts at the last bar before it; positions are
+    buy-and-hold and the 2% trade gate compares against the drifted weight;
+    history download starts 200 calendar days earlier (`price_history_start`).
+  - `scripts/regenerate_qc_risk_parity_artifact.py`: loads local history from
+    `price_history_start(...)` so offline regeneration keeps the margin.
+  - `tests/validation/test_cross_platform_metrics.py`: `risk_parity_quantconnect`
+    platform Sharpe pin 0.213296 -> 0.350569 (regenerated reference).
+  - Focused tests: `tests/strategies/test_risk_parity.py`,
+    `tests/test_qc_risk_parity_artifact_loader.py`.
+- Before/after matrix (`risk_parity_quantconnect`, reference = QC run): total
+  return 0.725 -> 0.9296 (QC 0.9378); CAGR 6.24% -> 7.58% (7.62%); max drawdown
+  25.5% -> 17.85% (17.70%); Sharpe (rf 2.5%) 0.229 -> 0.351 (0.372); annual vol
+  10.0% -> 8.76% (8.7%). Figures are from the PR description's regenerated run
+  (yfinance, pulled 2026-11-13); the artifacts in `data/backtests/` are not
+  committed, so the matrix payload was not re-diffed in this change.
+- Remaining limitations:
+  - The 2% trade gate uses the drifted weight marked through the rebalance-day
+    close, which is also the MOC fill bar. QC evaluates
+    `HoldingsValue/TotalPortfolioValue` at 10:00, i.e. through the previous
+    close. Legs within one day's drift of the gate can therefore flip; the 15+16
+    unmatched QC legs sit within ~0.3pp of it. Moving the gate to the previous
+    bar needs a regenerated reference and re-pinned stats (local data is not in
+    the repo), so it is left as a follow-up decision.
+  - No fee model, fractional shares, QC sizing MOC orders at the previous close,
+    and yfinance-vs-QC adjusted-price differences (median fill gap 0.1%).
+
 ## #186 — MT5 parity: server-clock D1 bars and explicit broker clocks
 
 - Changed behavior, protected files:
