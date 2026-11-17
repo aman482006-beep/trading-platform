@@ -4816,6 +4816,8 @@ def test_ctrader_broker_step_volume_is_cached() -> None:
         # Demo repro: qty 18.088... sized to volume 1_808_803, which cTrader
         # rejected with TRADING_BAD_VOLUME ("must be multiple of volume step").
         (18.08803, 1_800_000),
+        # Exactly the broker minimum is accepted (refusal is strictly below).
+        (1.0, 100_000),
         (1.0499, 100_000),
         (1.9999, 100_000),
         (2.0, 200_000),
