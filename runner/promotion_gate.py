@@ -28,9 +28,13 @@ Everything fails closed. A missing file, a missing, unreadable or malformed
 ledger, a required field that is missing or of the wrong type, evidence that no
 longer meets the *current* thresholds: all of them mean ``experimental``. Keys
 the reader does not know are ignored; only the thresholds file refuses unknown
-keys, because a typo there would silently leave a default in force. The evidence is re-validated on
-every check, so a ledger edited by hand to say something the checks would have
-refused does not pass either.
+keys, because a typo there would silently leave a default in force.
+
+The recorded evidence is re-validated on every check against the thresholds in
+force, so a hand-edited ledger whose recorded numbers the checks would refuse
+does not pass. The check does not re-open the optimization result or the
+reports that evidence names: their SHA256s are recorded for audit and are not
+re-verified when the promotion is checked.
 
 This module only knows files, parameters and ledgers. What a live deployment
 hashes and which parameters it binds is decided in

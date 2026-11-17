@@ -187,8 +187,13 @@ continued use"), and the viewer refuses to activate a deployment unless the
 broker reports a demo account. **That block stays.** The promotion gate is an
 additional layer under it, not a replacement. Today a promoted strategy on a
 real-money account therefore still cannot trade: preflight passes the gate,
-but the daemon will not keep a non-demo adapter and the viewer will not arm the
-deployment. Lifting the demo-only block is a separate, deliberate step.
+but the daemon will not keep a non-demo adapter. The viewer's activate path
+re-verifies the account against broker discovery and will not arm the
+deployment. The cTrader top-N deploy with `activate` is different: it creates
+the deployments `ACTIVE` directly, without that re-verification, on any account
+the gate passes. Only the daemon's demo-only block stops their orders. Refusing
+`activate` on a non-demo account there is a maintainer decision, not yet made.
+Lifting the demo-only block is a separate, deliberate step.
 
 ### Required evidence and thresholds
 
