@@ -32,8 +32,9 @@ What is hashed and which parameters are bound
   metadata, auth overrides, ...) do not parameterise the strategy and are not
   bound. Any deployment, strategy or signal bot, that carries
   ``settings["strategy_parameters"]`` is refused on a real-money account: it
-  would look like an override the gate checked while nothing applies it. Optimised parameters are promoted by
-  writing them into ``STRATEGY_META`` (which also changes the hashed file).
+  would look like an override the gate checked while nothing applies it.
+  Optimised parameters are promoted by writing them into ``STRATEGY_META``
+  (which also changes the hashed file).
 
 Anything that cannot be resolved on a real-money account is refused: no file,
 an unreadable ``STRATEGY_META``, an unknown processor, a malformed override.
