@@ -828,19 +828,22 @@ class BacktestStats:
     losers: int = 0
     win_rate: float = 0.0
     profit_factor: float | None = None
-    total_pnl: float = 0.0
+    # `total_pnl`/`total_return`/`max_drawdown_pct` are null when the curve's
+    # endpoint is not a finite number (ruin by an unreadable/NaN/inf point): the
+    # figure is unmeasurable, and each is named in `undefined_metrics` then.
+    total_pnl: float | None = 0.0
     avg_winner: float = 0.0
     avg_loser: float = 0.0
     max_consecutive_wins: int = 0
     max_consecutive_losses: int = 0
     avg_holding_bars: float | None = None
-    max_drawdown_pct: float = 0.0
+    max_drawdown_pct: float | None = 0.0
     max_drawdown_duration: int = 0
     sharpe_ratio: float | None = 0.0
     sortino_ratio: float | None = 0.0
     calmar_ratio: float | None = 0.0
     cagr: float | None = 0.0
-    total_return: float = 0.0
+    total_return: float | None = 0.0
     psr: float | None = None
     p_value: float | None = 1.0
     extras: dict[str, Any] = field(default_factory=dict)

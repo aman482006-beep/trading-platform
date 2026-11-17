@@ -10,6 +10,7 @@ listed in ``undefined_metrics``.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -147,6 +148,13 @@ def test_non_finite_equity_is_ruin_and_fails_closed(quantstats_flag, bad) -> Non
     for metric in RETURN_METRICS + ("cagr", "calmar_ratio"):
         assert stats[metric] is None, metric
         assert metric in stats["undefined_metrics"], metric
+    # The curve ends on a point no metric can be measured from. Publishing the
+    # NaN/inf the endpoint arithmetic produces is not a measurement and not
+    # valid JSON (`JSONResponse` refuses it), so all three are null and named.
+    for metric in ("total_return", "total_pnl", "max_drawdown_pct"):
+        assert stats[metric] is None, metric
+        assert metric in stats["undefined_metrics"], metric
+    json.dumps(stats, allow_nan=False)
 
 
 def test_degenerate_curves_name_return_and_drawdown_as_undefined() -> None:
@@ -158,12 +166,17 @@ def test_degenerate_curves_name_return_and_drawdown_as_undefined() -> None:
             assert metric in stats["undefined_metrics"], (metric, equities)
 
 
-@pytest.mark.parametrize("bad", [None, "n/a", ""], ids=["none", "text", "empty"])
+@pytest.mark.parametrize(
+    "bad", [None, "n/a", "", 10**400], ids=["none", "text", "empty", "overflow"]
+)
 def test_unreadable_equity_point_is_ruin_not_a_crash(quantstats_flag, bad) -> None:
     """A legacy artifact with an unreadable equity point counts as ruined (fail closed).
 
     `EquityPoint.from_dict` passes stored equity through uncoerced, so a
     corrupt or legacy artifact can carry `None` or text. That must not raise.
+    `10**400` is readable JSON but outside float64 range: `float()` raises
+    `OverflowError`, the same "cannot read this point" case one exception type
+    over (#139/#250).
     """
     curve = _curve(PRE_RUIN + [120_000.0])
     curve[len(PRE_RUIN)] = EquityPoint(time=curve[len(PRE_RUIN)].time, equity=bad)
@@ -174,3 +187,64 @@ def test_unreadable_equity_point_is_ruin_not_a_crash(quantstats_flag, bad) -> No
     for metric in RETURN_METRICS + ("cagr", "calmar_ratio"):
         assert stats[metric] is None, metric
         assert metric in stats["undefined_metrics"], metric
+    # The terminating point is NaN, so the endpoint figures are unmeasurable:
+    # null and named, never a NaN (invalid JSON) or a measured-looking number.
+    for metric in ("total_return", "total_pnl", "max_drawdown_pct"):
+        assert stats[metric] is None, metric
+        assert metric in stats["undefined_metrics"], metric
+    json.dumps(stats, allow_nan=False)
+
+
+@pytest.mark.parametrize(
+    ("bad_index", "expected_total_return"),
+    [(0, 0.0), (3, None), (len(PRE_RUIN), None)],
+    ids=["first", "middle", "last"],
+)
+def test_unreadable_point_truncates_inclusively(
+    quantstats_flag, bad_index, expected_total_return
+) -> None:
+    """The cut is inclusive of the bad point, wherever it sits in the curve.
+
+    Dropping it (`ordered[:index]` instead of `ordered[:index + 1]`) ends the
+    metrics on the last readable point, which publishes a measured-looking
+    return for a run whose account is gone. A single-point curve is the
+    existing degenerate shape (no return computable), so its `total_return`
+    stays the published 0.0 and is named undefined there.
+    """
+    curve = _curve(PRE_RUIN + [120_000.0])
+    curve[bad_index] = EquityPoint(time=curve[bad_index].time, equity=None)
+    stats = compute_stats([], initial_capital=100_000.0, equity_curve=curve)
+
+    assert stats["ruined"] is True
+    assert stats["ruin_time"] == curve[bad_index].time
+    # The NaN-normalised bad point is the curve's endpoint, so the endpoint
+    # figures are NaN before being published as null. If the bad point were
+    # sliced off, `total_pnl` would be a finite last-good minus first number.
+    assert stats["total_pnl"] is None
+    assert "total_pnl" in stats["undefined_metrics"]
+    assert stats["total_return"] == expected_total_return
+    assert "total_return" in stats["undefined_metrics"]
+    assert stats["max_drawdown_pct"] is None
+    assert "max_drawdown_pct" in stats["undefined_metrics"]
+    for metric in RETURN_METRICS:
+        assert stats[metric] is None, metric
+    json.dumps(stats, allow_nan=False)
+
+
+def test_numeric_text_equity_is_coerced_not_a_crash(quantstats_flag) -> None:
+    """A number stored as text is readable, not ruin: coerce it and keep the run.
+
+    Same value, different serialisation. Declaring the run ruined would publish
+    a false -100% for an account that never died, and leaving the raw string in
+    the curve moves the crash one line down (`str / float`).
+    """
+    curve = [
+        EquityPoint(time=(START + timedelta(days=i)).isoformat(), equity=str(equity))
+        for i, equity in enumerate([100_000, 101_000, 102_000])
+    ]
+    stats = compute_stats([], initial_capital=100_000.0, equity_curve=curve)
+
+    assert stats["ruined"] is False
+    assert stats["total_pnl"] == pytest.approx(2_000.0)
+    assert stats["total_return"] == pytest.approx(0.02)
+    json.dumps(stats, allow_nan=False)
