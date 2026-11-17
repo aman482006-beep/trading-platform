@@ -238,16 +238,13 @@ def test_strict_mode_failures_are_not_counted_as_skips(gate, tmp_path, capsys):
     assert "skipped on missing" not in output
 
 
-
 def test_ohlcv_root_defaults_to_the_suite_data_dir(gate, monkeypatch, tmp_path):
     monkeypatch.delenv("TP_TEST_OHLCV_DIR", raising=False)
 
     assert gate._ohlcv_root() == tmp_path / "ohlcv"
 
 
-def test_ohlcv_opt_in_reads_a_local_dataset_outside_the_suite_data_dir(
-    gate, monkeypatch, tmp_path
-):
+def test_ohlcv_opt_in_reads_a_local_dataset_outside_the_suite_data_dir(gate, monkeypatch, tmp_path):
     """The suite's DATA_DIR is a throwaway dir, so a developer's real datasets are invisible unless
     they name them explicitly with TP_TEST_OHLCV_DIR (read-only; the data-dir guard never sees
     it)."""
