@@ -240,7 +240,9 @@ class TradeMatcher:
     one.  The solve maximises the number of matched pairs first and minimises
     the blended cost second.  Feasibility is unchanged: same direction, same
     symbol when ``match_symbol`` is set, and entry *and* exit within
-    ``time_tolerance_seconds``.
+    ``time_tolerance_seconds``.  An exit-less (open) trade is never feasible:
+    it has no exit to compare, so it is reported in ``missing``/``extra``
+    rather than paired or raising (#138).
 
     Both lists are canonicalised before the solve (times, symbol, direction,
     price, quantity, id), so which pairs are matched does not depend on input

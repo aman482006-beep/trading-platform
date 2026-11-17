@@ -435,3 +435,25 @@ class TestExitlessTrades:
         assert result.matched == []
         assert len(result.missing) == 1
         assert len(result.extra) == 1
+
+    def test_open_and_closed_trade_sharing_an_entry_time_still_sort(self):
+        """With equal entries, the canonical sort must compare the exit keys.
+
+        Every other open-trade test puts the open and closed trades at
+        different entry times, so the first sort-key component decides the
+        order and the exit keys are never compared.  Here both references
+        enter at the same instant, which forces the ``None`` (open) and
+        ``datetime`` (closed) exit keys to be ordered against each other.
+        A raw ``None`` in the sort key crashes here instead of reporting the
+        open trade, which is exactly the abort #138/#251 removes.
+        """
+        entry = "2024-01-01T10:00:00Z"
+        ref = [
+            _make_trade(trade_id=1, entry_time=entry),
+            _make_open_trade(trade_id=2, entry_time=entry),
+        ]
+        act = [_make_trade(trade_id=3, entry_time=entry)]
+        result = TradeMatcher.match(ref, act)
+        assert [(r.id, a.id) for r, a, _key in result.matched] == [(1, 3)]
+        assert [t.id for t in result.missing] == [2]
+        assert result.extra == []
