@@ -7732,6 +7732,64 @@ def test_viewer_routes_without_response_model_keep_object_schema(path, method):
     assert schema.get("additionalProperties") is True
 
 
+def _write_duplicate_portfolio_file(portfolios_dir, portfolio_id: str, created_at: str) -> None:
+    (portfolios_dir / f"{portfolio_id}.json").write_text(
+        json.dumps(
+            {
+                "id": portfolio_id,
+                "name": "Duplicate Portfolio",
+                "account_capital": 100000.0,
+                "created_at": created_at,
+                "components": [
+                    {
+                        "component_id": "component-001",
+                        "strategy_name": "Strategy A",
+                        "symbol": "AAPL",
+                        "timeframe": "1h",
+                        "weight": 1.0,
+                        "risk_config": {},
+                        "settings": {},
+                        "backtest_id": "",
+                    }
+                ],
+                "trades": [],
+                "combined_stats": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _duplicate_group_fake(alive: set[str], created: dict[str, str]):
+    """Fake duplicate-group reader: one fingerprint, the newest live entry is kept.
+
+    ``alive`` and ``created`` are mutated by the test, so each call reflects the
+    group as it is at that moment.
+    """
+
+    def members() -> list[dict]:
+        ordered = sorted(alive, key=lambda item_id: created[item_id], reverse=True)
+        if len(ordered) < 2:
+            return []
+        return [
+            {
+                "id": item_id,
+                "name": "Duplicate",
+                "display_name": "Duplicate",
+                "created_at": created[item_id] + "T00:00:00Z",
+                "fingerprint": "fp1",
+                "kept_id": ordered[0],
+                "is_kept": item_id == ordered[0],
+            }
+            for item_id in ordered
+        ]
+
+    return members
+
+
+_GROUP_CREATED = {"a": "2026-01-03", "b": "2026-01-02", "c": "2026-01-01"}
+
+
 def test_deduplicate_portfolios_confirm_rechecks_each_id_before_delete(
     viewer_client, monkeypatch, tmp_path
 ):
@@ -7749,36 +7807,9 @@ def test_deduplicate_portfolios_confirm_rechecks_each_id_before_delete(
 
     portfolios_dir = tmp_path / "portfolios"
     portfolios_dir.mkdir(parents=True, exist_ok=True)
-    for portfolio_id, created_at in (
-        ("portfolio-a", "2026-01-03T00:00:00Z"),
-        ("portfolio-b", "2026-01-02T00:00:00Z"),
-        ("portfolio-c", "2026-01-01T00:00:00Z"),
-    ):
-        (portfolios_dir / f"{portfolio_id}.json").write_text(
-            json.dumps(
-                {
-                    "id": portfolio_id,
-                    "name": "Duplicate Portfolio",
-                    "account_capital": 100000.0,
-                    "created_at": created_at,
-                    "components": [
-                        {
-                            "component_id": "component-001",
-                            "strategy_name": "Strategy A",
-                            "symbol": "AAPL",
-                            "timeframe": "1h",
-                            "weight": 1.0,
-                            "risk_config": {},
-                            "settings": {},
-                            "backtest_id": "",
-                        }
-                    ],
-                    "trades": [],
-                    "combined_stats": {},
-                }
-            ),
-            encoding="utf-8",
-        )
+    _write_duplicate_portfolio_file(portfolios_dir, "portfolio-a", "2026-01-03T00:00:00Z")
+    _write_duplicate_portfolio_file(portfolios_dir, "portfolio-b", "2026-01-02T00:00:00Z")
+    _write_duplicate_portfolio_file(portfolios_dir, "portfolio-c", "2026-01-01T00:00:00Z")
 
     response = viewer_client.post("/api/portfolios/deduplicate")
     assert response.status_code == 200
@@ -7816,7 +7847,7 @@ def test_deduplicate_portfolios_confirm_rechecks_each_id_before_delete(
 
 
 def test_deduplicate_backtests_confirm_rechecks_each_id_before_delete(
-    viewer_client, monkeypatch, tmp_path
+    viewer_client, monkeypatch
 ):
     """Backtest twin of the portfolio re-check test.
 
@@ -7828,55 +7859,115 @@ def test_deduplicate_backtests_confirm_rechecks_each_id_before_delete(
     monkeypatch.setattr(viewer_app_module, "list_portfolio_records", lambda: [])
     monkeypatch.setattr(viewer_app_module, "delete_portfolio_record", lambda _portfolio_id: False)
 
-    alive = {"backtest-a", "backtest-b", "backtest-c"}
-    created = {"backtest-a": "2026-01-03", "backtest-b": "2026-01-02", "backtest-c": "2026-01-01"}
-
-    def fake_members():
-        ordered = sorted(alive, key=lambda item_id: created[item_id], reverse=True)
-        if len(ordered) < 2:
-            return []
-        return [
-            {
-                "id": item_id,
-                "display_name": "Duplicate Backtest",
-                "strategy_name": "Test",
-                "symbols": ["AAPL"],
-                "timeframe": "1d",
-                "trade_count": 1,
-                "created_at": created[item_id] + "T00:00:00Z",
-                "fingerprint": "fp1",
-                "kept_id": ordered[0],
-                "is_kept": item_id == ordered[0],
-            }
-            for item_id in ordered
-        ]
-
-    monkeypatch.setattr(viewer_app_module, "_duplicate_backtest_members", fake_members)
+    alive = {"a", "b", "c"}
+    monkeypatch.setattr(
+        viewer_app_module, "_duplicate_backtest_members", _duplicate_group_fake(alive, _GROUP_CREATED)
+    )
     deleted: list[str] = []
 
     def fake_delete(backtest_id):
         if not deleted:
             # Concurrent removal of the kept entry between snapshot and delete.
-            alive.discard("backtest-a")
+            alive.discard("a")
         alive.discard(backtest_id)
         deleted.append(backtest_id)
-        return {
-            "id": backtest_id,
-            "status": "deleted",
-            "database": "deleted",
-            "artifact": "deleted",
-        }
+        return {"id": backtest_id, "status": "deleted", "database": "deleted", "artifact": "deleted"}
 
     monkeypatch.setattr(viewer_app_module, "_delete_backtest_with_artifacts", fake_delete)
 
     response = viewer_client.post(
         "/api/backtests/deduplicate",
-        json={"dry_run": False, "ids": ["backtest-b", "backtest-c"]},
+        json={"dry_run": False, "ids": ["b", "c"]},
     )
     assert response.status_code == 200
     payload = response.json()
-    assert deleted == ["backtest-b"]
-    assert payload["deleted_ids"] == ["backtest-b"]
-    assert payload["skipped_ids"] == ["backtest-c"]
+    assert deleted == ["b"]
+    assert payload["deleted_ids"] == ["b"]
+    assert payload["skipped_ids"] == ["c"]
     assert payload["items"][1]["reason"] == "no_longer_duplicate"
-    assert "backtest-c" in alive
+    assert "c" in alive
+
+
+def test_deduplicate_backtests_recheck_error_skips_item_and_reports_rest(
+    viewer_client, monkeypatch
+):
+    """A failing re-check fails closed for that id only; earlier deletes are reported.
+
+    Group A (newest, kept) / B / C. B is deleted, then the database read for
+    C's re-check fails. C must be reported ``recheck_failed`` and kept, and the
+    response must still list B as deleted instead of returning a bare 500.
+    """
+    import viewer.main as viewer_app_module
+
+    alive = {"a", "b", "c"}
+    read_group = _duplicate_group_fake(alive, _GROUP_CREATED)
+    reads_broken = False
+
+    def members_or_fail() -> list[dict]:
+        if reads_broken:
+            raise RuntimeError("database is unavailable")
+        return read_group()
+
+    monkeypatch.setattr(viewer_app_module, "_duplicate_backtest_members", members_or_fail)
+    deleted: list[str] = []
+
+    def fake_delete(backtest_id):
+        nonlocal reads_broken
+        alive.discard(backtest_id)
+        deleted.append(backtest_id)
+        reads_broken = True  # the re-check for C (next id) fails
+        return {"id": backtest_id, "status": "deleted", "database": "deleted", "artifact": "deleted"}
+
+    monkeypatch.setattr(viewer_app_module, "_delete_backtest_with_artifacts", fake_delete)
+
+    response = viewer_client.post(
+        "/api/backtests/deduplicate",
+        json={"dry_run": False, "ids": ["b", "c"]},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert deleted == ["b"]
+    assert payload["deleted_ids"] == ["b"]
+    assert payload["skipped_ids"] == ["c"]
+    assert payload["items"][1] == {"id": "c", "status": "skipped", "reason": "recheck_failed"}
+    assert "c" in alive
+
+
+def test_deduplicate_portfolios_recheck_error_skips_item_and_reports_rest(
+    viewer_client, monkeypatch
+):
+    """Portfolio twin of the backtest re-check failure test (fail closed per id)."""
+    import viewer.main as viewer_app_module
+
+    alive = {"a", "b", "c"}
+    read_group = _duplicate_group_fake(alive, _GROUP_CREATED)
+    reads_broken = False
+
+    def members_or_fail() -> list[dict]:
+        if reads_broken:
+            raise RuntimeError("portfolio store is unavailable")
+        return read_group()
+
+    monkeypatch.setattr(viewer_app_module, "_duplicate_portfolio_members", members_or_fail)
+    deleted: list[str] = []
+
+    def fake_delete(portfolio_id):
+        nonlocal reads_broken
+        alive.discard(portfolio_id)
+        deleted.append(portfolio_id)
+        reads_broken = True  # the re-check for C (next id) fails
+        return {"id": portfolio_id, "status": "deleted", "database": "deleted", "artifact": "deleted"}
+
+    monkeypatch.setattr(viewer_app_module, "_delete_portfolio_with_artifacts", fake_delete)
+
+    response = viewer_client.post(
+        "/api/portfolios/deduplicate",
+        json={"dry_run": False, "ids": ["b", "c"]},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert deleted == ["b"]
+    assert payload["deleted_ids"] == ["b"]
+    assert payload["skipped_ids"] == ["c"]
+    assert payload["items"][1] == {"id": "c", "status": "skipped", "reason": "recheck_failed"}
+    assert "c" in alive
