@@ -133,9 +133,17 @@ def read_active_db_deployments(db_path: Path) -> tuple[list[DbDeploymentRow], se
     connection = sqlite3.connect(uri, uri=True, timeout=5)
     try:
         connection.row_factory = sqlite3.Row
+        columns = {
+            str(info[1]) for info in connection.execute("PRAGMA table_info(live_deployments)")
+        }
+        # The daemon rehydrates the source as ``signal_source or signal_source_type``
+        # (``LiveDeploymentModel.to_live_deployment``); an older DB may lack the type column.
+        type_column = "signal_source_type"
+        if type_column not in columns:
+            type_column = "NULL AS signal_source_type"
         rows = connection.execute(
             "SELECT id, strategy_name, account_id, symbols, timeframe, signal_source, "
-            "signal_source_id "
+            f"signal_source_id, {type_column} "
             "FROM live_deployments WHERE upper(status) = 'ACTIVE' ORDER BY strategy_name, id"
         ).fetchall()
         account_ids = {str(row["id"]) for row in connection.execute("SELECT id FROM live_accounts")}
@@ -151,7 +159,8 @@ def read_active_db_deployments(db_path: Path) -> tuple[list[DbDeploymentRow], se
                 account_id=str(row["account_id"]),
                 symbols=symbols,
                 timeframe=str(row["timeframe"] or ""),
-                signal_source=str(row["signal_source"] or ""),
+                # Mirror the daemon's fallback: an empty stored source takes the type.
+                signal_source=str(row["signal_source"] or row["signal_source_type"] or ""),
                 signal_source_id=str(row["signal_source_id"] or ""),
                 unclean_symbols=unclean,
             )

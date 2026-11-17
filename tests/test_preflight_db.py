@@ -244,6 +244,24 @@ def test_matching_signal_source_is_not_reported(isolated_db) -> None:
     assert report.warnings == [], report.warnings
 
 
+def test_empty_stored_signal_source_falls_back_to_the_type_like_the_daemon(isolated_db) -> None:
+    """The daemon rehydrates ``signal_source or signal_source_type`` (to_live_deployment).
+
+    A row with an empty ``signal_source`` but ``signal_source_type='discord'`` is traded as
+    Discord, so a YAML ``internal`` entry must show as drift, not as a clean match.
+    """
+    database = isolated_db[0]
+    _seed(database, signal_source="discord")
+    with sqlite3.connect(database.DB_PATH) as connection:
+        connection.execute(
+            "UPDATE live_deployments SET signal_source = '', signal_source_type = 'discord'"
+        )
+
+    report = run_db_preflight([_yaml_one()], db_path=_db_path(database))
+
+    assert any("signal_source differs (DB discord" in w for w in report.warnings), report.warnings
+
+
 def test_signal_source_id_drift_between_db_and_yaml_is_reported(isolated_db) -> None:
     """signal_source_id selects the Discord credential a deployment is dispatched with."""
     database = isolated_db[0]
