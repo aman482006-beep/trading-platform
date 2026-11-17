@@ -1036,3 +1036,64 @@ def test_migrate_schema_parents_smoke_orphans_and_lands_the_foreign_key(legacy_d
     ), "init_db() did not land the deployment_id foreign key on a smoke-only database"
     assert parents == 1, "the smoke orphan's parent was not created"
     assert orphans == 0, "a smoke orphan survived the migration, so the FK was left blocked"
+
+
+def test_backfill_does_not_lose_an_id_when_another_writer_backfilled_first(
+    isolated_db, signal_parent
+) -> None:
+    """Two redeliveries with different ids on an empty tracked id: neither id may vanish."""
+    from shared.database import (
+        _reconcile_existing_live_signal,
+        list_live_signal_broker_order_conflicts,
+    )
+
+    first_id, _ = save_live_signal(
+        _make_live_signal(discord_message_id="ord-bf-1", broker_order_id="")
+    )
+    with get_session() as stale_session:
+        stale_existing = stale_session.get(LiveSignalModel, first_id)
+        assert stale_existing is not None
+        assert not (stale_existing.broker_order_id or "").strip()
+        # Another redelivery backfills BRK-BBB and commits while this one holds its empty copy.
+        save_live_signal(
+            _make_live_signal(discord_message_id="ord-bf-1", broker_order_id="BRK-BBB")
+        )
+        incoming = LiveSignalModel.from_live_signal(
+            _make_live_signal(discord_message_id="ord-bf-1", broker_order_id="BRK-CCC")
+        )
+        _reconcile_existing_live_signal(stale_session, stale_existing, incoming)
+
+    with get_session() as session:
+        row = session.get(LiveSignalModel, first_id)
+        assert row.broker_order_id == "BRK-BBB"
+        assert row.metadata_json["broker_order_id"] == "BRK-BBB"
+        assert row.metadata_json["conflicting_broker_order_ids"] == ["BRK-CCC"]
+    assert list_live_signal_broker_order_conflicts()[0]["conflicting_broker_order_ids"] == [
+        "BRK-CCC"
+    ]
+
+
+def test_backfill_with_the_id_another_writer_already_stored_is_a_plain_duplicate(
+    isolated_db, signal_parent
+) -> None:
+    from shared.database import _reconcile_existing_live_signal
+
+    first_id, _ = save_live_signal(
+        _make_live_signal(discord_message_id="ord-bf-2", broker_order_id="")
+    )
+    with get_session() as stale_session:
+        stale_existing = stale_session.get(LiveSignalModel, first_id)
+        save_live_signal(
+            _make_live_signal(discord_message_id="ord-bf-2", broker_order_id="BRK-BBB")
+        )
+        incoming = LiveSignalModel.from_live_signal(
+            _make_live_signal(discord_message_id="ord-bf-2", broker_order_id="BRK-BBB")
+        )
+        _reconcile_existing_live_signal(stale_session, stale_existing, incoming)
+
+    with get_session() as session:
+        row = session.get(LiveSignalModel, first_id)
+        assert row.broker_order_id == "BRK-BBB"
+        assert "conflicting_broker_order_ids" not in row.metadata_json
+    # The write lock was released: another writer can save right away.
+    save_live_signal(_make_live_signal(discord_message_id="ord-bf-3", broker_order_id="BRK-ZZZ"))
