@@ -106,6 +106,9 @@ def _resolve_report_clock(
         return None
     if isinstance(broker_clock, BrokerClock):
         return broker_clock
+    if not str(broker_clock).strip():
+        # An empty name must not silently read server wall time as UTC.
+        raise ValueError("broker_clock must name a broker clock, got an empty string")
     return resolve_broker_clock(broker_clock)
 
 

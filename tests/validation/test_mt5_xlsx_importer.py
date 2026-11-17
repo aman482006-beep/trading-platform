@@ -344,8 +344,15 @@ class TestBrokerClock:
             trade.entry_time for trade in sp500_on_broker_clock.trades
         }
 
+    @pytest.mark.parametrize("name", ["", "   "])
+    def test_an_empty_broker_clock_name_is_refused(self, name):
+        from validation.importers.mt5_xlsx import _resolve_report_clock
+
+        with pytest.raises(ValueError, match="empty string"):
+            _resolve_report_clock(name)
+
     def test_exits_use_the_same_clock(self, sp500_on_broker_clock):
-        # Athens would put this stop at 20:55:40Z; the platform artifact stops
+        # Athens (UTC+3 then) would put this stop at 18:55:40Z; the platform artifact stops
         # the same trade at 19:55:00Z (MT5 tick fill vs. M1 bar open).
         trade = next(
             t for t in sp500_on_broker_clock.trades if t.entry_time == "2024-04-01T15:15:00Z"
