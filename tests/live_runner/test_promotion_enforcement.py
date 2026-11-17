@@ -135,6 +135,18 @@ class _Adapter(BaseLiveAdapter):
     async def connect(self) -> None:
         return None
 
+    async def get_quote(self, symbol: str):
+        # Entries need a fresh broker quote for the #125 deviation gate.
+        from live_runner.base_adapter import LiveQuote
+
+        return LiveQuote(
+            bid=100.0,
+            ask=100.0,
+            timestamp=datetime.now(timezone.utc),
+            source="test",
+            timestamp_source="broker",
+        )
+
     async def submit_order(self, signal: LiveSignal, *, qty: float | None = None) -> str:
         self.submitted.append(signal)
         return "order-1"
