@@ -226,7 +226,7 @@ byte or one parameter and the code is `experimental` again.
 
 | Deployment | Hashed file | Bound parameters |
 |---|---|---|
-| Strategy (no `signal_processor`) | `strategies/<strategy_name>/<strategy_name>.py` | `STRATEGY_META["parameters"]` defaults |
+| Internal strategy (no `signal_processor`) | `strategies/<strategy_name>/<strategy_name>.py` | `STRATEGY_META["parameters"]` defaults |
 | Signal bot (`signal_config.signal_processor` set) | `signal_bots/<bot>/processor.py` | processor id, `signal_config.signal_processor_config`, SHA256 of the bot's `config.yaml`, SHA256 of every repository module the processor imports |
 
 A signal bot's import closure is the set of repository modules Python executes to
@@ -242,9 +242,15 @@ No live code path applies per-deployment strategy parameters, so a strategy is
 promoted with its `STRATEGY_META` defaults: write optimised parameters into the
 file, then promote. A deployment that carries `settings.strategy_parameters` is
 refused on real money. Other `settings` keys (risk limits, selection metadata)
-are not strategy parameters and are not bound. A Discord deployment without a
-`signal_processor` has nothing to hash unless a strategy of the same name
-exists, so it is refused on real money.
+are not strategy parameters and are not bound. A non-internal (Discord)
+deployment without a `signal_processor` trades the raw channel signal, so no
+strategy file runs and nothing can be hashed: it is refused on real money even
+if a strategy of the same name is promoted. Only internal deployments are
+checked against a strategy file.
+
+The gate sits in the daemon, the preflight and the viewer. The operator tools
+`live_runner/test_signal_trigger.py --live` and `scripts/live_smoke.py` do not
+go through it: they are explicit, human-driven commands and bypass the gate.
 
 The ledger is `<file>.promoted.json` next to the hashed file (for example
 `strategies/foo/foo.py.promoted.json`) and must be committed: the promotion is

@@ -83,3 +83,27 @@ def test_a_changed_module_changes_its_digest(tmp_path: Path) -> None:
 def test_the_promoted_file_itself_is_not_part_of_its_own_closure(tmp_path: Path) -> None:
     start = _write(tmp_path, "pkg_a/processor.py", "import pkg_a.processor\n")
     assert repository_import_closure(start, repo_root=tmp_path) == {}
+
+
+def test_the_start_modules_parent_package_inits_are_bound(tmp_path: Path) -> None:
+    _write(tmp_path, "top/__init__.py", "")
+    _write(tmp_path, "top/inner/__init__.py", "")
+    start = _write(tmp_path, "top/inner/processor.py", "")
+    closure = repository_import_closure(start, repo_root=tmp_path)
+    assert set(closure) == {"top/__init__.py", "top/inner/__init__.py"}
+
+
+def test_a_start_parent_init_is_walked_for_its_own_imports(tmp_path: Path) -> None:
+    _write(tmp_path, "top/__init__.py", "from helper import X\n")
+    _write(tmp_path, "helper.py", "X = 1\n")
+    start = _write(tmp_path, "top/processor.py", "")
+    closure = repository_import_closure(start, repo_root=tmp_path)
+    assert set(closure) == {"top/__init__.py", "helper.py"}
+
+
+def test_ramjet_closure_contains_its_package_inits() -> None:
+    from signal_bots.registry import get_signal_processor_module_path
+
+    closure = repository_import_closure(get_signal_processor_module_path("ramjet"))
+    assert "signal_bots/__init__.py" in closure
+    assert "signal_bots/ramjet/__init__.py" in closure

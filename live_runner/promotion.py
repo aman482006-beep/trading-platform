@@ -164,7 +164,8 @@ def repository_import_closure(start: Path, *, repo_root: Path | None = None) -> 
     Walks the static ``import`` / ``from ... import`` statements of ``start``
     and of each repository module it reaches. A dotted name binds every file
     Python would execute to load it: the module itself and each parent package
-    ``__init__.py``. Only files under ``repo_root`` are returned, keyed by their
+    ``__init__.py``; the parent packages of ``start`` itself are seeded the
+    same way. Only files under ``repo_root`` are returned, keyed by their
     POSIX path relative to it. ``start`` itself is not included: the promoted
     file is bound by its own SHA256. Standard-library and third-party names
     resolve to nothing under the repository and are skipped.
@@ -177,6 +178,16 @@ def repository_import_closure(start: Path, *, repo_root: Path | None = None) -> 
     todo: list[Path] = [start_resolved]
     found: dict[str, str] = {}
     resolved_names: dict[str, Path | None] = {}
+    if start_resolved.is_relative_to(root):
+        # Importing start executes every parent package __init__.py first.
+        package_dirs = start_resolved.relative_to(root).parent.parts
+        for depth in range(1, len(package_dirs) + 1):
+            init = root.joinpath(*package_dirs[:depth], "__init__.py")
+            if init.is_file() and init.resolve() not in seen:
+                resolved = init.resolve()
+                seen.add(resolved)
+                todo.append(resolved)
+                found[resolved.relative_to(root).as_posix()] = _sha256_of(resolved)
     while todo:
         current = todo.pop()
         try:
@@ -296,6 +307,16 @@ def deployment_promotion_target(
         if processor_config is not None and not isinstance(processor_config, Mapping):
             raise PromotionTargetError("signal_processor_config must be a mapping")
         return signal_bot_target(processor_name, processor_config)
+    if (
+        str(deployment.signal_source or "internal").lower() != "internal"
+        or str(deployment.signal_source_type or "internal").lower() != "internal"
+    ):
+        # Without a processor the daemon passes the raw channel signal through;
+        # no strategy file runs, so a strategy of the same name proves nothing.
+        raise PromotionTargetError(
+            "a non-internal deployment without a signal_processor trades raw "
+            "channel signals, which cannot be promoted"
+        )
     return strategy_target(deployment.strategy_name, strategies_dir=strategies_dir)
 
 

@@ -158,6 +158,20 @@ def ramjet_deployment(processor_config: dict[str, Any] | None = None) -> LiveDep
     )
 
 
+def promote_ramjet_bot() -> Any:
+    """Promote the ramjet signal bot of the ``bots_root`` tree (no processor overrides)."""
+    target = deployment_promotion_target(ramjet_deployment())
+    promote(
+        target.path,
+        kind=target.kind,
+        parameters=target.parameters,
+        evidence=good_evidence(strategy_file="ramjet_strategy.py"),
+        promoted_by="Fred (reviewer)",
+        root=target.root,
+    )
+    return target
+
+
 def use_strategies_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """A throwaway strategy tree with STRATEGY_NAME, used by the enforcement."""
     root = tmp_path / "strategies"
@@ -786,9 +800,57 @@ def test_discord_deployment_without_processor_has_nothing_to_promote(strategies_
     deployment = strategy_deployment(
         "RAMJET", signal_source="discord", signal_config={"channel_id": "1"}
     )
-    with pytest.raises(StrategyNotPromotedError, match="no strategy file"):
+    with pytest.raises(StrategyNotPromotedError, match="raw channel signals"):
         enforce_promotion_gate(deployment, real_money=True)
     enforce_promotion_gate(deployment, real_money=False)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"signal_source": "discord", "signal_source_type": "discord"},
+        {"signal_source": "discord"},
+        {"signal_source_type": "discord"},
+    ],
+)
+def test_discord_deployment_without_processor_is_refused_even_if_a_same_named_strategy_is_promoted(
+    strategies_dir: Path, overrides: dict[str, Any]
+) -> None:
+    """The daemon passes the raw channel signal through: the strategy file never runs."""
+    promote_strategy_file(strategies_dir)
+    internal = strategy_deployment()
+    enforce_promotion_gate(internal, real_money=True)
+    discord = strategy_deployment(signal_config={"channel_id": "1"}, **overrides)
+    with pytest.raises(StrategyNotPromotedError, match="raw channel signals"):
+        enforce_promotion_gate(discord, real_money=True)
+
+
+def test_an_unknown_account_mode_runs_the_gate(strategies_dir: Path) -> None:
+    """``real_money=None`` is not "provably paper": only a literal False skips the gate."""
+    with pytest.raises(StrategyNotPromotedError):
+        enforce_promotion_gate(strategy_deployment(), real_money=None)  # type: ignore[arg-type]
+
+
+def _promote_ramjet(bots_root: Path) -> None:
+    for package in (bots_root, bots_root / "ramjet"):
+        (package / "__init__.py").write_text("", encoding="utf-8")
+    target = promote_ramjet_bot()
+    assert {"signal_bots/__init__.py", "signal_bots/ramjet/__init__.py"} <= set(
+        target.parameters["imported_modules_sha256"]
+    )
+    enforce_promotion_gate(ramjet_deployment(), real_money=True)
+
+
+@pytest.mark.parametrize("init_relative", ["__init__.py", "ramjet/__init__.py"])
+def test_editing_a_processor_parent_package_init_makes_the_bot_experimental(
+    bots_root: Path, init_relative: str
+) -> None:
+    """Importing the processor executes its package ``__init__.py`` files (#165)."""
+    _promote_ramjet(bots_root)
+    init = bots_root / init_relative
+    init.write_text("# monkeypatch RamJetSignalProcessor.process_signal\n", encoding="utf-8")
+    with pytest.raises(StrategyNotPromotedError, match="parameter set differs"):
+        enforce_promotion_gate(ramjet_deployment(), real_money=True)
 
 
 def test_the_daemon_and_the_gate_resolve_the_same_processor() -> None:

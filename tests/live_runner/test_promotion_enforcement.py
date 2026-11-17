@@ -20,12 +20,15 @@ import pytest
 from fastapi.testclient import TestClient
 
 from live_runner import daemon
+from live_runner import promotion as live_promotion
 from live_runner.base_adapter import BaseLiveAdapter
 from live_runner.preflight import run_live_preflight
 from runner.promotion_gate import StrategyNotPromotedError
 from shared.models import LiveAccountConfig, LiveSignal
 from tests.test_promotion_gate import (
     STRATEGY_NAME,
+    make_signal_bots_root,
+    promote_ramjet_bot,
     promote_strategy_file,
     strategy_deployment,
     use_strategies_dir,
@@ -35,6 +38,16 @@ from tests.test_promotion_gate import (
 @pytest.fixture
 def strategies_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return use_strategies_dir(tmp_path, monkeypatch)
+
+
+@pytest.fixture
+def bots_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    import signal_bots.registry as registry
+
+    root = make_signal_bots_root(tmp_path / "signal_bots")
+    monkeypatch.setattr(registry, "_ROOT", root)
+    monkeypatch.setattr(live_promotion, "REPOSITORY_ROOT", tmp_path)
+    return root
 
 
 # --------------------------------------------------------------------------- #
@@ -415,7 +428,13 @@ def test_viewer_top_n_dry_run_accepts_a_promoted_strategy_on_real_money(
     assert response.status_code == 200, response.text
 
 
-def _create(monkeypatch: pytest.MonkeyPatch, discovery: Any, *, settings: dict | None = None):
+def _create(
+    monkeypatch: pytest.MonkeyPatch,
+    discovery: Any,
+    *,
+    settings: dict | None = None,
+    signal_processor: str | None = None,
+):
     """POST /api/live/deployments for an Alpaca Discord deployment of STRATEGY_NAME."""
     import viewer.main as viewer
     from shared.models import Service, ServiceStatus, ServiceType
@@ -442,7 +461,13 @@ def _create(monkeypatch: pytest.MonkeyPatch, discovery: Any, *, settings: dict |
     monkeypatch.setattr(
         viewer,
         "_ensure_live_account_for_deployment",
-        lambda account_id: {"id": account_id, "broker": "alpaca", "name": "Alpaca"},
+        lambda account_id: {
+            "id": account_id,
+            "broker": "alpaca",
+            "name": "Alpaca",
+            # The account number the ramjet route requires (live_runner.stockkit_routing).
+            "broker_login": "PA3T0MQAGQ51",
+        },
     )
     created: list[Any] = []
     monkeypatch.setattr(viewer, "create_live_deployment", lambda d: created.append(d) or d)
@@ -455,7 +480,10 @@ def _create(monkeypatch: pytest.MonkeyPatch, discovery: Any, *, settings: dict |
             "timeframe": "1h",
             "signal_source_type": "discord",
             "signal_source_id": STRATEGY_NAME,
-            "signal_config": {"channel_id": "1431465140905185452"},
+            "signal_config": {
+                "channel_id": "1431465140905185452",
+                **({"signal_processor": signal_processor} if signal_processor else {}),
+            },
             "settings": settings or {},
         },
     )
@@ -487,17 +515,32 @@ def test_viewer_create_refuses_a_non_promoted_strategy_on_real_or_unknown_money(
     assert created == []
 
 
-def test_viewer_create_accepts_a_promoted_strategy_on_real_money(
-    strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
+def test_viewer_create_accepts_a_promoted_signal_bot_on_real_money(
+    bots_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    promote_strategy_file(strategies_dir)
-    response, created = _create(monkeypatch, _LIVE, settings={"risk_per_trade_pct": 0.01})
+    promote_ramjet_bot()
+    response, created = _create(
+        monkeypatch, _LIVE, settings={"risk_per_trade_pct": 0.01}, signal_processor="ramjet"
+    )
     assert response.status_code == 201, response.text
     assert len(created) == 1
 
 
-def _paused_discord_deployment(database_module) -> str:
-    database_module.ensure_live_account("acc-1", "alpaca", is_demo=True)
+def test_viewer_create_refuses_a_discord_deployment_without_a_processor_on_real_money(
+    strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The raw channel signal is traded, not the same-named strategy file (#165)."""
+    promote_strategy_file(strategies_dir)
+    response, created = _create(monkeypatch, _LIVE, settings={"risk_per_trade_pct": 0.01})
+    assert response.status_code == 409, response.text
+    assert "raw channel signals" in response.json()["detail"]
+    assert created == []
+
+
+def _paused_discord_deployment(database_module, *, signal_processor: str | None = None) -> str:
+    database_module.ensure_live_account(
+        "acc-1", "alpaca", is_demo=True, broker_login="PA3T0MQAGQ51"
+    )
     did = str(uuid.uuid4())
     database_module.create_live_deployment(
         database_module.LiveDeploymentConfig(
@@ -509,7 +552,10 @@ def _paused_discord_deployment(database_module) -> str:
             status="PAUSED",
             signal_source_type="discord",
             signal_source="discord",
-            signal_config={"channel_id": "1431465140905185452"},
+            signal_config={
+                "channel_id": "1431465140905185452",
+                **({"signal_processor": signal_processor} if signal_processor else {}),
+            },
         )
     )
     return did
@@ -560,13 +606,13 @@ def test_viewer_activation_on_unconfirmed_account_names_the_promotion_refusal(
     assert "Promotion gate refused" in entry["detail"]["promotion_gate"]
 
 
-def test_viewer_demo_only_block_still_refuses_a_promoted_strategy_on_real_money(
-    strategies_dir: Path, isolated_db_sandbox, monkeypatch: pytest.MonkeyPatch
+def test_viewer_demo_only_block_still_refuses_a_promoted_signal_bot_on_real_money(
+    bots_root: Path, isolated_db_sandbox, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Promotion is necessary, not sufficient: the demo-only block stays (#165)."""
     database_module, _engine, _data_dir = isolated_db_sandbox
-    promote_strategy_file(strategies_dir)
-    did = _paused_discord_deployment(database_module)
+    promote_ramjet_bot()
+    did = _paused_discord_deployment(database_module, signal_processor="ramjet")
     response = _activate(monkeypatch, did, broker_confirms_demo=False)
     assert response.status_code == 409
     detail = response.json()["detail"]
