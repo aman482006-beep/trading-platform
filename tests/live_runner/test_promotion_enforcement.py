@@ -197,14 +197,20 @@ def test_daemon_refuses_a_promoted_strategy_after_a_file_change(strategies_dir: 
         _submit(_Adapter(demo=False))
 
 
-def test_daemon_never_blocks_an_exit_only_order(strategies_dir: Path) -> None:
+def test_daemon_never_blocks_an_exit_only_order(
+    strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.live_runner.test_exit_signal_sizing import _patch_ledger
+
+    deployment = strategy_deployment()
+    # Exits size from the deployment's own ledger (#121): it owns the whole
+    # 5.0 units the broker reports, so there is something of its own to close.
+    _patch_ledger(monkeypatch, deployment, 5.0)
     adapter = _Adapter(
         demo=False, positions=[{"symbol": "EURUSD", "qty": 5.0, "side": "long"}]
     )
     signal = _entry_signal(exit_only=True).model_copy(update={"action": "sell"})
-    prepared, qty = asyncio.run(
-        daemon.prepare_order_with_risk(adapter, strategy_deployment(), signal)
-    )
+    prepared, qty = asyncio.run(daemon.prepare_order_with_risk(adapter, deployment, signal))
     assert qty > 0
     assert prepared.metadata["exit_only"] is True
 

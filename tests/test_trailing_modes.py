@@ -226,6 +226,13 @@ class _UntouchableAdapter:
         raise AssertionError(f"adapter.{name} was used before the trailing gate")
 
 
+class _UntouchableDemoAdapter(_UntouchableAdapter):
+    """Provably demo, so the promotion gate may read the flag (#165); every other
+    broker access still fails, which is what the mode-none test relies on."""
+
+    demo = True
+
+
 def _live_signal(metadata: dict) -> LiveSignal:
     return LiveSignal(
         deployment_id="dep-1",
@@ -256,7 +263,9 @@ def test_order_preparation_lets_mode_none_through_to_sizing(monkeypatch) -> None
     monkeypatch.setattr(daemon, "_broker_exposure_estimate", _exposure)
     signal = _live_signal({"trailing_sl_config": {"mode": "none"}, "stop_loss": 95.0})
     with pytest.raises(RuntimeError, match="stop after the gate"):
-        _prepare_order(signal)
+        asyncio.run(
+            daemon.prepare_order_with_risk(_UntouchableDemoAdapter(), _deployment(), signal)
+        )
     assert reached.sizing
 
 

@@ -710,6 +710,11 @@ class _RefusingAdapter(_Adapter):
     """Refuses every order before the broker request, like a broker-side
     volume floor or Alpaca's no-position guard."""
 
+    # A provable demo/paper account: an unpromoted entry on real money is refused
+    # by the promotion gate before it reaches the broker (#165), and these tests
+    # are about the broker's own refusal.
+    demo = True
+
     async def submit_order(self, signal, *, qty=None):
         from live_runner.base_adapter import order_not_submitted
 
