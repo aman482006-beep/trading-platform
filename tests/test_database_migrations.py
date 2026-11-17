@@ -1097,3 +1097,61 @@ def test_backfill_with_the_id_another_writer_already_stored_is_a_plain_duplicate
         assert "conflicting_broker_order_ids" not in row.metadata_json
     # The write lock was released: another writer can save right away.
     save_live_signal(_make_live_signal(discord_message_id="ord-bf-3", broker_order_id="BRK-ZZZ"))
+
+
+def test_reconcile_takes_write_lock_before_re_reading(isolated_db, signal_parent) -> None:
+    """The write lock must be taken before the refresh that re-reads the row.
+
+    A competing-commit test cannot observe the lock (its commit lands before the reconcile runs),
+    so record the statement order on the engine: ``BEGIN IMMEDIATE`` has to come before the refresh.
+    """
+    from sqlalchemy import event
+
+    from shared.database import _reconcile_existing_live_signal, get_engine
+
+    first_id, _ = save_live_signal(
+        _make_live_signal(discord_message_id="ord-lock-1", broker_order_id="")
+    )
+    events: list[str] = []
+
+    def _record_statement(conn, cursor, statement, parameters, context, executemany) -> None:
+        if statement.strip().upper() == "BEGIN IMMEDIATE":
+            events.append("lock")
+
+    engine = get_engine()
+    event.listen(engine, "before_cursor_execute", _record_statement)
+    try:
+        with get_session() as session:
+            existing = session.get(LiveSignalModel, first_id)
+            original_refresh = session.refresh
+
+            def _refresh(instance, *args, **kwargs):
+                events.append("refresh")
+                return original_refresh(instance, *args, **kwargs)
+
+            session.refresh = _refresh
+            incoming = LiveSignalModel.from_live_signal(
+                _make_live_signal(discord_message_id="ord-lock-1", broker_order_id="BRK-NEW")
+            )
+            _reconcile_existing_live_signal(session, existing, incoming)
+    finally:
+        event.remove(engine, "before_cursor_execute", _record_statement)
+
+    assert events == ["lock", "refresh"]
+    with get_session() as session:
+        assert session.get(LiveSignalModel, first_id).broker_order_id == "BRK-NEW"
+
+
+def test_blank_broker_id_redelivery_never_records_a_conflict(isolated_db, signal_parent) -> None:
+    """A blank id means no id: it must not be recorded as a conflict, even against a tracked id."""
+    from shared.database import list_live_signal_broker_order_conflicts
+
+    signal_id, _ = save_live_signal(
+        _make_live_signal(discord_message_id="ord-blank-1", broker_order_id="BRK-1")
+    )
+    save_live_signal(_make_live_signal(discord_message_id="ord-blank-1", broker_order_id=""))
+    with get_session() as session:
+        row = session.get(LiveSignalModel, signal_id)
+        assert row.broker_order_id == "BRK-1"
+        assert "conflicting_broker_order_ids" not in row.metadata_json
+    assert list_live_signal_broker_order_conflicts() == []
