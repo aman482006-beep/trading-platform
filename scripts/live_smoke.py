@@ -1049,6 +1049,17 @@ class _DiscordSmokeAdapter:
     async def get_positions(self) -> list[dict[str, Any]]:
         return []
 
+    async def get_quote(self, symbol: str) -> Any:
+        # #125 entry-deviation gate: quote at the replayed message price.
+        from live_runner.base_adapter import LiveQuote
+
+        return LiveQuote(
+            bid=190.50,
+            ask=190.50,
+            timestamp=datetime.now(timezone.utc),
+            source="discord-smoke",
+        )
+
 
 async def _discord_replay_smoke() -> list[SmokeCheck]:
     from types import SimpleNamespace
@@ -1357,7 +1368,13 @@ def _stockkit_deployment_and_signal(
         signal_source_type="discord",
         signal_source="discord",
         signal_source_id=route.upper(),
-        signal_config={"service_name": route, "channel_id": str(message.channel.id)},
+        # Explicitly marked as StockKit (#121): an unknown route then fails closed
+        # instead of silently skipping the broker-account check.
+        signal_config={
+            "service_name": route,
+            "channel_id": str(message.channel.id),
+            "stockkit_route": route,
+        },
         settings={
             "max_risk_per_trade": 0.00004,
             "max_total_exposure": 0.00008,

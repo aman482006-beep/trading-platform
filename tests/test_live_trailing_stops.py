@@ -921,6 +921,16 @@ def test_prepared_order_keeps_the_trailing_config_that_gets_persisted() -> None:
         async def get_balance(self) -> tuple[float, float]:
             return (100_000.0, 100_000.0)
 
+        async def get_quote(self, symbol: str):
+            # Entries need a fresh broker quote for the #125 deviation gate (#141).
+            from live_runner.base_adapter import LiveQuote
+
+            return LiveQuote(
+                bid=100.0,
+                ask=100.0,
+                timestamp=datetime.now(timezone.utc),
+            )
+
     deployment = LiveDeploymentConfig(
         strategy_name="trail-probe",
         account_id=ACCOUNT,
