@@ -477,6 +477,35 @@ def test_out_of_sample_evidence_is_read_from_the_result_file(tmp_path: Path) -> 
     assert len(evidence.result_sha256) == 64
 
 
+def test_out_of_sample_evidence_reads_the_final_holdout_not_the_validation_window(
+    tmp_path: Path,
+) -> None:
+    # Legacy keys `test_period`/`test_stats` now carry the VALIDATION window (#173).
+    # A validation window that looks well-traded and long must not stand in for
+    # the untouched final holdout the promotion is judged on.
+    path = _optimizer_result(
+        tmp_path,
+        test_period={"start": "2024-01-01", "end": "2025-06-30"},
+        test_stats={"total_trades": 500.0},
+        validation_period={"start": "2024-01-01", "end": "2025-06-30"},
+        validation_stats={"total_trades": 500.0},
+        final_test_period={"start": "2025-07-01", "end": "2025-08-15"},
+        final_test_stats={"total_trades": 10.0},
+    )
+    evidence = out_of_sample_evidence_from_result(path)
+    assert evidence.test_trade_count == 10
+    assert evidence.test_start == "2025-07-01"
+    assert evidence.test_end == "2025-08-15"
+    problems = evidence.problems(
+        PromotionThresholds(),
+        kind="strategy",
+        file_name=f"{STRATEGY_NAME}.py",
+        parameters_sha256=parameters_hash(DEFAULTS),
+    )
+    assert any("10 trades in the test segment" in problem for problem in problems)
+    assert any("test segment is 45.0 days" in problem for problem in problems)
+
+
 @pytest.mark.parametrize(
     "overrides, expected",
     [
