@@ -820,6 +820,11 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             "Connected Alpaca live adapter",
             extra={"data": {"account_id": self.account_id, "paper": self.paper}},
         )
+        # This is the ONLY reconciliation trigger on this adapter: Alpaca has no periodic pass
+        # and no `_reconciliation_required` retry queue the way cTrader does
+        # (`ctrader_adapter._run_pending_reconciliation`). Every refusal to store a fill that
+        # lacks a usable timestamp therefore recovers at the next connect, so the warnings
+        # must say so rather than promise a pass.
         try:
             await self.reconcile_executions()
         except Exception as exc:
@@ -902,8 +907,8 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         if fill_ts is None:
             logger.warning(
                 "Alpaca order has filled quantity but neither a usable filled_at nor updated_at; "
-                "not persisting the missed fill with an invented time, the next reconciliation "
-                "pass retries",
+                "not persisting the missed fill with an invented time. reconciliation runs only "
+                "when the adapter connects, so the next adapter connect retries it",
                 extra={
                     "data": {
                         "account_id": self.account_id,
@@ -2713,8 +2718,8 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 logger.warning(
                     "Alpaca fill carries no usable timestamp on the event or its order; no "
                     "execution row was stored (never an invented time), so the local filled "
-                    "quantity understates the broker's until reconcile_executions backfills it "
-                    "from the order once the broker reports a fill time",
+                    "quantity understates the broker's until the next adapter connect runs "
+                    "reconciliation and the order reports a fill time",
                     extra={
                         "data": {
                             "account_id": self.account_id,

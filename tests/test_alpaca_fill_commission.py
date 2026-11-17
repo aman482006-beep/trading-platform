@@ -2485,9 +2485,34 @@ def test_stream_refusal_logs_the_quantity_that_was_not_stored(monkeypatch, live_
     data = refusals[0].data
     assert data["filled_qty"] == pytest.approx(float(update.qty))
     assert data["broker_cumulative_filled_qty"] == pytest.approx(float(update.order.filled_qty))
+    assert "adapter connect" in refusals[0].getMessage(), (
+        "the refusal must say the retry is the next connect: the Alpaca adapter runs "
+        "reconcile_executions on connect only, with no periodic pass to promise"
+    )
 
 
-@pytest.mark.parametrize("date_only", ["2026-11-03", "20261103", "2026-11-03T", "2026-W45"])
+def test_reconcile_refusal_names_the_connect_that_retries_it(db, live_runner_logs):
+    signal = _signal(db)
+    order = _order(
+        signal, filled_qty="5", filled_avg_price="101.5", order_id=_order_id("rec-connect")
+    )
+    order.filled_at = None
+
+    assert asyncio.run(_adapter(order).reconcile_executions()) == 0
+    assert _rows(db, signal) == []
+    refusals = [
+        record for record in live_runner_logs.records if "updated_at" in record.getMessage()
+    ]
+    assert len(refusals) == 1
+    assert "adapter connect" in refusals[0].getMessage(), (
+        "Alpaca has no reconciliation timer (cTrader does): the log must not promise a pass"
+    )
+
+
+@pytest.mark.parametrize(
+    "date_only",
+    ["2026-11-03", "20261103", "2026-11-03T", "2026-W45", datetime(2026, 11, 3).date()],
+)
 def test_a_date_without_a_time_of_day_is_not_a_fill_timestamp(date_only):
     from live_runner.alpaca_adapter import _broker_fill_timestamp
 
