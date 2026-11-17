@@ -3420,6 +3420,23 @@ def _duplicate_portfolio_members() -> list[dict[str, Any]]:
     return members
 
 
+def _current_duplicate_member(
+    load_members: Callable[[], list[dict[str, Any]]], item_id: str
+) -> dict[str, Any] | None:
+    """Return ``item_id``'s member entry from a fresh duplicate-group read.
+
+    Used immediately before each confirmed delete. The confirm loop must not
+    act on the dry-run snapshot: if the other members of a group disappear in
+    between, the id may now be the last surviving entry, and deleting it would
+    destroy the group's only copy. ``None`` means it is no longer a duplicate
+    (or no longer exists).
+    """
+    for member in load_members():
+        if str(member["id"]) == item_id:
+            return member
+    return None
+
+
 def _current_backtest_store_mtime_ns() -> int:
     try:
         return int(BACKTEST_DB_PATH.stat().st_mtime_ns)
@@ -9490,7 +9507,6 @@ async def deduplicate_backtests(
             detail="dry_run=false requires the id list returned by the dry run",
         )
 
-    member_by_id = {str(member["id"]): member for member in members}
     deleted_ids: list[str] = []
     skipped_ids: list[str] = []
     affected_fingerprints: set[str] = set()
@@ -9501,7 +9517,7 @@ async def deduplicate_backtests(
         if not backtest_id or backtest_id in seen:
             continue
         seen.add(backtest_id)
-        member = member_by_id.get(backtest_id)
+        member = _current_duplicate_member(_duplicate_backtest_members, backtest_id)
         if member is None:
             items.append(_bulk_delete_skipped_item(backtest_id, "no_longer_duplicate"))
             skipped_ids.append(backtest_id)
@@ -12131,7 +12147,6 @@ async def deduplicate_portfolios(
             detail="dry_run=false requires the id list returned by the dry run",
         )
 
-    member_by_id = {str(member["id"]): member for member in members}
     deleted_ids: list[str] = []
     skipped_ids: list[str] = []
     affected_fingerprints: set[str] = set()
@@ -12142,7 +12157,7 @@ async def deduplicate_portfolios(
         if not portfolio_id or portfolio_id in seen:
             continue
         seen.add(portfolio_id)
-        member = member_by_id.get(portfolio_id)
+        member = _current_duplicate_member(_duplicate_portfolio_members, portfolio_id)
         if member is None:
             items.append(_bulk_delete_skipped_item(portfolio_id, "no_longer_duplicate"))
             skipped_ids.append(portfolio_id)
