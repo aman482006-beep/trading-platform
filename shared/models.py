@@ -213,13 +213,14 @@ class LiveDeploymentConfig(BaseModel):
 
     @model_validator(mode="after")
     def _validate_trailing_mode_override(self, info: ValidationInfo) -> "LiveDeploymentConfig":
-        # Issue #150 fail closed: the live path supports trailing mode "none"
-        # only (live trailing does not exist yet, #167). A deployment that
-        # overrides the signal-processor trailing mode to anything else is a
-        # configuration error and is rejected here — at YAML parse time and at
-        # API creation time — instead of being traded without its trailing.
-        # Deployments without the override inherit the processor's own
-        # (constructor-validated) default.
+        # Issue #150 fail closed, first stage: only the account id is known
+        # here, not its broker, so this rejects a trailing mode that NO live
+        # broker executes (unknown modes, supertrend_flip). Live support is
+        # per broker (#167): the broker-aware stage runs where the account is
+        # resolved (`create_live_deployment`, `update_live_deployment_account`,
+        # `parse_live_deployments_config`) and again at signal time against
+        # the adapter. Deployments without the override inherit the
+        # processor's own (constructor-validated) default.
         #
         # Stored rows are the exception: they are rehydrated on every DB read,
         # so a row written before/outside this check must not make the whole
