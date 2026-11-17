@@ -224,6 +224,15 @@ Order): SL/TP auf der falschen Seite des Entry, SL/TP innerhalb eines Ticks vom 
 fehlende/ungültige SL/TP-Level, Extended-Hours-Brackets und Crypto-Symbole (Alpaca
 kennt keine Bracket-/OTO-Orders für Crypto).
 
+
+## Broker-Raster (cTrader)
+
+cTrader bekommt SL/TP als relative Distanzen in 1/100000 des Preises. Das Raster ist
+`10 ** max(0, 5 - price_digits)` des Symbols. Beide Distanzen werden **zum Entry hin
+abgerundet** (`floor`), damit das tatsächliche Risiko nie über dem gesizten Budget
+liegt: ein Stop von 1,6 Ticks geht als 1 Tick raus. Ein Stop unter einem Tick wird
+abgelehnt (ValueError vor dem Senden), ein Take-Profit unter einem Tick wird als ein
+Tick gesendet (nie 0).
 ## Implizite Divergenz
 
 Der Unterschied bei `enforce_stop_direction` führt dazu, dass:

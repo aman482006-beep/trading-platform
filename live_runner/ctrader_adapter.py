@@ -181,6 +181,53 @@ EXECUTION_RETRY_LIMIT = 3
 UNRESOLVED_EXECUTION_EVENT_LIMIT = 1000
 
 
+def _power_of_ten_exponent(value: int) -> int:
+    """Return ``n`` for ``value == 10 ** n``; fail loudly for any other value."""
+    exponent = len(str(value)) - 1 if value > 0 else -1
+    if exponent < 0 or 10**exponent != value:
+        raise ValueError(f"Expected a power of ten, got {value!r}.")
+    return exponent
+
+
+def _relative_distance(
+    symbol: str,
+    reference_price: float,
+    price: float,
+    scale: int,
+    grid: int,
+    *,
+    is_stop: bool,
+) -> int:
+    """Positive SL/TP distance in 1/``scale`` price units, floored to ``grid``.
+
+    Floors toward the entry so a stop never widens beyond the risk the position was
+    sized for. A stop under one tick is refused; a take-profit under one tick is
+    sent as one tick (0 would mean "no TP").
+    """
+    leg = "SL" if is_stop else "TP"
+    if math.isnan(price) or math.isinf(price) or price <= 0:
+        raise ValueError(f"Invalid {leg} price for {symbol}: {price!r}; refusing to submit.")
+    distance = abs(reference_price - price)
+    if distance <= 0:
+        raise ValueError(
+            f"{leg} price {price!r} equals the reference price {reference_price!r} "
+            f"for {symbol}; refusing to submit a zero-distance {leg}."
+        )
+    raw = distance * scale
+    if not math.isfinite(raw) or raw < 1:
+        raise ValueError(
+            f"{leg} distance for {symbol} resolves to {raw!r} "
+            f"(below one 1/{scale} price unit); refusing to submit."
+        )
+    if is_stop and raw < grid * (1 - 1e-9):  # float noise at exactly one tick
+        raise ValueError(
+            f"{leg} distance for {symbol} is below one tick of the symbol "
+            f"price grid ({raw!r} < {grid} protocol units); refusing to submit "
+            "rather than widen the stop beyond the sized risk."
+        )
+    return max(grid, math.floor(raw / grid + 1e-9) * grid)
+
+
 def _utc_now() -> datetime:
     """Receive-time clock for spot events (a seam so tests can freeze it)."""
     return datetime.now(timezone.utc)
@@ -229,8 +276,10 @@ class SymbolScale:
     The qty unit is 0.01 lots, so ``volume_per_qty = lotSize / 100``
     (broker EURUSD: 10_000_000/100 = 100_000; the fallback table's FX
     100_000/100 = 1000 is in base units, see the unit contract above).
-    ``price_digits``: broker-reported symbol price decimals retained as symbol
-    metadata; relative SL/TP always uses the fixed protocol divisor.
+    ``price_digits``: broker-reported symbol price decimals. Relative SL/TP units
+    always use the fixed protocol divisor; ``price_digits`` only sizes the price-grid
+    the distance is floored to, toward the entry (``10 ** (5 - price_digits)`` units,
+    1 if finer).
     ``min_volume``: broker minimum order volume (fail-closed floor).
     ``source``: "broker" (ProtoOASymbol props) or "fallback" (static table).
     ``lot_size_from_broker``: the broker sent ``lotSize`` itself. A "broker"
@@ -2525,6 +2574,14 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         1/100000 of a price unit (123000 means 1.23), where for BUY
         stopLoss = entryPrice - relativeStopLoss and takeProfit
         = entryPrice + relativeTakeProfit (reversed for SELL).
+
+        The broker also rejects a distance finer than the symbol's price precision
+        (``Relative stop loss has invalid precision``), so each distance is floored
+        to the symbol grid of ``10 ** (5 - price_digits)`` units (1 when the symbol
+        is finer than 5 digits), i.e. toward the entry, so the real risk never
+        exceeds the sized risk (docs/live-risk-consistency.md). A take-profit under
+        one tick is sent as one tick (0 would mean "no TP"); a stop-loss under one
+        tick is refused, because widening it would exceed the sized risk.
         """
         reference_price = float(signal.theoretical_price)
         if not math.isfinite(reference_price) or reference_price <= 0:
@@ -2532,31 +2589,18 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 f"Invalid reference price for {signal.symbol}: "
                 f"{signal.theoretical_price!r}; refusing to submit."
             )
-        self._scale_for(signal.symbol)
+        symbol_scale = self._scale_for(signal.symbol)
         scale = CTRADER_RELATIVE_PRICE_UNIT_DIVISOR
+        # The broker validates a relative distance against the symbol's own price
+        # precision (``Relative stop loss has invalid precision``): on a 2-digit symbol
+        # (ETHUSD, XAUUSD, indices) it must be a multiple of 1000 protocol units, on a
+        # 3-digit one a multiple of 100. Sent unrounded, every such order is rejected.
+        grid = 10 ** max(0, _power_of_ten_exponent(scale) - symbol_scale.price_digits)
 
-        def _distance(price: float) -> int:
-            if math.isnan(price) or math.isinf(price) or price <= 0:
-                raise ValueError(
-                    f"Invalid SL/TP price for {signal.symbol}: {price!r}; "
-                    "refusing to submit."
-                )
-            distance = abs(reference_price - price)
-            if distance <= 0:
-                raise ValueError(
-                    f"SL/TP price {price!r} equals the reference price "
-                    f"{reference_price!r} for {signal.symbol}; refusing to "
-                    "submit a zero-distance SL/TP."
-                )
-            raw = distance * scale
-            if not math.isfinite(raw) or raw < 1:
-                raise ValueError(
-                    f"SL/TP distance for {signal.symbol} resolves to {raw!r} "
-                    f"(below one 1/{scale} price unit); refusing to submit."
-                )
-            # Distance is signed by direction at the protocol level; the value
-            # sent is always the positive magnitude in 1/scale price units.
-            return int(round(raw))
+        def distance(price: float, *, is_stop: bool) -> int:
+            return _relative_distance(
+                signal.symbol, reference_price, price, scale, grid, is_stop=is_stop
+            )
 
         buy = signal.action == "buy"
         stop_outward = reference_price - stop_loss if buy else stop_loss - reference_price
@@ -2569,7 +2613,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         if take_profit is None:
             # C1: explicit unbounded policy — stop-only order. cTrader treats
             # a zero relativeTakeProfit as "no take profit".
-            return (_distance(stop_loss), 0)
+            return (distance(stop_loss, is_stop=True), 0)
         take_outward = take_profit - reference_price if buy else reference_price - take_profit
         if take_outward <= 0:
             raise ValueError(
@@ -2577,7 +2621,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 f"{signal.symbol} ({signal.action}): take_profit={take_profit!r}, "
                 f"reference={reference_price!r}; refusing to submit."
             )
-        return (_distance(stop_loss), _distance(take_profit))
+        return (distance(stop_loss, is_stop=True), distance(take_profit, is_stop=False))
 
     async def _submit_new_order_request(self, request: Any) -> Any:
         try:

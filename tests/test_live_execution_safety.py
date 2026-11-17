@@ -3578,7 +3578,7 @@ def test_ctrader_relative_sl_tp_direction_and_rejections():
     with pytest.raises(ValueError, match="wrong side of the reference price"):
         wrong_side(wrong_side_signal, symbol_id=7)
     nan_signal = _signal("buy", float("nan"), 1.2)
-    with pytest.raises(ValueError, match="Invalid SL/TP price"):
+    with pytest.raises(ValueError, match="Invalid SL price"):
         wrong_side(nan_signal, symbol_id=7)
     zero_distance_signal = _signal("buy", 1.1, 1.2)
     with pytest.raises(ValueError, match="wrong side of the reference price"):
@@ -4327,6 +4327,161 @@ def test_ctrader_jpy_relative_sl_tp_uses_fixed_protocol_divisor() -> None:
     request = adapter._build_new_order_request(signal, symbol_id=9)
     assert request.relativeStopLoss == 5000
     assert request.relativeTakeProfit == 10000
+
+
+@pytest.mark.parametrize(
+    ("digits", "grid"),
+    [(2, 1000), (3, 100), (4, 10), (5, 1)],
+)
+def test_ctrader_relative_sl_tp_snaps_to_symbol_price_grid(digits: int, grid: int) -> None:
+    """cTrader rejects a relative distance that is finer than the symbol's price digits
+    (``Relative stop loss has invalid precision``, seen on a demo ETHUSD order), so the
+    sent distance is snapped to the symbol grid: 1000 units at 2 digits, 100 at 3, ..."""
+    module, adapter = _make_ctrader_request_builder_adapter()
+    adapter._symbol_props["ETHUSD"] = module.SymbolScale(
+        volume_per_qty=1.0,
+        price_digits=digits,
+        min_volume=1,
+        lot_size=100.0,
+        source="broker",
+    )
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="ETHUSD",
+        action="buy",
+        theoretical_price=1925.50,
+        timestamp=datetime.now(timezone.utc),
+        # 9.62751 below / 9.62749 above: both off-grid below 5 digits.
+        metadata={"qty": 1.0, "stop_loss": 1925.50 - 9.62751, "take_profit": 1925.50 + 9.62749},
+    )
+    request = adapter._build_new_order_request(signal, symbol_id=9)
+    assert request.relativeStopLoss % grid == 0
+    assert request.relativeTakeProfit % grid == 0
+    # Snapping floors toward the entry: never beyond the requested distance, and by
+    # less than one tick short of it.
+    assert 0 <= 962_751 - request.relativeStopLoss < grid
+    assert 0 <= 962_749 - request.relativeTakeProfit < grid
+
+
+def _ethusd_signal(stop_loss: float, take_profit: float | None) -> LiveSignal:
+    metadata: dict = {"qty": 1.0, "stop_loss": stop_loss}
+    if take_profit is not None:
+        metadata["take_profit"] = take_profit
+    else:  # stop-only orders need the explicit unbounded policy
+        metadata["take_profit_policy"] = "unbounded_exit_on_opposite_signal"
+    return LiveSignal(
+        deployment_id="dep-1",
+        symbol="ETHUSD",
+        action="buy",
+        theoretical_price=1925.50,
+        timestamp=datetime.now(timezone.utc),
+        metadata=metadata,
+    )
+
+
+def _seed_digits(module, adapter, digits: int) -> None:
+    adapter._symbol_props["ETHUSD"] = module.SymbolScale(
+        volume_per_qty=1.0, price_digits=digits, min_volume=1, lot_size=100.0, source="broker"
+    )
+
+
+def test_ctrader_sub_tick_take_profit_is_sent_as_one_tick_never_zero() -> None:
+    """A TP under one tick is sent as one tick, not 0 (0 means 'no TP'). Widening a
+    take-profit does not add risk."""
+    module, adapter = _make_ctrader_request_builder_adapter()
+    _seed_digits(module, adapter, 2)
+    request = adapter._build_new_order_request(
+        _ethusd_signal(1925.50 - 5.0, 1925.504), symbol_id=9
+    )
+    assert request.relativeTakeProfit == 1000
+
+
+def test_ctrader_sub_tick_stop_loss_is_refused_not_widened() -> None:
+    """The risk engine sized qty from the requested stop distance; widening a sub-tick
+    stop to a full tick would exceed the per-trade risk, so it fails closed."""
+    module, adapter = _make_ctrader_request_builder_adapter()
+    _seed_digits(module, adapter, 2)
+    with pytest.raises(ValueError, match="SL distance .* below one tick"):
+        adapter._build_new_order_request(_ethusd_signal(1925.496, 1925.50 + 5.0), symbol_id=9)
+    # Exactly one tick is accepted.
+    request = adapter._build_new_order_request(_ethusd_signal(1925.49, 1925.60), symbol_id=9)
+    assert request.relativeStopLoss == 1000
+
+
+@pytest.mark.parametrize("stop", [1925.496, 1925.50 - 0.009])
+def test_ctrader_sub_tick_stop_loss_is_refused_for_each_sub_tick_price(stop: float) -> None:
+    module, adapter = _make_ctrader_request_builder_adapter()
+    _seed_digits(module, adapter, 2)
+    with pytest.raises(ValueError, match="below one tick"):
+        adapter._build_new_order_request(_ethusd_signal(stop, 1925.50 + 5.0), symbol_id=9)
+
+
+def test_ctrader_sub_tick_stop_loss_is_refused_on_stop_only_order() -> None:
+    module, adapter = _make_ctrader_request_builder_adapter()
+    _seed_digits(module, adapter, 2)
+    with pytest.raises(ValueError, match="SL distance .* below one tick"):
+        adapter._build_new_order_request(_ethusd_signal(1925.50 - 0.004, None), symbol_id=9)
+    request = adapter._build_new_order_request(_ethusd_signal(1925.49, None), symbol_id=9)
+    assert request.relativeStopLoss == 1000
+    assert request.relativeTakeProfit == 0
+
+
+@pytest.mark.parametrize(
+    ("stop_ticks", "take_ticks", "expected_stop", "expected_take"),
+    [
+        (1.6, 1.6, 1000, 1000),  # floored toward entry, never widened to 2 ticks
+        (2.5, 2.5, 2000, 2000),
+        (1.0, 1.0, 1000, 1000),  # exactly one tick accepted
+        (2.0, 0.4, 2000, 1000),  # sub-tick TP -> one tick, never 0
+    ],
+)
+def test_ctrader_relative_distances_floor_toward_entry(
+    stop_ticks: float, take_ticks: float, expected_stop: int, expected_take: int
+) -> None:
+    """Rounding must never widen a stop beyond the sized risk (docs/live-risk-consistency.md)."""
+    module, adapter = _make_ctrader_request_builder_adapter()
+    _seed_digits(module, adapter, 2)
+    request = adapter._build_new_order_request(
+        _ethusd_signal(1925.50 - 0.01 * stop_ticks, 1925.50 + 0.01 * take_ticks), symbol_id=9
+    )
+    assert request.relativeStopLoss == expected_stop
+    assert request.relativeTakeProfit == expected_take
+
+
+def test_ctrader_relative_distance_error_names_the_leg() -> None:
+    module, adapter = _make_ctrader_request_builder_adapter()
+    _seed_digits(module, adapter, 2)
+    with pytest.raises(ValueError, match="TP price"):
+        adapter._build_new_order_request(_ethusd_signal(1925.50 - 5.0, float("nan")), symbol_id=9)
+
+
+@pytest.mark.parametrize(("scale", "exp"), [(100_000, 5), (10, 1), (1, 0)])
+def test_ctrader_price_grid_exponent_requires_power_of_ten(scale: int, exp: int) -> None:
+    from live_runner import ctrader_adapter as module
+
+    assert module._power_of_ten_exponent(scale) == exp
+
+
+@pytest.mark.parametrize("scale", [0, -10, 50_000, 12])
+def test_ctrader_price_grid_exponent_rejects_non_power_of_ten(scale: int) -> None:
+    from live_runner import ctrader_adapter as module
+
+    with pytest.raises(ValueError, match="power of ten"):
+        module._power_of_ten_exponent(scale)
+
+
+@pytest.mark.parametrize("digits", [6, 8, 10])
+def test_ctrader_relative_sl_tp_handles_price_digits_above_five(digits: int) -> None:
+    """Symbols finer than the 1/100000 protocol unit keep grid 1 and int64 fields."""
+    module, adapter = _make_ctrader_request_builder_adapter()
+    _seed_digits(module, adapter, digits)
+    request = adapter._build_new_order_request(
+        _ethusd_signal(1925.50 - 9.62751, 1925.50 + 9.62749), symbol_id=9
+    )
+    assert isinstance(request.relativeStopLoss, int)
+    assert isinstance(request.relativeTakeProfit, int)
+    assert request.relativeStopLoss == 962_751
+    assert request.relativeTakeProfit == 962_749
 
 
 def test_ctrader_xau_order_volume_uses_ounce_scale() -> None:
