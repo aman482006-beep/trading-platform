@@ -488,7 +488,9 @@ def test_order_preparation_lets_percent_through_on_a_trailing_adapter(monkeypatc
         {"trailing_sl_config": {"mode": "percent", "percent": 0.02}, "stop_loss": 95.0}
     )
     deployment = _deployment()
-    preparation = daemon.prepare_order_with_risk(_ALPACA_LIKE, deployment, signal)
+    # Provably demo, so the promotion gate (#165) lets the order reach sizing.
+    adapter = SimpleNamespace(broker_name="alpaca", supports_stop_amendment=True, demo=True)
+    preparation = daemon.prepare_order_with_risk(adapter, deployment, signal)
     with pytest.raises(RuntimeError, match="stop after the gate"):
         asyncio.run(preparation)
     assert reached.sizing
