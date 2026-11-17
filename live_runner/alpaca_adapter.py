@@ -440,6 +440,9 @@ def _resolve_optional_float(metadata: Mapping[str, Any], keys: tuple[str, ...]) 
     return None
 
 
+_DATE_TIME_PREFIX = re.compile(r"^\d{4}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}")
+
+
 def _broker_fill_timestamp(*candidates: Any) -> datetime | None:
     """The first usable broker timestamp among ``candidates``, as an aware UTC datetime.
 
@@ -449,6 +452,10 @@ def _broker_fill_timestamp(*candidates: Any) -> datetime | None:
     PnL by this column and a fabricated time would be stored with nothing to correct it later.
     """
     for candidate in candidates:
+        # A string must carry a time of day: ``fromisoformat`` also reads a bare date as midnight,
+        # which would be an invented instant. Alpaca always sends full RFC 3339.
+        if isinstance(candidate, str) and _DATE_TIME_PREFIX.match(candidate.strip()) is None:
+            continue
         stamp = canonical_utc_timestamp(candidate)
         if stamp is not None:
             return datetime.fromisoformat(stamp)
@@ -2374,9 +2381,10 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
 
             if fill_ts is None:
                 logger.warning(
-                    "Alpaca fill carries no usable timestamp on the event or its order; not "
-                    "storing it with an invented time. reconcile_executions backfills it from "
-                    "the order once the broker reports a fill time",
+                    "Alpaca fill carries no usable timestamp on the event or its order; no "
+                    "execution row was stored (never an invented time), so the local filled "
+                    "quantity understates the broker's until reconcile_executions backfills it "
+                    "from the order once the broker reports a fill time",
                     extra={
                         "data": {
                             "account_id": self.account_id,
@@ -2384,6 +2392,8 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                             "broker_order_id": broker_order_id,
                             "event": event,
                             "execution_id": execution_id,
+                            "filled_qty": filled_qty,
+                            "broker_cumulative_filled_qty": broker_cumulative_filled_qty,
                         }
                     },
                 )

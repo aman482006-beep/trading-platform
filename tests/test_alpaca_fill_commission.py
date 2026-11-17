@@ -2431,3 +2431,35 @@ def test_reconcile_with_no_order_time_persists_nothing_then_retries(db, live_run
     order.filled_at = ORDER_FILLED_AT
     assert asyncio.run(adapter.reconcile_executions()) == 1
     assert [row.timestamp for row in _rows(db, signal)] == [ORDER_FILLED_AT.replace(tzinfo=None)]
+
+
+def test_stream_refusal_logs_the_quantity_that_was_not_stored(monkeypatch, live_runner_logs):
+    saved = _stream_capture(monkeypatch)
+    update = _trade_update(
+        signal_id=str(uuid4()),
+        order_id=_order_id("ts-nowhere-qty"),
+        asset_class="us_equity",
+        symbol="AAPL",
+    )
+    update.timestamp = None
+
+    asyncio.run(_adapter(None)._on_trade_update(update))
+
+    assert saved == []
+    refusals = [
+        record
+        for record in live_runner_logs.records
+        if "no execution row was stored" in record.getMessage()
+    ]
+    assert len(refusals) == 1
+    data = refusals[0].data
+    assert data["filled_qty"] == pytest.approx(float(update.qty))
+    assert data["broker_cumulative_filled_qty"] == pytest.approx(float(update.order.filled_qty))
+
+
+@pytest.mark.parametrize("date_only", ["2026-11-03", "20261103", "2026-11-03T", "2026-W45"])
+def test_a_date_without_a_time_of_day_is_not_a_fill_timestamp(date_only):
+    from live_runner.alpaca_adapter import _broker_fill_timestamp
+
+    assert _broker_fill_timestamp(date_only) is None
+    assert _broker_fill_timestamp(date_only, "2026-11-03T15:05:00Z") == ORDER_FILLED_AT
