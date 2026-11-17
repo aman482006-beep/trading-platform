@@ -260,6 +260,11 @@ def diff_db_and_yaml(
     warnings: list[str] = []
     yaml_active, yaml_warnings = _yaml_active_by_key(yaml_deployments)
     warnings.extend(yaml_warnings)
+    yaml_inactive = {
+        (deployment.strategy_name, deployment.account_id): deployment.status
+        for deployment in yaml_deployments
+        if deployment.status != "ACTIVE"
+    }
     db_by_key: dict[DeploymentKey, DbDeploymentRow] = {}
     matched: list[str] = []
     only_in_db: list[str] = []
@@ -278,10 +283,17 @@ def diff_db_and_yaml(
         yaml_dep = yaml_active.get(row.key)
         if yaml_dep is None:
             only_in_db.append(row.label)
-            errors.append(
-                f"DB deployment {row.label}: ACTIVE in the DB but absent from the YAML, so "
-                "this preflight never validated it; the daemon will trade it."
-            )
+            if row.key in yaml_inactive:
+                errors.append(
+                    f"DB deployment {row.label}: ACTIVE in the DB but the YAML lists it as "
+                    f"{yaml_inactive[row.key]}, so this preflight never validated it; the daemon "
+                    "will trade it."
+                )
+            else:
+                errors.append(
+                    f"DB deployment {row.label}: ACTIVE in the DB but absent from the YAML, so "
+                    "this preflight never validated it; the daemon will trade it."
+                )
             continue
         matched.append(row.label)
         for difference in _db_row_drift(row, yaml_dep):

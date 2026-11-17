@@ -652,3 +652,21 @@ def test_non_string_stored_symbols_are_not_manufactured_into_symbols(isolated_db
 
     assert any("null" in e and "not clean" in e for e in report.errors), report.errors
     assert not any("NONE" in w for w in report.warnings + report.errors), report.errors
+
+
+def test_active_db_row_whose_yaml_twin_is_paused_names_the_paused_entry(isolated_db) -> None:
+    """The YAML has an entry, just not an ACTIVE one: calling it absent misdirects the operator."""
+    database = isolated_db[0]
+    _seed(database)
+    paused = LiveDeploymentConfig(
+        strategy_name="equity_momentum",
+        account_id="alpaca-paper",
+        symbols=["AAPL"],
+        timeframe="1h",
+        status="PAUSED",
+    )
+
+    report = run_db_preflight([paused], db_path=_db_path(database))
+
+    assert any("YAML lists it as PAUSED" in e for e in report.errors), report.errors
+    assert not any("absent from the YAML" in e for e in report.errors), report.errors
