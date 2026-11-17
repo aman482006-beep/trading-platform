@@ -3727,6 +3727,12 @@ def _backtest_summary_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _magnitude_or_none(value: object) -> float | None:
+    """Absolute value of a measured metric; ``None`` when it was not measured."""
+    measured = _optional_float(value)
+    return None if measured is None else abs(measured)
+
+
 def _backtest_all_item_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
     win_rate = _normalize_win_rate(meta.get("win_rate"))
     tags = [
@@ -3746,12 +3752,12 @@ def _backtest_all_item_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
         "strategy_slug": str(meta.get("strategy_name") or "unknown"),
         "symbols": [str(item) for item in meta.get("symbols", []) if str(item).strip()],
         "timeframe": normalize_timeframe(str(meta.get("timeframe") or "")),
-        "total_return": _safe_float(meta.get("total_return"), 0.0),
+        "total_return": _optional_float(meta.get("total_return")),
         "sharpe_ratio": _optional_float(meta.get("sharpe_ratio")),
         "psr": _optional_float(meta.get("psr")),
         "p_value": _optional_float(meta.get("p_value")),
         "cagr": _optional_float(meta.get("cagr")),
-        "max_drawdown": abs(_safe_float(meta.get("max_drawdown"), 0.0)),
+        "max_drawdown": _magnitude_or_none(meta.get("max_drawdown")),
         "trade_count": max(int(meta.get("trade_count", 0) or 0), 0),
         "win_rate": win_rate,
         "start_date": str(meta.get("start_date") or ""),
