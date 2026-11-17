@@ -265,12 +265,13 @@ def test_promotion_with_complete_evidence_is_production(strategies_dir: Path) ->
 
 @pytest.mark.parametrize("reviewer", ["", "   ", "unspecified", "Unspecified"])
 def test_promotion_requires_a_named_reviewer(strategies_dir: Path, reviewer: str) -> None:
+    evidence = good_evidence()
     with pytest.raises(InvalidPromotionError, match="reviewer"):
         promote(
             strategies_dir / STRATEGY_NAME / f"{STRATEGY_NAME}.py",
             kind="strategy",
             parameters=DEFAULTS,
-            evidence=good_evidence(),
+            evidence=evidence,
             promoted_by=reviewer,
             root=strategies_dir,
         )
@@ -292,12 +293,13 @@ def test_promotion_requires_a_named_reviewer(strategies_dir: Path, reviewer: str
 def test_promotion_refuses_incomplete_or_insufficient_evidence(
     strategies_dir: Path, evidence_kwargs: dict[str, Any], expected: str
 ) -> None:
+    evidence = good_evidence(**evidence_kwargs)
     with pytest.raises(InvalidPromotionError, match=expected):
         promote(
             strategies_dir / STRATEGY_NAME / f"{STRATEGY_NAME}.py",
             kind="strategy",
             parameters=DEFAULTS,
-            evidence=good_evidence(**evidence_kwargs),
+            evidence=evidence,
             promoted_by="Fred",
             root=strategies_dir,
         )
@@ -321,12 +323,13 @@ def test_thresholds_are_inclusive_at_the_boundary(strategies_dir: Path) -> None:
 
 def test_paper_run_ending_in_the_future_is_refused(strategies_dir: Path) -> None:
     now = datetime.now(timezone.utc)
+    evidence = good_evidence(now=now + timedelta(days=10))
     with pytest.raises(InvalidPromotionError, match="future"):
         promote(
             strategies_dir / STRATEGY_NAME / f"{STRATEGY_NAME}.py",
             kind="strategy",
             parameters=DEFAULTS,
-            evidence=good_evidence(now=now + timedelta(days=10)),
+            evidence=evidence,
             promoted_by="Fred",
             root=strategies_dir,
             now=now,
@@ -340,12 +343,13 @@ def test_out_of_sample_segment_ending_in_the_future_is_refused(strategies_dir: P
     future_oos = replace(
         evidence.out_of_sample, test_end=(now + timedelta(days=10)).isoformat()
     )
+    future_evidence = replace(evidence, out_of_sample=future_oos)
     with pytest.raises(InvalidPromotionError, match="test segment ends in the future"):
         promote(
             strategies_dir / STRATEGY_NAME / f"{STRATEGY_NAME}.py",
             kind="strategy",
             parameters=DEFAULTS,
-            evidence=replace(evidence, out_of_sample=future_oos),
+            evidence=future_evidence,
             promoted_by="Fred",
             root=strategies_dir,
             now=now,
@@ -549,8 +553,9 @@ def test_out_of_sample_evidence_reads_the_final_holdout_not_the_validation_windo
 def test_out_of_sample_evidence_refuses_a_result_without_the_verdict(
     tmp_path: Path, overrides: dict[str, Any], expected: str
 ) -> None:
+    result = _optimizer_result(tmp_path, **overrides)
     with pytest.raises(InvalidPromotionError, match=expected):
-        out_of_sample_evidence_from_result(_optimizer_result(tmp_path, **overrides))
+        out_of_sample_evidence_from_result(result)
 
 
 # --------------------------------------------------------------------------- #
@@ -565,6 +570,14 @@ def test_is_real_money_fails_closed(flag: object, expected: bool) -> None:
     assert is_real_money(flag) is expected
 
 
+@pytest.mark.parametrize("flag", [None, 0, 1, "false"])
+def test_only_a_literal_false_skips_the_gate(strategies_dir: Path, flag: Any) -> None:
+    # The verdict is fail-closed at the enforcement boundary too, not only in is_real_money.
+    deployment = strategy_deployment()
+    with pytest.raises(StrategyNotPromotedError):
+        enforce_promotion_gate(deployment, real_money=flag)
+
+
 def test_demo_account_passes_without_promotion(strategies_dir: Path) -> None:
     enforce_promotion_gate(strategy_deployment(), real_money=False)
     # Even a deployment that could not be resolved at all: paper/demo may run
@@ -573,8 +586,9 @@ def test_demo_account_passes_without_promotion(strategies_dir: Path) -> None:
 
 
 def test_real_money_refuses_a_non_promoted_strategy(strategies_dir: Path) -> None:
+    deployment = strategy_deployment()
     with pytest.raises(StrategyNotPromotedError, match="no promotion ledger") as excinfo:
-        enforce_promotion_gate(strategy_deployment(), real_money=True)
+        enforce_promotion_gate(deployment, real_money=True)
     assert "real-money account 'acc-1'" in str(excinfo.value)
 
 
@@ -616,22 +630,35 @@ def test_real_money_after_a_file_change_is_refused(strategies_dir: Path) -> None
     promote_strategy_file(strategies_dir)
     path = strategies_dir / STRATEGY_NAME / f"{STRATEGY_NAME}.py"
     path.write_bytes(path.read_bytes().replace(b"'slow': 30", b"'slow': 31"))
+    deployment = strategy_deployment()
     with pytest.raises(StrategyNotPromotedError):
-        enforce_promotion_gate(strategy_deployment(), real_money=True)
+        enforce_promotion_gate(deployment, real_money=True)
 
 
 @pytest.mark.parametrize("name", ["does_not_exist", "../alpha", "alpha/alpha.py", "", ".."])
 def test_real_money_refuses_a_missing_or_path_like_strategy(
     strategies_dir: Path, name: str
 ) -> None:
+    deployment = strategy_deployment(name)
     with pytest.raises(StrategyNotPromotedError, match="Promotion gate refused"):
-        enforce_promotion_gate(strategy_deployment(name), real_money=True)
+        enforce_promotion_gate(deployment, real_money=True)
+
+
+def test_a_strategy_name_that_resolves_to_a_promoted_file_is_refused(
+    strategies_dir: Path,
+) -> None:
+    # alpha/../alpha resolves to the promoted file, so only the name check stands in its way.
+    promote_strategy_file(strategies_dir)
+    deployment = strategy_deployment(f"{STRATEGY_NAME}/../{STRATEGY_NAME}")
+    with pytest.raises(StrategyNotPromotedError, match="not a strategy name"):
+        enforce_promotion_gate(deployment, real_money=True)
 
 
 def test_real_money_refuses_an_unreadable_strategy_meta(strategies_dir: Path) -> None:
     make_strategy(strategies_dir, "broken", "STRATEGY_META = build_meta()\n")
+    deployment = strategy_deployment("broken")
     with pytest.raises(StrategyNotPromotedError, match="STRATEGY_META"):
-        enforce_promotion_gate(strategy_deployment("broken"), real_money=True)
+        enforce_promotion_gate(deployment, real_money=True)
 
 
 def test_signal_bot_is_bound_to_processor_file_and_processor_config(bots_root: Path) -> None:
@@ -652,21 +679,23 @@ def test_signal_bot_is_bound_to_processor_file_and_processor_config(bots_root: P
     enforce_promotion_gate(ramjet_deployment({"min_rr": 2.0}), real_money=True)
 
     # One changed processor_config value: experimental again.
+    changed_config = ramjet_deployment({"min_rr": 2.5})
     with pytest.raises(StrategyNotPromotedError, match="parameter set differs"):
-        enforce_promotion_gate(ramjet_deployment({"min_rr": 2.5}), real_money=True)
+        enforce_promotion_gate(changed_config, real_money=True)
     # The bot's base config.yaml parameterises the processor as well.
     config = bots_root / "ramjet" / "config.yaml"
     original = config.read_text(encoding="utf-8")
     config.write_text(original.replace("1.5", "1.6"), encoding="utf-8")
+    same_config = ramjet_deployment({"min_rr": 2.0})
     with pytest.raises(StrategyNotPromotedError):
-        enforce_promotion_gate(ramjet_deployment({"min_rr": 2.0}), real_money=True)
+        enforce_promotion_gate(same_config, real_money=True)
     config.write_text(original, encoding="utf-8")
-    enforce_promotion_gate(ramjet_deployment({"min_rr": 2.0}), real_money=True)
+    enforce_promotion_gate(same_config, real_money=True)
     # One changed byte of the processor module: experimental again.
     processor = bots_root / "ramjet" / "processor.py"
     processor.write_bytes(processor.read_bytes() + b"#")
     with pytest.raises(StrategyNotPromotedError, match="changed"):
-        enforce_promotion_gate(ramjet_deployment({"min_rr": 2.0}), real_money=True)
+        enforce_promotion_gate(same_config, real_money=True)
 
 
 def test_editing_a_module_the_processor_imports_makes_the_bot_experimental(
@@ -698,8 +727,9 @@ def test_editing_a_module_the_processor_imports_makes_the_bot_experimental(
     enforce_promotion_gate(ramjet_deployment(), real_money=True)
 
     (shared / "helper.py").write_text("LIMIT = 2\n", encoding="utf-8")
+    deployment = ramjet_deployment()
     with pytest.raises(StrategyNotPromotedError, match="parameter set differs"):
-        enforce_promotion_gate(ramjet_deployment(), real_money=True)
+        enforce_promotion_gate(deployment, real_money=True)
 
 
 def test_nitro_is_bound_to_the_ramjet_processor_it_imports() -> None:
@@ -806,14 +836,16 @@ def test_cli_records_a_complete_promotion(strategies_dir: Path, tmp_path: Path) 
         ({"paper_report": "/nonexistent/paper.csv"}, "not found"),
         ({"promoted_by": " "}, "reviewer"),
         ({"params": '{"fast": 11}'}, "signal-processor only"),
+        ({"params": "[1, 2]"}, "must be a JSON object"),
         ({"strategy": "does_not_exist"}, "no strategy file"),
     ],
 )
 def test_cli_refuses_incomplete_evidence(
     strategies_dir: Path, tmp_path: Path, overrides: dict[str, Any], expected: str
 ) -> None:
+    args = _cli_args(tmp_path, **overrides)
     with pytest.raises(InvalidPromotionError, match=expected):
-        record_promotion(_cli_args(tmp_path, **overrides))
+        record_promotion(args)
     assert not ledger_path_for(strategies_dir / STRATEGY_NAME / f"{STRATEGY_NAME}.py").exists()
 
 

@@ -74,6 +74,30 @@ def _promotion_errors(result) -> list[str]:
     return [error for error in result.deployment_errors if "Promotion gate" in error]
 
 
+@pytest.mark.parametrize(
+    "broker, paper, demo, expected",
+    [
+        # Alpaca's source of truth is the paper flag; its demo flag means nothing here.
+        ("alpaca", True, False, False),
+        ("alpaca", False, True, True),
+        ("alpaca", None, None, True),
+        # cTrader's source of truth is the demo flag; its paper flag means nothing here.
+        ("ctrader", True, None, True),
+        ("ctrader", None, True, False),
+        ("ctrader", False, False, True),
+    ],
+)
+def test_preflight_reads_each_brokers_own_demo_flag(
+    broker: str, paper: bool | None, demo: bool | None, expected: bool
+) -> None:
+    from live_runner.preflight import LivePreflightAccountResult, _account_result_is_real_money
+
+    result = LivePreflightAccountResult(
+        account_id="acc-1", broker=broker, ok=True, paper=paper, demo=demo
+    )
+    assert _account_result_is_real_money(result) is expected
+
+
 def test_preflight_demo_account_passes_without_promotion(
     strategies_dir: Path, tmp_path: Path
 ) -> None:
@@ -205,8 +229,9 @@ def test_daemon_refuses_a_promoted_strategy_after_a_file_change(strategies_dir: 
     promote_strategy_file(strategies_dir)
     path = strategies_dir / STRATEGY_NAME / f"{STRATEGY_NAME}.py"
     path.write_bytes(path.read_bytes() + b"\n")
+    adapter = _Adapter(demo=False)
     with pytest.raises(StrategyNotPromotedError, match="changed"):
-        _submit(_Adapter(demo=False))
+        _submit(adapter)
 
 
 def test_daemon_never_blocks_an_exit_only_order(
@@ -242,7 +267,8 @@ def test_daemon_discord_path_refuses_a_non_promoted_entry_on_real_money(
             refusals.append(exc)
 
     asyncio.run(_run())
-    assert refusals and adapter.submitted == []
+    assert refusals
+    assert adapter.submitted == []
 
 
 def test_demo_only_block_still_drops_a_non_demo_adapter_for_promoted_code(
