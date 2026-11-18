@@ -78,6 +78,10 @@ class TestHTMLSplitFills:
             assert html_trade.direction == xlsx_trade.direction
             assert html_trade.quantity == pytest.approx(xlsx_trade.quantity)
             assert html_trade.pnl == pytest.approx(xlsx_trade.pnl)
+            # Both importers must agree on the fee convention too: ``fees`` is a
+            # positive cost and ``net_pnl == pnl - fees`` in each of them.
+            assert html_trade.fees == pytest.approx(xlsx_trade.fees)
+            assert html_trade.net_pnl == pytest.approx(xlsx_trade.net_pnl)
             assert len(html_trade.exits) == len(xlsx_trade.exits)
 
 

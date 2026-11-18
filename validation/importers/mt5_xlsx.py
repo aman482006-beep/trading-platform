@@ -14,6 +14,7 @@ import pandas as pd
 
 from shared.broker_clock import BrokerClock, resolve_broker_clock
 from shared.models import Trade, TradeExit
+from validation.importers._fees import mt5_signed_costs_to_fee
 from validation.importers._numbers import detect_decimal_comma, parse_locale_number
 from validation.importers._pairing import (
     closed_positions,
@@ -788,11 +789,9 @@ class MT5XLSXImporter(BaseImporter):
                 for r in fills.entries + exit_rows
             )
             # MT5 reports commission and swap signed from the account's point
-            # of view (a cost is negative). The Trade contract defines ``fees``
-            # as a positive cost (net_pnl == pnl - fees), so negate at the
-            # importer boundary. A net swap credit therefore yields a
-            # negative fee. ``meta`` keeps the raw MT5-signed values.
-            fees = -(commission + swap)
+            # of view (a cost is negative); the Trade contract wants a positive
+            # cost. ``meta`` keeps the raw MT5-signed values.
+            fees = mt5_signed_costs_to_fee(commission, swap)
 
             exits: list[TradeExit] = []
             for exit_row in exit_rows:
