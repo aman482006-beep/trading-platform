@@ -77,7 +77,8 @@ def mt5_fee_or_none(fees: float) -> float | None:
 
     Exact zero, not a tolerance: MT5 reports "no fees" as ``0.0``. Both
     importers reach the same mapping through this one function so the next
-    editor changes the rule once. (``fees`` is finite by construction:
-    :func:`mt5_signed_costs_to_fee` refuses anything else.)
+    editor changes the rule once. (``fees`` is finite by construction --
+    :func:`mt5_signed_costs_to_fee` refuses anything else -- so falsiness
+    here is exactly the reported ``0.0``/``-0.0``.)
     """
-    return fees if fees != 0.0 else None
+    return fees if fees else None
