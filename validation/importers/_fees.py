@@ -11,6 +11,8 @@ boundary. A net swap credit therefore yields a negative ``fees``.
 
 from __future__ import annotations
 
+import math
+
 
 def mt5_signed_costs_to_fee(commission: float, swap: float) -> float:
     """Return the ``Trade.fees`` value for MT5's signed commission and swap.
@@ -19,5 +21,16 @@ def mt5_signed_costs_to_fee(commission: float, swap: float) -> float:
     XLSX and the HTML importer cannot drift apart on the sign convention (they
     must agree trade by trade, see ``test_importers_agree`` in
     ``tests/validation/test_split_fills.py``).
+
+    A non-finite commission or swap (``nan``/``inf``) is refused rather than
+    stored: the callers' zero-guards disagree on such a value (one maps it to
+    ``None``, the other would store it), and either choice silently corrupts
+    ``net_pnl == pnl - fees``. A corrupt report cell must fail the import.
     """
-    return -(commission + swap)
+    total = commission + swap
+    if not math.isfinite(total):
+        raise ValueError(
+            "MT5 commission and swap must be finite numbers, got "
+            f"commission={commission!r}, swap={swap!r}"
+        )
+    return -total
