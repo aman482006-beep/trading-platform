@@ -31,10 +31,12 @@ def mt5_fee_cell(value: Any, column: str, parse: Callable[[Any], float | None]) 
     owns one, and both return ``None`` for "not a number".
 
     MT5 reports "no fees" through a missing, blank or ``0.0`` cell, which
-    reads as ``0.0``. A cell that *has* a value the parser cannot read (an
-    Excel error string, ``"n/a"``) must fail the import: reading it as
-    ``0.0`` would silently move the trade's ``net_pnl`` and its
-    winner/loser classification.
+    reads as ``0.0``. A cell that reaches the parser with a non-numeric text
+    must fail the import: reading it as ``0.0`` would silently move the
+    trade's ``net_pnl`` and its winner/loser classification. (An Excel error
+    cell such as ``#DIV/0!`` never gets that far: ``pd.read_excel`` converts
+    it to NaN, so it is indistinguishable from a blank cell and reads as
+    "no fees" like one.)
     """
     if value is None or (isinstance(value, float) and math.isnan(value)):
         return 0.0
@@ -52,8 +54,9 @@ def mt5_signed_costs_to_fee(commission: float, swap: float) -> float:
     A net swap credit (swap positive) therefore yields a negative ``fees``.
     Both importers reach the same expression through this one function, so the
     XLSX and the HTML importer cannot drift apart on the sign convention (they
-    must agree trade by trade, see ``test_importers_agree`` in
-    ``tests/validation/test_split_fills.py``).
+    must agree trade by trade, see
+    ``test_split_fills.py::TestHTMLSplitFills``'s
+    ``test_importers_agree_on_same_position_sequence``).
 
     A non-finite commission or swap (``inf``) is refused rather than stored:
     storing it would put a non-finite ``fees`` or ``net_pnl`` on the trade.
@@ -67,3 +70,14 @@ def mt5_signed_costs_to_fee(commission: float, swap: float) -> float:
             f"commission={commission!r}, swap={swap!r}"
         )
     return -total
+
+
+def mt5_fee_or_none(fees: float) -> float | None:
+    """Map MT5's exact-zero fee to ``None`` (``Trade.fees`` is optional).
+
+    Exact zero, not a tolerance: MT5 reports "no fees" as ``0.0``. Both
+    importers reach the same mapping through this one function so the next
+    editor changes the rule once. (``fees`` is finite by construction:
+    :func:`mt5_signed_costs_to_fee` refuses anything else.)
+    """
+    return fees if fees != 0.0 else None

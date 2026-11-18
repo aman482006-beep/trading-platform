@@ -266,6 +266,20 @@ class TestGermanNumberParsing:
         assert I._to_float(["-499.60"], 0) == pytest.approx(-499.60)
         assert I._to_float(["n/a"], 0) is None
 
+    def test_ambiguous_dotted_cell_uses_dot_decimal_first(self):
+        """An ambiguous "2.500" in a money cell is 2.5, not 2500.
+
+        SL/TP cells read the *detected* locale (German grouping wins there);
+        every other money cell (PnL, commission, swap) reads dot-decimal first
+        and only falls back to comma-decimal. Pin the precedence: reversing it
+        would read a German "1.500" commission 1000x low.
+        """
+        from validation.importers._numbers import parse_report_number
+        from validation.importers.mt5_html import MT5HTMLImporter as I
+
+        assert I._to_float(["2.500"], 0) == pytest.approx(2.5)
+        assert parse_report_number("2.500") == pytest.approx(2.5)
+
     def test_sltp_map_parses_german_formats(self):
         ref = MT5HTMLImporter().load(
             Path("tests/fixtures/validation/mt5_html/german_sltp.html")
@@ -376,3 +390,41 @@ class TestFeeSign:
         table = self._table("#DIV/0!", "0")
         with pytest.raises(ValueError, match="Kommission cell is not a number"):
             MT5HTMLImporter._build_trades(table, {})
+
+    def test_swap_on_an_entry_fill_is_counted(self):
+        """DV-B43 sums commission and swap over entry *and* exit fills.
+
+        The HTML fixtures only charge swap on the exit row, so a mutant that
+        drops the entry-fill swap survived there; the XLSX twin is caught by
+        its own fixtures. Rollover or per-deal brokers book swap on entries.
+        """
+        trades, _ = MT5HTMLImporter._build_trades(self._table_with_swap_on_both(), {})
+        assert trades[0].fees == pytest.approx(4.40)
+        assert trades[0].net_pnl == pytest.approx(95.60)
+        assert trades[0].meta["swap"] == pytest.approx(-1.90)
+        assert trades[0].meta["commission"] == pytest.approx(-2.5)
+
+    @staticmethod
+    def _table_with_swap_on_both():
+        """Commission on the entry fill and swap on both fills."""
+        return BeautifulSoup(
+            """
+            <table><thead><tr>
+              <th>Zeit</th><th>Trade</th><th>Symbol</th><th>Typ</th><th>Richtung</th>
+              <th>Volumen</th><th>Preis</th><th>Auftrag</th><th>Kommission</th><th>Swap</th>
+              <th>Gewinn</th><th>Kommentar</th>
+            </tr></thead><tbody>
+              <tr>
+                <td>2024.01.02 08:00:00</td><td>1</td><td>EURUSD</td>
+                <td>buy</td><td>in</td><td>0.10</td><td>1.08</td>
+                <td>902</td><td>-2.5</td><td>-0.40</td><td>0</td><td>Entry</td>
+              </tr>
+              <tr>
+                <td>2024.01.02 16:00:00</td><td>1</td><td>EURUSD</td>
+                <td>sell</td><td>out</td><td>0.10</td><td>1.09</td>
+                <td>903</td><td>0</td><td>-1.50</td><td>100</td><td>TP</td>
+              </tr>
+            </tbody></table>
+            """,
+            "lxml",
+        ).find("table")

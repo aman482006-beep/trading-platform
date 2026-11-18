@@ -12,7 +12,11 @@ from typing import Any
 from bs4 import BeautifulSoup
 
 from shared.models import Trade, TradeExit
-from validation.importers._fees import mt5_fee_cell, mt5_signed_costs_to_fee
+from validation.importers._fees import (
+    mt5_fee_cell,
+    mt5_fee_or_none,
+    mt5_signed_costs_to_fee,
+)
 from validation.importers._numbers import (
     detect_decimal_comma,
     parse_locale_number,
@@ -669,7 +673,7 @@ class MT5HTMLImporter(BaseImporter):
                 quantity=entry_volume,
                 exits=exits,
                 pnl=pnl,
-                fees=fees if fees != 0.0 else None,
+                fees=mt5_fee_or_none(fees),
                 net_pnl=pnl - fees,
                 stop_loss=sl,
                 take_profit=tp,
