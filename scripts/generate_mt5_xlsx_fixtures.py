@@ -620,6 +620,11 @@ files or the `goldens/` JSON by hand. Regenerate them with:
 
     python scripts/generate_mt5_xlsx_fixtures.py
 
+`tests/validation/test_mt5_xlsx_fixture_fresh.py` regenerates both workbooks
+and fails when they drift from the script, so a change to the script must be
+regenerated here in the same commit (and its expectations re-derived by hand in
+`tests/validation/test_mt5_xlsx_fixture_shapes.py`).
+
 All values are invented. No file here is an export from a real account.
 
 - `hedged_partial_open.xlsx`: deal-numbered deals. Hedged long and short on
