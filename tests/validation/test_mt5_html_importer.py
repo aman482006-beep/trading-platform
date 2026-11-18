@@ -366,3 +366,7 @@ class TestFeeSign:
         trades, _ = MT5HTMLImporter._build_trades(self._table("-0.5", "1.5"), {})
         assert trades[0].fees == pytest.approx(-1.0)
         assert trades[0].net_pnl == pytest.approx(101.0)
+        # meta keeps MT5's raw signs: the commission stays negative (a cost)
+        # and the swap positive (a credit); only Trade.fees is normalised.
+        assert trades[0].meta["commission"] == pytest.approx(-0.5)
+        assert trades[0].meta["swap"] == pytest.approx(1.5)

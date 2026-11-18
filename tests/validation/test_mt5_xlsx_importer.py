@@ -738,7 +738,12 @@ class TestZeroFeesBecomeNone:
     """
 
     def _write_report(
-        self, tmp_path: Path, *, commission: float, swap: float, profit: float = 100.0
+        self,
+        tmp_path: Path,
+        *,
+        commission: float | str,
+        swap: float | str,
+        profit: float = 100.0,
     ) -> Path:
         header = [
             "Zeit", "Trade", "Symbol", "Typ", "Richtung", "Volumen", "Preis",
@@ -794,3 +799,22 @@ class TestZeroFeesBecomeNone:
         trade = ref.trades[0]
         assert trade.fees == pytest.approx(-1.0)
         assert trade.net_pnl == pytest.approx(101.0)
+
+    @pytest.mark.parametrize(
+        ("commission", "swap"), [("inf", 0.0), (0.0, "inf"), ("-inf", 0.0)]
+    )
+    def test_non_finite_fee_cells_are_refused(
+        self, tmp_path: Path, commission: float | str, swap: float | str
+    ):
+        """A corrupt fee cell must fail the import, never store an inf fee.
+
+        ``_to_float`` runs ``float("inf")`` on a text cell, so without the
+        shared helper's finiteness guard the importer would store ``fees=inf``
+        and ``net_pnl=inf``. (A ``nan`` cell never gets that far: ``_to_float``
+        maps a NaN cell to its default, which is why the guard is proven here
+        with ``inf``.)
+        """
+        with pytest.raises(ValueError, match="must be finite"):
+            MT5XLSXImporter().load(
+                self._write_report(tmp_path, commission=commission, swap=swap)
+            )
