@@ -2,9 +2,9 @@
 
 MT5 signs commission and swap from the account's point of view (a cost is
 negative); :class:`~shared.models.Trade` defines ``fees`` as a positive cost.
-``validation.importers._fees.mt5_signed_costs_to_fee`` is the one place that
-converts between the two, so a change to the convention is caught here rather
-than in one importer only.
+``validation.importers._fees`` is the one place that converts between the
+two, so a change to the convention is caught here rather than in one
+importer only.
 """
 
 from __future__ import annotations
@@ -13,7 +13,21 @@ import math
 
 import pytest
 
-from validation.importers._fees import mt5_signed_costs_to_fee
+from validation.importers._fees import mt5_fee_cell, mt5_signed_costs_to_fee
+
+
+def _never_parses(value: object) -> float | None:
+    return None
+
+
+def _dot_or_comma_decimal(raw: str | None) -> float | None:
+    """Stand-in for an importer's locale-aware parser."""
+    if raw is None:
+        return None
+    try:
+        return float(raw.replace(",", "."))
+    except ValueError:
+        return None
 
 
 class TestSignedCostsBecomeTradeFees:
@@ -35,7 +49,7 @@ class TestSignedCostsBecomeTradeFees:
         assert 100.0 - fees == pytest.approx(101.0)
 
 
-class TestNonFiniteCostsAreRefused:
+class TestNonFiniteSumsAreRefused:
     @pytest.mark.parametrize(
         ("commission", "swap"),
         [
@@ -46,7 +60,30 @@ class TestNonFiniteCostsAreRefused:
             (math.inf, -math.inf),
         ],
     )
-    def test_corrupt_cells_fail_the_import(self, commission: float, swap: float):
-        """Never store a nan/inf fee or net_pnl: refuse the report instead."""
+    def test_non_finite_sums_are_refused(self, commission: float, swap: float):
+        """Never store an inf fee or net_pnl: refuse the value instead."""
         with pytest.raises(ValueError, match="must be finite"):
             mt5_signed_costs_to_fee(commission, swap)
+
+
+class TestFeeCellRule:
+    """The cell-level rule both importers share (``mt5_fee_cell``)."""
+
+    @pytest.mark.parametrize("value", [None, "", "   ", math.nan])
+    def test_missing_cell_is_mt5s_no_fees(self, value: object):
+        assert mt5_fee_cell(value, "Kommission", _never_parses) == 0.0
+
+    @pytest.mark.parametrize("value", ["-2.5", "-2,5", "0,00"])
+    def test_present_number_goes_through_the_callers_parser(self, value: str):
+        assert mt5_fee_cell(value, "Kommission", _dot_or_comma_decimal) == pytest.approx(
+            float(value.replace(",", "."))
+        )
+
+    def test_present_but_unparseable_cell_fails_the_import(self):
+        """Reading "#DIV/0!" as 0.0 would silently move net_pnl and win/loss."""
+        with pytest.raises(ValueError, match="Kommission cell is not a number"):
+            mt5_fee_cell("#DIV/0!", "Kommission", _never_parses)
+
+    def test_non_finite_text_is_refused(self):
+        with pytest.raises(ValueError, match="Swap cell is not a number"):
+            mt5_fee_cell("inf", "Swap", _never_parses)

@@ -105,6 +105,19 @@ def _split_sign(text: str | None) -> tuple[str | None, bool]:
     return (text or None), negative
 
 
+def parse_report_number(raw: str | None) -> float | None:
+    """Parse one report cell number, dot-decimal first, comma fallback.
+
+    MT5 HTML reports can be written in either convention, so an ambiguous
+    value is read as ASCII first and as German only when the ASCII reading
+    fails. Returns ``None`` when the value cannot be parsed unambiguously.
+    """
+    parsed = parse_locale_number(raw, decimal_comma=False)
+    if parsed is None:
+        parsed = parse_locale_number(raw, decimal_comma=True)
+    return parsed
+
+
 def parse_locale_number(raw: str | None, decimal_comma: bool) -> float | None:
     """Parse a locale-formatted number into a float.
 

@@ -12,8 +12,12 @@ from typing import Any
 from bs4 import BeautifulSoup
 
 from shared.models import Trade, TradeExit
-from validation.importers._fees import mt5_signed_costs_to_fee
-from validation.importers._numbers import detect_decimal_comma, parse_locale_number
+from validation.importers._fees import mt5_fee_cell, mt5_signed_costs_to_fee
+from validation.importers._numbers import (
+    detect_decimal_comma,
+    parse_locale_number,
+    parse_report_number,
+)
 from validation.importers._pairing import (
     closed_positions,
     entry_side_scope,
@@ -607,11 +611,19 @@ class MT5HTMLImporter(BaseImporter):
             # DV-B43: commission/swap accumulate over every fill of the
             # position (entry fills included), not just the last exit row.
             commission = sum(
-                (MT5HTMLImporter._to_float(r, col_commission, default=0.0) or 0.0)
+                mt5_fee_cell(
+                    MT5HTMLImporter._get_str(r, col_commission, ""),
+                    "Kommission",
+                    parse_report_number,
+                )
                 for r in fills.entries + exit_rows
             )
             swap = sum(
-                (MT5HTMLImporter._to_float(r, col_swap, default=0.0) or 0.0)
+                mt5_fee_cell(
+                    MT5HTMLImporter._get_str(r, col_swap, ""),
+                    "Swap",
+                    parse_report_number,
+                )
                 for r in fills.entries + exit_rows
             )
             # MT5 reports commission and swap signed from the account's point
@@ -746,9 +758,7 @@ class MT5HTMLImporter(BaseImporter):
         # The dot-decimal reading is tried first; when it is ambiguous or
         # fails, the comma-decimal reading is used, so a PnL or commission
         # of "1.234,56" is neither dropped nor corrupted.
-        parsed = parse_locale_number(val, decimal_comma=False)
-        if parsed is None:
-            parsed = parse_locale_number(val, decimal_comma=True)
+        parsed = parse_report_number(val)
         return default if parsed is None else parsed
 
     @staticmethod

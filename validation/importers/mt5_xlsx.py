@@ -14,7 +14,7 @@ import pandas as pd
 
 from shared.broker_clock import BrokerClock, resolve_broker_clock
 from shared.models import Trade, TradeExit
-from validation.importers._fees import mt5_signed_costs_to_fee
+from validation.importers._fees import mt5_fee_cell, mt5_signed_costs_to_fee
 from validation.importers._numbers import detect_decimal_comma, parse_locale_number
 from validation.importers._pairing import (
     closed_positions,
@@ -781,11 +781,13 @@ class MT5XLSXImporter(BaseImporter):
             # DV-B43: commission/swap accumulate over every fill of the
             # position (entry fills included), not just the last exit row.
             commission = sum(
-                (MT5XLSXImporter._to_float(r.get(col_commission), default=0.0) or 0.0)
+                mt5_fee_cell(
+                    r.get(col_commission), "Kommission", MT5XLSXImporter._to_float
+                )
                 for r in fills.entries + exit_rows
             )
             swap = sum(
-                (MT5XLSXImporter._to_float(r.get(col_swap), default=0.0) or 0.0)
+                mt5_fee_cell(r.get(col_swap), "Swap", MT5XLSXImporter._to_float)
                 for r in fills.entries + exit_rows
             )
             # MT5 reports commission and swap signed from the account's point

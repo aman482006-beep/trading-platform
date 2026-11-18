@@ -760,7 +760,9 @@ class TestZeroFeesBecomeNone:
         trades = pd.DataFrame(rows)
         orders = pd.DataFrame([["Orders", None], [None, None]])
 
-        path = tmp_path / f"report_{commission}_{swap}.xlsx"
+        path = tmp_path / (
+            f"report_{str(commission).replace('/', '_')}_{swap}.xlsx"
+        )
         with pd.ExcelWriter(path, engine="openpyxl") as writer:
             orders.to_excel(writer, index=False, header=False, startrow=0)
             trades.to_excel(writer, index=False, header=False, startrow=20)
@@ -817,4 +819,17 @@ class TestZeroFeesBecomeNone:
         with pytest.raises(ValueError, match="must be finite"):
             MT5XLSXImporter().load(
                 self._write_report(tmp_path, commission=commission, swap=swap)
+            )
+
+    def test_unparseable_fee_cell_is_refused(self, tmp_path: Path):
+        """A fee cell that cannot be parsed must fail the import, not read as 0.0.
+
+        Reading it as zero would move the trade's net_pnl and its win/loss
+        classification without a trace. (An Excel error string such as
+        "#DIV/0!" arrives as a NaN cell, which MT5 also uses for "no fees";
+        a cell that keeps a non-numeric text is the reachable case.)
+        """
+        with pytest.raises(ValueError, match="Kommission cell is not a number"):
+            MT5XLSXImporter().load(
+                self._write_report(tmp_path, commission="xyz", swap=0.0)
             )

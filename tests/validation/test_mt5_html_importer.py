@@ -370,3 +370,8 @@ class TestFeeSign:
         # and the swap positive (a credit); only Trade.fees is normalised.
         assert trades[0].meta["commission"] == pytest.approx(-0.5)
         assert trades[0].meta["swap"] == pytest.approx(1.5)
+
+    def test_unparseable_fee_cell_is_refused(self):
+        """An Excel error fee cell must fail the import, not read as 0.0."""
+        with pytest.raises(ValueError, match="Kommission cell is not a number"):
+            MT5HTMLImporter._build_trades(self._table("#DIV/0!", "0"), {})

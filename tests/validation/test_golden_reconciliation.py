@@ -27,6 +27,7 @@ from pathlib import Path
 
 import pytest
 
+from scripts.generate_golden_files import REPORTS as _GOLDEN_GENERATOR_REPORTS
 from shared.models import Trade
 from validation.importers.mt5_xlsx import MT5XLSXImporter
 from validation.reference import ValidationReference
@@ -34,17 +35,10 @@ from validation.stats.calculator import compute_trade_statistics
 
 GOLDEN_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "validation" / "goldens"
 GOLDEN_FILES = ["eurusd_h1_golden.json", "nas100_m15_golden.json", "sp500_m1_golden.json"]
-REPORT_DIR = (
-    Path(__file__).resolve().parents[2]
-    / "strategy-comparisons"
-    / "intraday_volatility_breakout"
-)
-GOLDEN_REPORTS = {
-    "eurusd_h1_golden.json": "EURUSD_H1.xlsx",
-    "nas100_m15_golden.json": "NAS100_M15.xlsx",
-    "sp500_m1_golden.json": "SP500_M1.xlsx",
-}
 MONEY_TOLERANCE = 0.01
+# The generator's single mapping of report -> golden is the source of truth,
+# so a rename cannot desync this test from the regeneration path.
+GOLDEN_REPORTS = {filename: report for report, filename in _GOLDEN_GENERATOR_REPORTS}
 
 @pytest.fixture(params=GOLDEN_FILES, ids=lambda name: name.removesuffix("_golden.json"))
 def golden(request: pytest.FixtureRequest) -> dict:
@@ -153,7 +147,7 @@ class TestGoldensMatchFreshImport:
     @pytest.mark.parametrize("file_name", GOLDEN_FILES)
     def test_fee_fields_match_a_fresh_import(self, file_name: str) -> None:
         golden = json.loads((GOLDEN_DIR / file_name).read_text(encoding="utf-8"))
-        report = REPORT_DIR / GOLDEN_REPORTS[file_name]
+        report = GOLDEN_REPORTS[file_name]
         assert report.is_file(), f"tracked report is missing: {report}"
         fresh: list[Trade] = MT5XLSXImporter().load(report).trades
         committed = golden["trades"]
