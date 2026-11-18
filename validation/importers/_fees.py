@@ -36,7 +36,7 @@ def mt5_fee_cell(value: Any, column: str, parse: Callable[[Any], float | None]) 
     ``0.0`` would silently move the trade's ``net_pnl`` and its
     winner/loser classification.
     """
-    if value is None or (isinstance(value, float) and value != value):  # NaN
+    if value is None or (isinstance(value, float) and math.isnan(value)):
         return 0.0
     if str(value).strip() == "":
         return 0.0

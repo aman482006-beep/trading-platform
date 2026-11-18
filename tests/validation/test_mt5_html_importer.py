@@ -373,5 +373,6 @@ class TestFeeSign:
 
     def test_unparseable_fee_cell_is_refused(self):
         """An Excel error fee cell must fail the import, not read as 0.0."""
+        table = self._table("#DIV/0!", "0")
         with pytest.raises(ValueError, match="Kommission cell is not a number"):
-            MT5HTMLImporter._build_trades(self._table("#DIV/0!", "0"), {})
+            MT5HTMLImporter._build_trades(table, {})

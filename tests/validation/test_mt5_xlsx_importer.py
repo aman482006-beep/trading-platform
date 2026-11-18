@@ -816,10 +816,9 @@ class TestZeroFeesBecomeNone:
         maps a NaN cell to its default, which is why the guard is proven here
         with ``inf``.)
         """
+        path = self._write_report(tmp_path, commission=commission, swap=swap)
         with pytest.raises(ValueError, match="must be finite"):
-            MT5XLSXImporter().load(
-                self._write_report(tmp_path, commission=commission, swap=swap)
-            )
+            MT5XLSXImporter().load(path)
 
     def test_unparseable_fee_cell_is_refused(self, tmp_path: Path):
         """A fee cell that cannot be parsed must fail the import, not read as 0.0.
@@ -829,7 +828,6 @@ class TestZeroFeesBecomeNone:
         "#DIV/0!" arrives as a NaN cell, which MT5 also uses for "no fees";
         a cell that keeps a non-numeric text is the reachable case.)
         """
+        path = self._write_report(tmp_path, commission="xyz", swap=0.0)
         with pytest.raises(ValueError, match="Kommission cell is not a number"):
-            MT5XLSXImporter().load(
-                self._write_report(tmp_path, commission="xyz", swap=0.0)
-            )
+            MT5XLSXImporter().load(path)
