@@ -7,7 +7,10 @@ importer, so each identity below checks the importer's trade list against an
 independent source.
 
 The identities are checked against the stored JSON, not against a fresh
-import. The source ``.xlsx`` reports are not in this repository.
+import. The source ``.xlsx`` reports are tracked in
+``strategy-comparisons/intraday_volatility_breakout/``, and
+``scripts/generate_golden_files.py`` re-imports them to regenerate the goldens,
+so a golden can always be re-derived from its report.
 
 ``fees`` is a positive cost (``net_pnl == pnl - fees``); the importers negate
 MT5's signed commission and swap. MT5's own totals therefore equal
