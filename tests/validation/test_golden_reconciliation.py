@@ -11,6 +11,9 @@ import. The source ``.xlsx`` reports are tracked in
 ``strategy-comparisons/intraday_volatility_breakout/``, and
 ``scripts/generate_golden_files.py`` re-imports them to regenerate the goldens,
 so a golden can always be re-derived from its report.
+``TestGoldensMatchFreshImport`` pins the trade-level fee fields (``fees``,
+``pnl``, ``net_pnl``) to a fresh import of those reports, so the goldens cannot
+drift away from the importer without a test failing.
 
 ``fees`` is a positive cost (``net_pnl == pnl - fees``); the importers negate
 MT5's signed commission and swap. MT5's own totals therefore equal
@@ -24,11 +27,24 @@ from pathlib import Path
 
 import pytest
 
+from shared.models import Trade
+from validation.importers.mt5_xlsx import MT5XLSXImporter
 from validation.reference import ValidationReference
 from validation.stats.calculator import compute_trade_statistics
 
 GOLDEN_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "validation" / "goldens"
 GOLDEN_FILES = ["eurusd_h1_golden.json", "nas100_m15_golden.json", "sp500_m1_golden.json"]
+REPORT_DIR = (
+    Path(__file__).resolve().parents[2]
+    / "strategy-comparisons"
+    / "intraday_volatility_breakout"
+)
+GOLDEN_REPORTS = {
+    "eurusd_h1_golden.json": "EURUSD_H1.xlsx",
+    "nas100_m15_golden.json": "NAS100_M15.xlsx",
+    "sp500_m1_golden.json": "SP500_M1.xlsx",
+}
+MONEY_TOLERANCE = 0.01
 
 @pytest.fixture(params=GOLDEN_FILES, ids=lambda name: name.removesuffix("_golden.json"))
 def golden(request: pytest.FixtureRequest) -> dict:
@@ -41,6 +57,21 @@ def _pnl(trade: dict) -> float:
 
 def _fees(trade: dict) -> float:
     return float(trade["fees"] or 0.0)
+
+
+def _assert_same_money(
+    fresh: float | None,
+    committed: float | None,
+    field: str,
+    trade_id: int,
+) -> None:
+    assert (fresh is None) == (committed is None), (
+        f"trade {trade_id}: {field}: fresh {fresh!r}, golden {committed!r}"
+    )
+    if fresh is not None:
+        assert fresh == pytest.approx(committed, abs=MONEY_TOLERANCE), (
+            f"trade {trade_id}: {field}: fresh {fresh!r}, golden {committed!r}"
+        )
 
 
 class TestSummaryReconciliation:
@@ -103,3 +134,32 @@ class TestNetPnl:
         golden = json.loads((GOLDEN_DIR / file_name).read_text(encoding="utf-8"))
         ref = ValidationReference.model_validate(golden)
         assert compute_trade_statistics(ref.trades).winning_trades == golden["stats"]["winners"]
+
+
+class TestGoldensMatchFreshImport:
+    """The goldens must stay re-derivable from their tracked reports.
+
+    The source ``.xlsx`` reports are tracked in
+    ``strategy-comparisons/intraday_volatility_breakout/``, so each golden is
+    a derived copy, not an independently maintained file. This pins the
+    fields the importer owns about a trade's PnL (``fees``/``net_pnl``) to a
+    fresh import, so a hand-edited golden that drifts from the importer
+    fails here instead of silently contradicting it. Not compared: the
+    volatile reference fields (``imported_at``, ``source_path``) and fields
+    added by later importer versions, which the committed goldens are still
+    free to lag on.
+    """
+
+    @pytest.mark.parametrize("file_name", GOLDEN_FILES)
+    def test_fee_fields_match_a_fresh_import(self, file_name: str) -> None:
+        golden = json.loads((GOLDEN_DIR / file_name).read_text(encoding="utf-8"))
+        report = REPORT_DIR / GOLDEN_REPORTS[file_name]
+        assert report.is_file(), f"tracked report is missing: {report}"
+        fresh: list[Trade] = MT5XLSXImporter().load(report).trades
+        committed = golden["trades"]
+        assert [t.id for t in fresh] == [t["id"] for t in committed]
+        assert len(fresh) == len(committed)
+        for trade, expected in zip(fresh, committed, strict=True):
+            _assert_same_money(trade.fees, expected["fees"], "fees", trade.id)
+            _assert_same_money(trade.pnl, expected["pnl"], "pnl", trade.id)
+            _assert_same_money(trade.net_pnl, expected["net_pnl"], "net_pnl", trade.id)
