@@ -391,6 +391,18 @@ class TestFeeSign:
         with pytest.raises(ValueError, match="Kommission cell is not a number"):
             MT5HTMLImporter._build_trades(table, {})
 
+    def test_zero_fees_are_stored_as_none(self):
+        """MT5's "no fees" (0.0) is stored as None, like on the XLSX side.
+
+        ``Trade.fees`` is optional and ``None`` means "not reported", which is
+        not the same as a reported zero; both importer paths must agree.
+        """
+        trades, _ = MT5HTMLImporter._build_trades(self._table("", ""), {})
+        assert trades[0].fees is None
+        assert trades[0].net_pnl == pytest.approx(trades[0].pnl)
+        assert trades[0].meta["commission"] is None
+        assert trades[0].meta["swap"] is None
+
     def test_swap_on_an_entry_fill_is_counted(self):
         """DV-B43 sums commission and swap over entry *and* exit fills.
 

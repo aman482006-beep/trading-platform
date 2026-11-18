@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import openpyxl
 import pandas as pd
 import pytest
 
@@ -831,3 +832,28 @@ class TestZeroFeesBecomeNone:
         path = self._write_report(tmp_path, commission="xyz", swap=0.0)
         with pytest.raises(ValueError, match="Kommission cell is not a number"):
             MT5XLSXImporter().load(path)
+
+    def test_excel_error_fee_cell_is_read_as_no_fees(self, tmp_path: Path):
+        """A real Excel error cell arrives as NaN and reads as "no fees".
+
+        Settled empirically: pandas' ``read_excel`` converts a ``t="e"`` cell
+        to NaN, so at the importer's boundary such a cell is indistinguishable
+        from a blank one (an openpyxl-level distinction the importer does not
+        make). Pinned so the documented limitation cannot silently change:
+        ``fees`` stays ``None`` and ``net_pnl`` equals the gross PnL.
+        """
+        path = self._write_report(tmp_path, commission=0.0, swap=0.0)
+        workbook = openpyxl.load_workbook(path)
+        sheet = workbook.active
+        commission_cell = None
+        for row in sheet.iter_rows():
+            for cell in row:
+                if cell.value == "Kommission":
+                    commission_cell = sheet.cell(row=cell.row + 1, column=cell.column)
+        assert commission_cell is not None
+        commission_cell.value = "#DIV/0!"
+        workbook.save(path)
+
+        trade = MT5XLSXImporter().load(path).trades[0]
+        assert trade.fees is None
+        assert trade.net_pnl == pytest.approx(trade.pnl)

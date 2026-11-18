@@ -30,6 +30,19 @@ def _trade(direction: str, *, exits: list[TradeExit] | None = None) -> Trade:
     )
 
 
+def test_fees_and_net_pnl_default_to_none_not_zero() -> None:
+    """An omitted fee means "not reported", never a reported zero.
+
+    Importers and engines that carry no fee information rely on this default;
+    a ``0.0`` default would silently upgrade every such trade to "no cost".
+    """
+    trade = _trade("LONG")
+    assert trade.fees is None
+    assert trade.net_pnl is None
+    assert trade.to_dict().get("fees") is None
+    assert trade.to_dict().get("net_pnl") is None
+
+
 def _trade_dict(direction: object) -> dict:
     return {
         "id": 1,
