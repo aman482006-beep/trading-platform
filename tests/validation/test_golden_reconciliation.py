@@ -11,9 +11,9 @@ import. The source ``.xlsx`` reports are tracked in
 ``strategy-comparisons/intraday_volatility_breakout/``, and
 ``scripts/generate_golden_files.py`` re-imports them to regenerate the goldens,
 so a golden can always be re-derived from its report.
-``TestGoldensMatchFreshImport`` pins the trade-level fee fields (``fees``,
-``pnl``, ``net_pnl``) to a fresh import of those reports, so the goldens cannot
-drift away from the importer without a test failing.
+``TestGoldensMatchFreshImport`` pins the trade-level and per-exit money
+fields (``fees``, ``pnl``, ``net_pnl``) to a fresh import of those reports, so
+the goldens cannot drift away from the importer without a test failing.
 
 ``fees`` is a positive cost (``net_pnl == pnl - fees``); the importers negate
 MT5's signed commission and swap. MT5's own totals therefore equal
@@ -142,12 +142,12 @@ class TestGoldensMatchFreshImport:
     The source ``.xlsx`` reports are tracked in
     ``strategy-comparisons/intraday_volatility_breakout/``, so each golden is
     a derived copy, not an independently maintained file. This pins the
-    fields the importer owns about a trade's PnL (``fees``/``net_pnl``) to a
-    fresh import, so a hand-edited golden that drifts from the importer
-    fails here instead of silently contradicting it. Not compared: the
-    volatile reference fields (``imported_at``, ``source_path``) and fields
-    added by later importer versions, which the committed goldens are still
-    free to lag on.
+    fields the importer owns about a trade's PnL (``fees``/``net_pnl``, and
+    the per-exit ones) to a fresh import, so a hand-edited golden that drifts
+    from the importer fails here instead of silently contradicting it. Not
+    compared: the volatile reference fields (``imported_at``, ``source_path``)
+    and fields added by later importer versions, which the committed goldens
+    are still free to lag on.
     """
 
     @pytest.mark.parametrize("file_name", GOLDEN_FILES)
@@ -163,3 +163,12 @@ class TestGoldensMatchFreshImport:
             _assert_same_money(trade.fees, expected["fees"], "fees", trade.id)
             _assert_same_money(trade.pnl, expected["pnl"], "pnl", trade.id)
             _assert_same_money(trade.net_pnl, expected["net_pnl"], "net_pnl", trade.id)
+            assert len(trade.exits) == len(expected["exits"])
+            for exit_, exit_expected in zip(trade.exits, expected["exits"], strict=True):
+                # Costs live on Trade.fees only, never on a TradeExit.
+                _assert_same_money(
+                    exit_.fees, exit_expected["fees"], "exits[].fees", trade.id
+                )
+                _assert_same_money(
+                    exit_.pnl, exit_expected["pnl"], "exits[].pnl", trade.id
+                )
