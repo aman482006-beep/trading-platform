@@ -271,8 +271,10 @@ class TestGermanNumberParsing:
 
         SL/TP cells read the *detected* locale (German grouping wins there);
         every other money cell (PnL, commission, swap) reads dot-decimal first
-        and only falls back to comma-decimal. Pin the precedence: reversing it
-        would read a German "1.500" commission 1000x low.
+        and only falls back to comma-decimal. Pin the precedence: an ambiguous
+        dot-grouped value ("1.500") therefore resolves to 1.5, so a report that
+        groups with dots reads that fee 1000x low -- the chosen trade-off of
+        DV-B44 (a dot-grouped commission is rare; a dropped PnL is not).
         """
         from validation.importers._numbers import parse_report_number
         from validation.importers.mt5_html import MT5HTMLImporter as I

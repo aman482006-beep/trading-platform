@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -35,21 +36,23 @@ def _sp500_path() -> Path:
     return _REPORTS / "SP500_M1.xlsx"
 
 
-def _write_report_with_formula_fee_cell(tmp_path: Path, formula: str) -> tuple[Path, str]:
-    """A report whose entry-fill commission cell holds ``formula``."""
+def _write_report_with_formula_fee_cell(
+    tmp_path: Path, formula: str, column: str = "Kommission"
+) -> tuple[Path, str]:
+    """A report whose entry-fill ``column`` fee cell holds ``formula``."""
     path = TestZeroFeesBecomeNone._write_report(
         TestZeroFeesBecomeNone(), tmp_path, commission=0.0, swap=0.0
     )
     workbook = openpyxl.load_workbook(path)
     sheet = workbook.active
-    commission_cell = None
+    fee_cell = None
     for row in sheet.iter_rows():
         for cell in row:
-            if cell.value == "Kommission":
-                commission_cell = sheet.cell(row=cell.row + 1, column=cell.column)
-    assert commission_cell is not None
-    coordinate = commission_cell.coordinate
-    commission_cell.value = formula
+            if cell.value == column:
+                fee_cell = sheet.cell(row=cell.row + 1, column=cell.column)
+    assert fee_cell is not None
+    coordinate = fee_cell.coordinate
+    fee_cell.value = formula
     workbook.save(path)
     return path, coordinate
 
@@ -823,9 +826,8 @@ class TestZeroFeesBecomeNone:
         trades = pd.DataFrame(rows)
         orders = pd.DataFrame([["Orders", None], [None, None]])
 
-        path = tmp_path / (
-            f"report_{str(commission).replace('/', '_')}_{swap}.xlsx"
-        )
+        stem = f"{str(commission).replace('/', '_')}_{str(swap).replace('/', '_')}"
+        path = tmp_path / f"report_{stem}.xlsx"
         with pd.ExcelWriter(path, engine="openpyxl") as writer:
             orders.to_excel(writer, index=False, header=False, startrow=0)
             trades.to_excel(writer, index=False, header=False, startrow=20)
@@ -908,18 +910,27 @@ class TestZeroFeesBecomeNone:
         with pytest.raises(ValueError, match="Swap cell is not a number"):
             MT5XLSXImporter().load(path)
 
+    @pytest.mark.parametrize("column", ["commission", "swap"])
     @pytest.mark.parametrize("na_text", ["n/a", "NA", "N/A", "NULL", "NaN", "None"])
     def test_pandas_na_sentinel_fee_cell_is_refused(
-        self, tmp_path: Path, na_text: str
+        self, tmp_path: Path, na_text: str, column: str
     ):
         """A fee cell pandas reads as no value must fail, not become zero fees.
 
         ``pd.read_excel`` converts these exact texts (case-sensitive, no
         stripping) to NaN, which ``mt5_fee_cell`` would then read as MT5's
         "no fees"; the guard sees the text in the raw workbook and refuses.
+        Both fee columns: a narrowed guard would lose the swap instead.
         """
-        path = self._write_report(tmp_path, commission=na_text, swap=0.0)
-        with pytest.raises(ValueError, match="which pandas reads as no value"):
+        path = self._write_report(
+            tmp_path,
+            commission=na_text if column == "commission" else 0.0,
+            swap=na_text if column == "swap" else 0.0,
+        )
+        label = "Kommission" if column == "commission" else "Swap"
+        with pytest.raises(
+            ValueError, match=re.escape(f"{label} cell in row") + ".*which pandas reads as no value"
+        ):
             MT5XLSXImporter().load(path)
 
     def test_excel_error_fee_cell_is_refused(self, tmp_path: Path):
@@ -997,42 +1008,54 @@ class TestZeroFeesBecomeNone:
         with pytest.raises(ValueError, match="Kommission cell is an Excel error"):
             MT5XLSXImporter().load(path)
 
-    def test_excel_error_formula_cell_is_refused(self, tmp_path: Path):
+    @pytest.mark.parametrize("fee_column", ["Kommission", "Swap"])
+    def test_excel_error_formula_cell_is_refused(self, tmp_path: Path, fee_column: str):
         """A formula whose cached result is an error must fail the import too.
 
         pandas reads cached values, so the guard must as well (data_only=True):
         in formula mode such a cell looks like a harmless ``data_type="f"``
         while pandas hands over NaN and the fee would read as "no fees".
         """
-        path, coordinate = _write_report_with_formula_fee_cell(tmp_path, "=1/0")
+        path, coordinate = _write_report_with_formula_fee_cell(
+            tmp_path, "=1/0", fee_column
+        )
         _inject_cached_result(
             path, coordinate, "1/0", ' t="e"><f>1/0</f><v>#DIV/0!</v>'
         )
 
-        with pytest.raises(ValueError, match="Kommission cell is an Excel error"):
+        with pytest.raises(
+            ValueError, match=re.escape(f"{fee_column} cell is an Excel error")
+        ):
             MT5XLSXImporter().load(path)
 
-    def test_formula_without_a_cached_result_is_refused(self, tmp_path: Path):
+    @pytest.mark.parametrize("fee_column", ["Kommission", "Swap"])
+    def test_formula_without_a_cached_result_is_refused(
+        self, tmp_path: Path, fee_column: str
+    ):
         """A formula with no cached value must fail, not read as "no fees".
 
         This is the shape openpyxl itself writes (``<f>1/0</f><v></v>``), so
-        the repo's own fixture generator and test helper produce such reports.
-        pandas reads NaN for them; booking the fee as zero would report an
-        unknown cost as none.
+        this repo's test helper produces such a report; pandas reads NaN for
+        them and booking the fee as zero would report an unknown cost as none.
         """
-        path, _ = _write_report_with_formula_fee_cell(tmp_path, "=1/0")
+        path, _ = _write_report_with_formula_fee_cell(tmp_path, "=1/0", fee_column)
 
         with pytest.raises(ValueError, match="formula without a cached result"):
             MT5XLSXImporter().load(path)
 
-    def test_formula_whose_cached_result_is_na_text_is_refused(self, tmp_path: Path):
+    @pytest.mark.parametrize("fee_column", ["Kommission", "Swap"])
+    def test_formula_whose_cached_result_is_na_text_is_refused(
+        self, tmp_path: Path, fee_column: str
+    ):
         """A formula caching the text ``n/a`` must fail, not read as "no fees".
 
         pandas applies its NA conversion to the cached string, so such a cell
         reaches the fee parser as NaN and would be booked as zero; only the
         raw workbook still shows the text.
         """
-        path, coordinate = _write_report_with_formula_fee_cell(tmp_path, "=A1")
+        path, coordinate = _write_report_with_formula_fee_cell(
+            tmp_path, "=A1", fee_column
+        )
         _inject_cached_result(path, coordinate, "A1", ' t="str"><f>A1</f><v>n/a</v>')
 
         with pytest.raises(ValueError, match="which pandas reads as no value"):

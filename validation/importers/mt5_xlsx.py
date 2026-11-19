@@ -40,9 +40,10 @@ try:
     # Exactly the texts pandas' Excel reader reads as "no value" (private
     # module, stable across pandas 2.x and 3.x). A fee cell holding one of them
     # is indistinguishable from a blank cell after the read, so the guard below
-    # refuses it; the tests pin the behaviour either way.
+    # refuses it. tests/test_na_text_fallback_pins_pandas.py fails loudly if
+    # pandas ever adds a sentinel this copy does not know.
     from pandas._libs.parsers import STR_NA_VALUES as _PANDAS_NO_VALUE_TEXTS
-except ImportError:  # pragma: no cover - a pandas API rename must fail closed
+except ImportError:  # pragma: no cover - a pinned copy for a pandas rename
     _PANDAS_NO_VALUE_TEXTS = frozenset(  # type: ignore[assignment]
         {
             "#N/A",
