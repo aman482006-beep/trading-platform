@@ -274,20 +274,18 @@ def _scan_fee_cells(
             return _FeeCellScan([], [], [], values, [], 0)
         # Positions, not Cell.column: read_only mode hands out EmptyCell objects
         # for gaps, which carry no column index.
-        fee_columns = {
+        fee_columns: dict[int, str] = {
             column: cell.value.strip()
             for column, cell in enumerate(header_row, start=1)
             if isinstance(cell.value, str) and cell.value.strip() in ("Kommission", "Swap")
         }
-        if not fee_columns:
-            return _FeeCellScan([], [], [], values, [], header_row_number, dict(fee_columns))
         # The rows the importer reads as fills: the report's trailing totals
         # row (a SUM formula in a fee column, no Richtung) is never one, so its
         # cells are the parser's business, not this guard's. The selection is
         # Richtung-only and therefore a superset of group_position_fills (which
         # also drops Typ=balance rows): over-scanning fails closed, a missed
         # fill would not.
-        direction_column = next(
+        direction_column: int | None = next(
             (
                 column
                 for column, cell in enumerate(header_row, start=1)
@@ -298,10 +296,13 @@ def _scan_fee_cells(
         if table is not None:
             # The cached read already resolved the table; re-matching the raw
             # header would drop a column whose header is itself a formula.
+            # Overriding before any early return keeps that protection.
             fee_columns, direction_column = table
-            if not fee_columns:
-                return _FeeCellScan([], [], [], values, [], header_row_number, table[0], table[1])
-        if direction_column is None:
+        if not fee_columns:
+            return _FeeCellScan([], [], [], values, [], header_row_number, dict(fee_columns), None)
+        if direction_column is None and rows is None:
+            # Without a Richtung column this scan cannot tell fill rows from
+            # the totals row; the parse reports the layout itself.
             return _FeeCellScan(
                 [], [], [], values, [], header_row_number, dict(fee_columns), None
             )
