@@ -54,6 +54,24 @@ def _write_report_with_formula_fee_cell(tmp_path: Path, formula: str) -> tuple[P
     return path, coordinate
 
 
+def _append_totals_row_with_formula_fee_cell(path: Path) -> None:
+    """Add the report's trailing totals row with an uncached fee formula.
+
+    The row carries no Richtung, so group_position_fills never reads it as a
+    fill; a workbook re-saved without cached values must still import.
+    """
+    workbook = openpyxl.load_workbook(path)
+    sheet = workbook.active
+    swap_header = next(
+        cell for row in sheet.iter_rows() for cell in row if cell.value == "Swap"
+    )
+    totals_row = sheet.max_row + 1
+    for column in range(1, swap_header.column + 1):
+        sheet.cell(row=totals_row, column=column)
+    sheet.cell(row=totals_row, column=swap_header.column).value = "=1/0"
+    workbook.save(path)
+
+
 def _inject_cached_result(
     path: Path, coordinate: str, formula: str, cached_xml: str
 ) -> None:
@@ -937,10 +955,46 @@ class TestZeroFeesBecomeNone:
             cell for row in sheet.iter_rows() for cell in row if cell.value == "Swap"
         )
         # The entry fill is the first row below the header; the exit row follows.
-        swap_header.offset(row=2).value = "#DIV/0!"
+        swap_cell = swap_header.offset(row=2)
+        swap_cell.value = "#DIV/0!"
         workbook.save(path)
 
-        with pytest.raises(ValueError, match=r"Swap cell is an Excel error .* in row \d+"):
+        with pytest.raises(
+            ValueError, match=f"Swap cell is an Excel error .* in row {swap_cell.row}"
+        ):
+            MT5XLSXImporter().load(path)
+
+    def test_totals_row_formula_is_ignored(self, tmp_path: Path):
+        """The guard must not refuse a totals row it does not read.
+
+        The report's trailing totals row can hold a SUM formula in a fee
+        column; the importer never reads it as a fill (no Richtung), so an
+        uncached formula there must not fail the import.
+        """
+        path = self._write_report(tmp_path, commission=0.0, swap=0.0)
+        _append_totals_row_with_formula_fee_cell(path)
+
+        assert len(MT5XLSXImporter().load(path).trades) == 1
+
+    def test_padded_trades_label_is_still_scanned(self, tmp_path: Path):
+        """A padded table label must not hide an unreadable fee cell."""
+        path = self._write_report(tmp_path, commission=0.0, swap=0.0)
+        workbook = openpyxl.load_workbook(path)
+        sheet = workbook.active
+        label = next(
+            cell for row in sheet.iter_rows() for cell in row if cell.value == "Trades"
+        )
+        label.value = " Trades "
+        commission_cell = None
+        for row in sheet.iter_rows():
+            for cell in row:
+                if cell.value == "Kommission":
+                    commission_cell = sheet.cell(row=cell.row + 1, column=cell.column)
+        assert commission_cell is not None
+        commission_cell.value = "#DIV/0!"
+        workbook.save(path)
+
+        with pytest.raises(ValueError, match="Kommission cell is an Excel error"):
             MT5XLSXImporter().load(path)
 
     def test_excel_error_formula_cell_is_refused(self, tmp_path: Path):

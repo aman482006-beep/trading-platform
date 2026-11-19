@@ -168,11 +168,11 @@ def _assert_fee_cells_are_readable(path: Path) -> None:
     the fee columns are checked there before anything is parsed.
 
     Formula cells are refused unless the workbook stores a cached result: a
-    formula without one reads as ``None`` here and as NaN in pandas (the
-    openpyxl-written workbooks of this repo's own fixture generator are exactly
-    that shape), and a cached *error* is a corrupt report like a literal error
-    cell. A formula with a cached number is the value pandas reads and stays
-    importable.
+    formula without one reads as ``None`` here and as NaN in pandas (any
+    openpyxl-written report is that shape, including this repo's test helper
+    ``_write_report_with_formula_fee_cell``), and a cached *error* is a corrupt
+    report like a literal error cell. A formula with a cached number is the
+    value pandas reads and stays importable.
 
     Self-contained on purpose: the sheet is re-scanned for the Trades header
     instead of reusing the parsed row/column indices, which the table
@@ -252,7 +252,31 @@ def _scan_fee_cells(
         }
         if not fee_columns:
             return _FeeCellScan([], [], [], values)
+        # Only the rows the importer itself reads as fills: the report's
+        # trailing totals row (a SUM formula in a fee column, no Richtung) is
+        # never a fill, so its cells are the parser's business, not this
+        # guard's. group_position_fills selects exactly these rows.
+        direction_column = next(
+            (
+                column
+                for column, cell in enumerate(header_row, start=1)
+                if isinstance(cell.value, str) and cell.value.strip() == "Richtung"
+            ),
+            None,
+        )
+        if direction_column is None:
+            return _FeeCellScan([], [], [], values)  # the layout check reports this itself
         for row_number, row in enumerate(rows, start=header_row_number + 1):
+            row_direction = (
+                row[direction_column - 1].value
+                if direction_column - 1 < len(row)
+                else None
+            )
+            if (
+                not isinstance(row_direction, str)
+                or row_direction.strip().lower() not in ("in", "out")
+            ):
+                continue
             for column, cell in enumerate(row, start=1):
                 if column not in fee_columns:
                     continue
