@@ -164,6 +164,7 @@ class _FeeCellScan(NamedTuple):
     header_row: int = 0
     fee_columns: dict[int, str] = field(default_factory=dict)
     direction_column: int | None = None
+    header_formulas: list[_FeeCell] = field(default_factory=list)
 
 
 def _assert_fee_cells_are_readable(path: Path) -> None:
@@ -213,6 +214,16 @@ def _assert_fee_cells_are_readable(path: Path) -> None:
         table_header_row=cached.header_row or None,
         table=(cached.fee_columns, cached.direction_column),
     )
+    for cell in raw.header_formulas:
+        cached_value, _ = cached.values.get(cell.position, (None, ""))
+        if cached_value is None:
+            # pandas drops a column whose header has no cached result, and the
+            # importer then reads every fee in it as "no fees".
+            raise ValueError(
+                f"MT5 Trades header cell {cell.value!r} (column {cell.column}) is "
+                "a formula without a cached result: the column is unreadable "
+                "and its fees cannot be read as zero"
+            )
     for cell in raw.formulas:
         cached_value, _ = cached.values[cell.position]
         if cached_value is None:
@@ -244,6 +255,7 @@ def _scan_fee_cells(
     error_cells: list[_FeeCell] = []
     na_text_cells: list[_FeeCell] = []
     formula_cells: list[_FeeCell] = []
+    header_formulas: list[_FeeCell] = []
     values: dict[tuple[int, int], tuple[Any, str]] = {}
     fill_rows: list[int] = []
     wanted_rows = rows
@@ -298,13 +310,25 @@ def _scan_fee_cells(
             # header would drop a column whose header is itself a formula.
             # Overriding before any early return keeps that protection.
             fee_columns, direction_column = table
+        for column, cell in enumerate(header_row, start=1):
+            values[(header_row_number, column)] = (cell.value, cell.data_type)
+            if data_only is False and cell.data_type == "f":
+                # A header cell that is a formula without a cached result makes
+                # pandas drop the column; only formula mode can see it.
+                header_formulas.append(
+                    _FeeCell(str(cell.value), header_row_number, column, cell.value)
+                )
         if not fee_columns:
-            return _FeeCellScan([], [], [], values, [], header_row_number, dict(fee_columns), None)
-        if direction_column is None and rows is None:
+            return _FeeCellScan(
+                [], [], [], values, [], header_row_number, dict(fee_columns), None,
+                header_formulas,
+            )
+        if direction_column is None and wanted_rows is None:
             # Without a Richtung column this scan cannot tell fill rows from
             # the totals row; the parse reports the layout itself.
             return _FeeCellScan(
-                [], [], [], values, [], header_row_number, dict(fee_columns), None
+                [], [], [], values, [], header_row_number, dict(fee_columns), None,
+                header_formulas,
             )
         for row_number, row in enumerate(rows, start=header_row_number + 1):
             if wanted_rows is not None:
@@ -357,6 +381,7 @@ def _scan_fee_cells(
         header_row_number,
         dict(fee_columns),
         direction_column,
+        header_formulas,
     )
 
 

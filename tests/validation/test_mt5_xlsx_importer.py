@@ -809,6 +809,7 @@ class TestZeroFeesBecomeNone:
         commission: float | str,
         swap: float | str,
         profit: float = 100.0,
+        entry_direction: str = "in",
     ) -> Path:
         header = [
             "Zeit", "Trade", "Symbol", "Typ", "Richtung", "Volumen", "Preis",
@@ -817,7 +818,7 @@ class TestZeroFeesBecomeNone:
         rows = [
             ["Trades"] + [None] * (len(header) - 1),
             header,
-            ["2024.01.03 08:00:00", 2, "EURUSD", "buy", "in", "0.10", 1.085,
+            ["2024.01.03 08:00:00", 2, "EURUSD", "buy", entry_direction, "0.10", 1.085,
              commission, swap, 0.0, ""],
             ["2024.01.03 16:00:00", 3, "EURUSD", "sell", "out", "0.10", 1.090,
              0.0, 0.0, profit, ""],
@@ -910,9 +911,10 @@ class TestZeroFeesBecomeNone:
             MT5XLSXImporter().load(path)
 
     @pytest.mark.parametrize("column", ["commission", "swap"])
+    @pytest.mark.parametrize("direction", ["in", "In", "OUT"])
     @pytest.mark.parametrize("na_text", ["n/a", "NA", "N/A", "NULL", "NaN", "None"])
     def test_pandas_na_sentinel_fee_cell_is_refused(
-        self, tmp_path: Path, na_text: str, column: str
+        self, tmp_path: Path, na_text: str, column: str, direction: str
     ):
         """A fee cell pandas reads as no value must fail, not become zero fees.
 
@@ -925,6 +927,7 @@ class TestZeroFeesBecomeNone:
             tmp_path,
             commission=na_text if column == "commission" else 0.0,
             swap=na_text if column == "swap" else 0.0,
+            entry_direction=direction,
         )
         label = "Kommission" if column == "commission" else "Swap"
         with pytest.raises(
@@ -932,15 +935,22 @@ class TestZeroFeesBecomeNone:
         ):
             MT5XLSXImporter().load(path)
 
-    def test_excel_error_fee_cell_is_refused(self, tmp_path: Path):
+    @pytest.mark.parametrize("entry_direction", ["in", "In", "OUT"])
+    def test_excel_error_fee_cell_is_refused(
+        self, tmp_path: Path, entry_direction: str
+    ):
         """A genuine Excel-error fee cell must fail the import, not read as 0.0.
 
         pandas turns an error cell (``data_type="e"``) into NaN, so after the
         read it is indistinguishable from MT5's "no fees" blank cell; the
         importer checks the raw workbook and refuses instead of booking an
-        unknown cost as zero.
+        unknown cost as zero. The direction spellings matter: the importer
+        lowercases ``Richtung`` before classifying a fill, so the guard must
+        recognise ``In``/``OUT`` as fills too or it would skip those rows.
         """
-        path = self._write_report(tmp_path, commission=0.0, swap=0.0)
+        path = self._write_report(
+            tmp_path, commission=0.0, swap=0.0, entry_direction=entry_direction
+        )
         workbook = openpyxl.load_workbook(path)
         sheet = workbook.active
         commission_cell = None
@@ -1035,6 +1045,25 @@ class TestZeroFeesBecomeNone:
         )
 
         with pytest.raises(ValueError, match="Kommission cell is an Excel error"):
+            MT5XLSXImporter().load(path)
+
+    def test_uncached_formula_fee_header_is_refused(self, tmp_path: Path):
+        """A fee-column header that is a formula without a cached result.
+
+        pandas drops such a column (it renames it ``__col_N``), and the
+        importer then reads every fee in it as "no fees" -- the silent
+        unknown-cost-to-zero conversion the guard must refuse.
+        """
+        path = self._write_report(tmp_path, commission=-2.5, swap=-1.5)
+        workbook = openpyxl.load_workbook(path)
+        sheet = workbook.active
+        kommission_header = next(
+            cell for row in sheet.iter_rows() for cell in row if cell.value == "Kommission"
+        )
+        kommission_header.value = '="Kommission"'
+        workbook.save(path)
+
+        with pytest.raises(ValueError, match="Trades header cell"):
             MT5XLSXImporter().load(path)
 
     @pytest.mark.parametrize("fee_column", ["Kommission", "Swap"])
