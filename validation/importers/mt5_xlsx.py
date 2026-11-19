@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import re
+from dataclasses import field
 from datetime import datetime, timezone, tzinfo
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -161,6 +162,8 @@ class _FeeCellScan(NamedTuple):
     values: dict[tuple[int, int], tuple[Any, str]]
     fill_rows: list[int]
     header_row: int = 0
+    fee_columns: dict[int, str] = field(default_factory=dict)
+    direction_column: int | None = None
 
 
 def _assert_fee_cells_are_readable(path: Path) -> None:
@@ -208,6 +211,7 @@ def _assert_fee_cells_are_readable(path: Path) -> None:
         data_only=False,
         rows=set(cached.fill_rows),
         table_header_row=cached.header_row or None,
+        table=(cached.fee_columns, cached.direction_column),
     )
     for cell in raw.formulas:
         cached_value, _ = cached.values[cell.position]
@@ -227,6 +231,7 @@ def _scan_fee_cells(
     data_only: bool,
     rows: set[int] | None = None,
     table_header_row: int | None = None,
+    table: tuple[dict[int, str], int | None] | None = None,
 ) -> _FeeCellScan:
     """Stream the Trades table's fee columns of a workbook.
 
@@ -275,7 +280,7 @@ def _scan_fee_cells(
             if isinstance(cell.value, str) and cell.value.strip() in ("Kommission", "Swap")
         }
         if not fee_columns:
-            return _FeeCellScan([], [], [], values, [], header_row_number)
+            return _FeeCellScan([], [], [], values, [], header_row_number, dict(fee_columns))
         # The rows the importer reads as fills: the report's trailing totals
         # row (a SUM formula in a fee column, no Richtung) is never one, so its
         # cells are the parser's business, not this guard's. The selection is
@@ -290,8 +295,16 @@ def _scan_fee_cells(
             ),
             None,
         )
+        if table is not None:
+            # The cached read already resolved the table; re-matching the raw
+            # header would drop a column whose header is itself a formula.
+            fee_columns, direction_column = table
+            if not fee_columns:
+                return _FeeCellScan([], [], [], values, [], header_row_number, table[0], table[1])
         if direction_column is None:
-            return _FeeCellScan([], [], [], values, [], header_row_number)
+            return _FeeCellScan(
+                [], [], [], values, [], header_row_number, dict(fee_columns), None
+            )
         for row_number, row in enumerate(rows, start=header_row_number + 1):
             if wanted_rows is not None:
                 # The caller restricted the scan to rows the *cached* read
@@ -335,7 +348,14 @@ def _scan_fee_cells(
     finally:
         workbook.close()
     return _FeeCellScan(
-        error_cells, na_text_cells, formula_cells, values, fill_rows, header_row_number
+        error_cells,
+        na_text_cells,
+        formula_cells,
+        values,
+        fill_rows,
+        header_row_number,
+        dict(fee_columns),
+        direction_column,
     )
 
 

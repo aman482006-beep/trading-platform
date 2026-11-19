@@ -1057,6 +1057,33 @@ class TestZeroFeesBecomeNone:
         ):
             MT5XLSXImporter().load(path)
 
+    def test_formula_fee_column_header_is_not_dropped(self, tmp_path: Path):
+        """A fee column whose header is a formula must still be scanned.
+
+        pandas imports the column from the cached header, so the cached pass
+        resolves it; the formula-mode re-scan must reuse those positions instead
+        of re-matching the raw header (which holds ``="Kommission"``).
+        """
+        path = self._write_report(tmp_path, commission=0.0, swap=0.0)
+        workbook = openpyxl.load_workbook(path)
+        sheet = workbook.active
+        kommission_header = next(
+            cell for row in sheet.iter_rows() for cell in row if cell.value == "Kommission"
+        )
+        entry_fee = sheet.cell(row=kommission_header.row + 1, column=kommission_header.column)
+        kommission_header.value = '="Kommission"'
+        entry_fee.value = "=1+1"
+        workbook.save(path)
+        _inject_cached_result(
+            path,
+            kommission_header.coordinate,
+            '"Kommission"',
+            ' t="str"><f>"Kommission"</f><v>Kommission</v>',
+        )
+
+        with pytest.raises(ValueError, match="formula without a cached result"):
+            MT5XLSXImporter().load(path)
+
     def test_formula_richtung_with_uncached_fee_formula_is_refused(
         self, tmp_path: Path
     ):
