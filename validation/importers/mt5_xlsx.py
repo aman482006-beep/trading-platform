@@ -36,36 +36,38 @@ logger = logging.getLogger(__name__)
 _ORDERS_LABEL = "Orders"
 _TRADES_LABEL = "Trades"
 
+_NA_TEXT_FALLBACK = frozenset(
+    {
+        "#N/A",
+        "#N/A N/A",
+        "#NA",
+        "-1.#IND",
+        "-1.#QNAN",
+        "-NaN",
+        "-nan",
+        "1.#IND",
+        "1.#QNAN",
+        "<NA>",
+        "N/A",
+        "NA",
+        "NULL",
+        "NaN",
+        "None",
+        "n/a",
+        "nan",
+        "null",
+    }
+)
 try:
     # Exactly the texts pandas' Excel reader reads as "no value" (private
     # module, stable across pandas 2.x and 3.x). A fee cell holding one of them
     # is indistinguishable from a blank cell after the read, so the guard below
-    # refuses it. tests/test_na_text_fallback_pins_pandas.py fails loudly if
-    # pandas ever adds a sentinel this copy does not know.
+    # refuses it. tests/test_na_text_fallback_pins_pandas.py compares
+    # _NA_TEXT_FALLBACK with pandas' live set, so a sentinel pandas adds fails
+    # loudly there.
     from pandas._libs.parsers import STR_NA_VALUES as _PANDAS_NO_VALUE_TEXTS
 except ImportError:  # pragma: no cover - a pinned copy for a pandas rename
-    _PANDAS_NO_VALUE_TEXTS = frozenset(  # type: ignore[assignment]
-        {
-            "#N/A",
-            "#N/A N/A",
-            "#NA",
-            "-1.#IND",
-            "-1.#QNAN",
-            "-NaN",
-            "-nan",
-            "1.#IND",
-            "1.#QNAN",
-            "<NA>",
-            "N/A",
-            "NA",
-            "NULL",
-            "NaN",
-            "None",
-            "n/a",
-            "nan",
-            "null",
-        }
-    )
+    _PANDAS_NO_VALUE_TEXTS = _NA_TEXT_FALLBACK
 _PANDAS_NO_VALUE_TEXTS = frozenset(_PANDAS_NO_VALUE_TEXTS) - {""}
 
 # Known German stat labels → canonical keys (with and without trailing colon)
@@ -203,7 +205,9 @@ def _assert_fee_cells_are_readable(path: Path) -> None:
     raw = _scan_fee_cells(path, data_only=False, rows=set(cached.fill_rows))
     for cell in raw.formulas:
         cached_value, _ = cached.values[cell.position]
-        if cached_value is None:
+        if cached_value is None or cached_value == "":
+            # pandas reads both the missing and the blank cached result as
+            # "no value", so both book the fee as zero without this guard.
             raise ValueError(
                 f"MT5 {cell.label} cell in row {cell.row} is a formula without a "
                 "cached result: the fee is unknown and cannot be read as zero"
@@ -269,20 +273,27 @@ def _scan_fee_cells(
         if direction_column is None:
             return _FeeCellScan([], [], [], values, [])  # the layout check reports this
         for row_number, row in enumerate(rows, start=header_row_number + 1):
-            if wanted_rows is not None and row_number not in wanted_rows:
-                continue
-            row_direction = (
-                row[direction_column - 1].value
-                if direction_column - 1 < len(row)
-                else None
-            )
-            is_fill = (
-                isinstance(row_direction, str)
-                and row_direction.strip().lower() in ("in", "out")
-            )
-            if not is_fill:
-                continue
-            fill_rows.append(row_number)
+            if wanted_rows is not None:
+                # The caller restricted the scan to rows the *cached* read
+                # called fills; a formula Richtung resolves there, and this
+                # formula-mode pass must not second-guess that.
+                if row_number not in wanted_rows:
+                    continue
+                fill_rows.append(row_number)
+                is_fill = True
+            else:
+                row_direction = (
+                    row[direction_column - 1].value
+                    if direction_column - 1 < len(row)
+                    else None
+                )
+                is_fill = (
+                    isinstance(row_direction, str)
+                    and row_direction.strip().lower() in ("in", "out")
+                )
+                if not is_fill:
+                    continue
+                fill_rows.append(row_number)
             for column, cell in enumerate(row, start=1):
                 if column not in fee_columns:
                     continue

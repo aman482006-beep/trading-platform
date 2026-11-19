@@ -1057,6 +1057,48 @@ class TestZeroFeesBecomeNone:
         ):
             MT5XLSXImporter().load(path)
 
+    def test_formula_richtung_with_uncached_fee_formula_is_refused(
+        self, tmp_path: Path
+    ):
+        """The formula-mode re-scan must not skip a formula-direction row.
+
+        pandas imports such a row as a fill (its cached direction), so a fee
+        formula without a cached result on it has to fail the import; re-deriving
+        "is a fill" from the raw direction cell would skip the row.
+        """
+        path = self._write_report(tmp_path, commission=0.0, swap=0.0)
+        workbook = openpyxl.load_workbook(path)
+        sheet = workbook.active
+        header_cells = next(
+            row
+            for row in sheet.iter_rows()
+            for cell in row
+            if cell.value == "Kommission"
+        )
+        richtung_cell = next(cell for cell in header_cells if cell.value == "Richtung")
+        kommission_cell = next(cell for cell in header_cells if cell.value == "Kommission")
+        entry_direction = sheet.cell(row=kommission_cell.row + 1, column=richtung_cell.column)
+        entry_fee = sheet.cell(row=kommission_cell.row + 1, column=kommission_cell.column)
+        entry_direction.value = '="in"'
+        entry_fee.value = "=1+1"
+        workbook.save(path)
+        _inject_cached_result(
+            path, entry_direction.coordinate, '"in"', ' t="str"><f>"in"</f><v>in</v>'
+        )
+
+        with pytest.raises(ValueError, match="formula without a cached result"):
+            MT5XLSXImporter().load(path)
+
+    def test_formula_caching_an_empty_string_is_refused(self, tmp_path: Path):
+        """A blank cached result is pandas' "no value" too, not a stored fee."""
+        path, coordinate = _write_report_with_formula_fee_cell(tmp_path, "=1+1")
+        _inject_cached_result(
+            path, coordinate, "1+1", ' t="str"><f>1+1</f><v></v>'
+        )
+
+        with pytest.raises(ValueError, match="formula without a cached result"):
+            MT5XLSXImporter().load(path)
+
     @pytest.mark.parametrize("fee_column", ["Kommission", "Swap"])
     def test_formula_without_a_cached_result_is_refused(
         self, tmp_path: Path, fee_column: str
