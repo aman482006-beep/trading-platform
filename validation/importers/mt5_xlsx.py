@@ -160,6 +160,7 @@ class _FeeCellScan(NamedTuple):
     formulas: list[_FeeCell]
     values: dict[tuple[int, int], tuple[Any, str]]
     fill_rows: list[int]
+    header_row: int = 0
 
 
 def _assert_fee_cells_are_readable(path: Path) -> None:
@@ -202,12 +203,18 @@ def _assert_fee_cells_are_readable(path: Path) -> None:
             "which pandas reads as no value: a reported cost may not silently "
             "become zero fees"
         )
-    raw = _scan_fee_cells(path, data_only=False, rows=set(cached.fill_rows))
+    raw = _scan_fee_cells(
+        path,
+        data_only=False,
+        rows=set(cached.fill_rows),
+        table_header_row=cached.header_row or None,
+    )
     for cell in raw.formulas:
         cached_value, _ = cached.values[cell.position]
-        if cached_value is None or cached_value == "":
-            # pandas reads both the missing and the blank cached result as
-            # "no value", so both book the fee as zero without this guard.
+        if cached_value is None:
+            # openpyxl resolves an empty cached value to None as well
+            # (``findtext(VALUE_TAG, None) or None``), so a blank result is
+            # refused here too; pandas reads it as no value either way.
             raise ValueError(
                 f"MT5 {cell.label} cell in row {cell.row} is a formula without a "
                 "cached result: the fee is unknown and cannot be read as zero"
@@ -219,6 +226,7 @@ def _scan_fee_cells(
     *,
     data_only: bool,
     rows: set[int] | None = None,
+    table_header_row: int | None = None,
 ) -> _FeeCellScan:
     """Stream the Trades table's fee columns of a workbook.
 
@@ -239,16 +247,26 @@ def _scan_fee_cells(
         rows = workbook.worksheets[0].iter_rows()
         header_row: Any = None
         header_row_number = 0
-        for row_number, row in enumerate(rows, start=1):
-            if any(
-                isinstance(cell.value, str) and cell.value.strip() == _TRADES_LABEL
-                for cell in row
-            ):
-                header_row = next(rows, None)
-                header_row_number = row_number + 1
-                break
+        if table_header_row:
+            # The caller found the table in the cached read; reusing its header
+            # row keeps this formula-mode pass from missing a label that is a
+            # formula (``="Trades"``) and therefore matches no literal text.
+            for row_number, row in enumerate(rows, start=1):
+                if row_number == table_header_row:
+                    header_row = row
+                    header_row_number = row_number
+                    break
+        else:
+            for row_number, row in enumerate(rows, start=1):
+                if any(
+                    isinstance(cell.value, str) and cell.value.strip() == _TRADES_LABEL
+                    for cell in row
+                ):
+                    header_row = next(rows, None)
+                    header_row_number = row_number + 1
+                    break
         if header_row is None:
-            return _FeeCellScan([], [], [], values, [])
+            return _FeeCellScan([], [], [], values, [], 0)
         # Positions, not Cell.column: read_only mode hands out EmptyCell objects
         # for gaps, which carry no column index.
         fee_columns = {
@@ -257,7 +275,7 @@ def _scan_fee_cells(
             if isinstance(cell.value, str) and cell.value.strip() in ("Kommission", "Swap")
         }
         if not fee_columns:
-            return _FeeCellScan([], [], [], values, [])
+            return _FeeCellScan([], [], [], values, [], header_row_number)
         # Only the rows the importer itself reads as fills: the report's
         # trailing totals row (a SUM formula in a fee column, no Richtung) is
         # never a fill, so its cells are the parser's business, not this
@@ -271,7 +289,7 @@ def _scan_fee_cells(
             None,
         )
         if direction_column is None:
-            return _FeeCellScan([], [], [], values, [])  # the layout check reports this
+            return _FeeCellScan([], [], [], values, [], header_row_number)
         for row_number, row in enumerate(rows, start=header_row_number + 1):
             if wanted_rows is not None:
                 # The caller restricted the scan to rows the *cached* read
@@ -314,7 +332,9 @@ def _scan_fee_cells(
                 values[(row_number, column)] = (cell.value, cell.data_type)
     finally:
         workbook.close()
-    return _FeeCellScan(error_cells, na_text_cells, formula_cells, values, fill_rows)
+    return _FeeCellScan(
+        error_cells, na_text_cells, formula_cells, values, fill_rows, header_row_number
+    )
 
 
 def _resolve_report_clock(

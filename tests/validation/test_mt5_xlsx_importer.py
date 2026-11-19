@@ -1089,6 +1089,35 @@ class TestZeroFeesBecomeNone:
         with pytest.raises(ValueError, match="formula without a cached result"):
             MT5XLSXImporter().load(path)
 
+    def test_formula_trades_label_still_finds_fee_formulas(self, tmp_path: Path):
+        """A formula ``Trades`` label must not hide an uncached fee formula.
+
+        The cached read resolves the label's cached value and finds the table;
+        the formula-mode re-scan then reuses that header row instead of
+        re-searching for a literal label, so the fill row's fee formula is
+        still seen.
+        """
+        path = self._write_report(tmp_path, commission=0.0, swap=0.0)
+        workbook = openpyxl.load_workbook(path)
+        sheet = workbook.active
+        label_cell = next(
+            cell for row in sheet.iter_rows() for cell in row if cell.value == "Trades"
+        )
+        label_cell.value = '="Trades"'
+        kommission_header = next(
+            cell for row in sheet.iter_rows() for cell in row if cell.value == "Kommission"
+        )
+        sheet.cell(
+            row=kommission_header.row + 1, column=kommission_header.column
+        ).value = "=1+1"
+        workbook.save(path)
+        _inject_cached_result(
+            path, label_cell.coordinate, '"Trades"', ' t="str"><f>"Trades"</f><v>Trades</v>'
+        )
+
+        with pytest.raises(ValueError, match="formula without a cached result"):
+            MT5XLSXImporter().load(path)
+
     def test_formula_caching_an_empty_string_is_refused(self, tmp_path: Path):
         """A blank cached result is pandas' "no value" too, not a stored fee."""
         path, coordinate = _write_report_with_formula_fee_cell(tmp_path, "=1+1")
