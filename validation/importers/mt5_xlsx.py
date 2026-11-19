@@ -276,10 +276,12 @@ def _scan_fee_cells(
         }
         if not fee_columns:
             return _FeeCellScan([], [], [], values, [], header_row_number)
-        # Only the rows the importer itself reads as fills: the report's
-        # trailing totals row (a SUM formula in a fee column, no Richtung) is
-        # never a fill, so its cells are the parser's business, not this
-        # guard's. group_position_fills selects exactly these rows.
+        # The rows the importer reads as fills: the report's trailing totals
+        # row (a SUM formula in a fee column, no Richtung) is never one, so its
+        # cells are the parser's business, not this guard's. The selection is
+        # Richtung-only and therefore a superset of group_position_fills (which
+        # also drops Typ=balance rows): over-scanning fails closed, a missed
+        # fill would not.
         direction_column = next(
             (
                 column
