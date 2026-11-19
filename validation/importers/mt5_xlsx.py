@@ -11,6 +11,7 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pandas as pd
+from openpyxl import load_workbook
 
 from shared.broker_clock import BrokerClock, resolve_broker_clock
 from shared.models import Trade, TradeExit
@@ -104,6 +105,57 @@ def _resolve_source_timezone(source_tz: str | tzinfo | None) -> tzinfo | None:
         raise ValueError(f"Unknown source timezone: {source_tz}") from exc
 
 
+def _assert_fee_cells_are_readable(path: Path) -> None:
+    """Refuse an Excel-error cell in a fee column of the Trades table.
+
+    ``pd.read_excel`` converts an error cell (``#DIV/0!``, openpyxl
+    ``data_type == "e"``) to NaN, so afterwards it can no longer be told from
+    MT5's "no fees" blank cell: booking that trade with ``fees=None`` would
+    report an unknown cost as zero and can flip its win/loss classification.
+    The raw workbook keeps the distinction, so the fee columns are checked
+    there before anything is parsed.
+
+    Self-contained on purpose: the sheet is re-scanned for the Trades header
+    instead of reusing the parsed row/column indices, which the table
+    extraction drops (all-NaN rows and columns) and a ``skiprows`` kwarg would
+    shift.
+    """
+    workbook = load_workbook(path, read_only=True)
+    try:
+        rows = workbook.worksheets[0].iter_rows()
+        header_row: Any = None
+        header_row_number = 0
+        for row_number, row in enumerate(rows, start=1):
+            if any(
+                isinstance(cell.value, str) and cell.value.strip() == _TRADES_LABEL
+                for cell in row
+            ):
+                header_row = next(rows, None)
+                header_row_number = row_number + 1
+                break
+        if header_row is None:
+            return  # no Trades table; the layout check reports that itself
+        # Positions, not Cell.column: read_only mode hands out EmptyCell objects
+        # for gaps, which carry no column index.
+        fee_columns = {
+            column: cell.value.strip()
+            for column, cell in enumerate(header_row, start=1)
+            if isinstance(cell.value, str) and cell.value.strip() in ("Kommission", "Swap")
+        }
+        if not fee_columns:
+            return
+        for row_number, row in enumerate(rows, start=header_row_number + 1):
+            for column, cell in enumerate(row, start=1):
+                if column in fee_columns and cell.data_type == "e":
+                    raise ValueError(
+                        f"MT5 {fee_columns[column]} cell is an Excel error "
+                        f"({cell.value!r}) in row {row_number}: the report is "
+                        "corrupt and the fee cannot be read"
+                    )
+    finally:
+        workbook.close()
+
+
 def _resolve_report_clock(
     broker_clock: str | BrokerClock | None,
 ) -> BrokerClock | None:
@@ -161,6 +213,9 @@ class MT5XLSXImporter(BaseImporter):
                 "timestamps are either a civil zone's wall time or a broker server clock"
             )
         df_raw = pd.read_excel(path, header=None, sheet_name=0, **kwargs)
+        # A fee cell pandas hands over as NaN may be an Excel error cell, which
+        # the fee parsing must never silently book as "no fees".
+        _assert_fee_cells_are_readable(path)
         rows = df_raw.values.tolist()
 
         # Locate section headers dynamically

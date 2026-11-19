@@ -34,9 +34,9 @@ def mt5_fee_cell(value: Any, column: str, parse: Callable[[Any], float | None]) 
     reads as ``0.0``. A cell that reaches the parser with a non-numeric text
     must fail the import: reading it as ``0.0`` would silently move the
     trade's ``net_pnl`` and its winner/loser classification. (An Excel error
-    cell such as ``#DIV/0!`` never gets that far: ``pd.read_excel`` converts
-    it to NaN, so it is indistinguishable from a blank cell and reads as
-    "no fees" like one.)
+    cell such as ``#DIV/0!`` also never gets that far: the XLSX importer
+    refuses it beforehand, because ``pd.read_excel`` turns it into a NaN that
+    this rule would otherwise read as "no fees".)
     """
     if value is None or (isinstance(value, float) and math.isnan(value)):
         return 0.0

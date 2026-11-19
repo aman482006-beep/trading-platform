@@ -833,14 +833,13 @@ class TestZeroFeesBecomeNone:
         with pytest.raises(ValueError, match="Kommission cell is not a number"):
             MT5XLSXImporter().load(path)
 
-    def test_excel_error_fee_cell_is_read_as_no_fees(self, tmp_path: Path):
-        """A real Excel error cell arrives as NaN and reads as "no fees".
+    def test_excel_error_fee_cell_is_refused(self, tmp_path: Path):
+        """A genuine Excel-error fee cell must fail the import, not read as 0.0.
 
-        Settled empirically: pandas' ``read_excel`` converts a ``t="e"`` cell
-        to NaN, so at the importer's boundary such a cell is indistinguishable
-        from a blank one (an openpyxl-level distinction the importer does not
-        make). Pinned so the documented limitation cannot silently change:
-        ``fees`` stays ``None`` and ``net_pnl`` equals the gross PnL.
+        pandas turns an error cell (``data_type="e"``) into NaN, so after the
+        read it is indistinguishable from MT5's "no fees" blank cell; the
+        importer checks the raw workbook and refuses instead of booking an
+        unknown cost as zero.
         """
         path = self._write_report(tmp_path, commission=0.0, swap=0.0)
         workbook = openpyxl.load_workbook(path)
@@ -852,8 +851,23 @@ class TestZeroFeesBecomeNone:
                     commission_cell = sheet.cell(row=cell.row + 1, column=cell.column)
         assert commission_cell is not None
         commission_cell.value = "#DIV/0!"
+        assert commission_cell.data_type == "e"
         workbook.save(path)
 
-        trade = MT5XLSXImporter().load(path).trades[0]
-        assert trade.fees is None
-        assert trade.net_pnl == pytest.approx(trade.pnl)
+        with pytest.raises(ValueError, match="Kommission cell is an Excel error"):
+            MT5XLSXImporter().load(path)
+
+    def test_swap_error_on_the_exit_row_names_the_row(self, tmp_path: Path):
+        """The refusal names the column and the Excel row, so the report is fixable."""
+        path = self._write_report(tmp_path, commission=0.0, swap=0.0)
+        workbook = openpyxl.load_workbook(path)
+        sheet = workbook.active
+        swap_header = next(
+            cell for row in sheet.iter_rows() for cell in row if cell.value == "Swap"
+        )
+        # The entry fill is the first row below the header; the exit row follows.
+        swap_header.offset(row=2).value = "#DIV/0!"
+        workbook.save(path)
+
+        with pytest.raises(ValueError, match=r"Swap cell is an Excel error .* in row \d+"):
+            MT5XLSXImporter().load(path)
