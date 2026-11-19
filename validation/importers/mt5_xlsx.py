@@ -7,7 +7,7 @@ import math
 import re
 from datetime import datetime, timezone, tzinfo
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pandas as pd
@@ -105,29 +105,83 @@ def _resolve_source_timezone(source_tz: str | tzinfo | None) -> tzinfo | None:
         raise ValueError(f"Unknown source timezone: {source_tz}") from exc
 
 
+class _FeeCell(NamedTuple):
+    """One fee cell of the Trades table that needs a second look."""
+
+    label: str
+    row: int
+    column: int
+    value: Any = None
+
+    @property
+    def position(self) -> tuple[int, int]:
+        return (self.row, self.column)
+
+
 def _assert_fee_cells_are_readable(path: Path) -> None:
-    """Refuse an Excel-error cell in a fee column of the Trades table.
+    """Refuse an unreadable fee cell in a fee column of the Trades table.
 
-    ``pd.read_excel`` converts an error cell (``#DIV/0!``, openpyxl
-    ``data_type == "e"``) to NaN, so afterwards it can no longer be told from
-    MT5's "no fees" blank cell: booking that trade with ``fees=None`` would
-    report an unknown cost as zero and can flip its win/loss classification.
-    The raw workbook keeps the distinction, so the fee columns are checked
-    there before anything is parsed.
+    ``pd.read_excel`` converts an error cell (``#DIV/0!``) to NaN, so afterwards
+    it can no longer be told from MT5's "no fees" blank cell: booking that
+    trade with ``fees=None`` would report an unknown cost as zero and can flip
+    its win/loss classification. The raw workbook keeps the distinction, so
+    the fee columns are checked there before anything is parsed.
 
-    The workbook is read with ``data_only=True`` because pandas reads cached
-    values: a formula whose cached result is an error is ``data_type == "f"``
-    in formula mode but ``"e"`` with the cache, which is what pandas sees.
-    (A formula without a cached value reads as ``None`` here and as NaN in
-    pandas -- openpyxl-written reports; only Excel-stored reports can be told
-    apart.)
+    Formula cells are refused unless the workbook stores a cached result: a
+    formula without one reads as ``None`` here and as NaN in pandas (the
+    openpyxl-written workbooks of this repo's own fixture generator are exactly
+    that shape), and a cached *error* is a corrupt report like a literal error
+    cell. A formula with a cached number is the value pandas reads and stays
+    importable.
 
     Self-contained on purpose: the sheet is re-scanned for the Trades header
     instead of reusing the parsed row/column indices, which the table
     extraction drops (all-NaN rows and columns) and a ``skiprows`` kwarg would
     shift.
     """
-    workbook = load_workbook(path, read_only=True, data_only=True)
+    error_cells, formula_cells, _ = _scan_fee_cells(path, data_only=False)
+    for cell in error_cells:
+        raise ValueError(
+            f"MT5 {cell.label} cell is an Excel error ({cell.value!r}) in row "
+            f"{cell.row}: the report is corrupt and the fee cannot be read"
+        )
+    if not formula_cells:
+        return
+    # Only a cached result tells a formula's value; the rare workbook that
+    # carries formulas in fee columns pays a second scan for that.
+    cached = _scan_fee_cells(
+        path, data_only=True, wanted={cell.position for cell in formula_cells}
+    )[2]
+    for cell in formula_cells:
+        cached_value, cached_type = cached[cell.position]
+        if cached_type == "e":
+            raise ValueError(
+                f"MT5 {cell.label} cell is an Excel error ({cached_value!r}) in "
+                f"row {cell.row}: the report is corrupt and the fee cannot be read"
+            )
+        if cached_value is None:
+            raise ValueError(
+                f"MT5 {cell.label} cell in row {cell.row} is a formula without a "
+                "cached result: the fee is unknown and cannot be read as zero"
+            )
+
+
+def _scan_fee_cells(
+    path: Path,
+    *,
+    data_only: bool,
+    wanted: set[tuple[int, int]] | None = None,
+) -> tuple[list[_FeeCell], list[_FeeCell], dict[tuple[int, int], Any]]:
+    """Stream the Trades table's fee columns of a workbook.
+
+    Returns the error cells and the formula cells found (as ``_FeeCell``), and
+    the ``(value, data_type)`` seen at the ``wanted`` ``(row, column)`` positions
+    (empty unless ``wanted`` is given).
+    """
+    error_cells: list[_FeeCell] = []
+    formula_cells: list[_FeeCell] = []
+    values: dict[tuple[int, int], tuple[Any, str]] = {}
+    workbook = load_workbook(path, read_only=True, data_only=data_only)
     try:
         rows = workbook.worksheets[0].iter_rows()
         header_row: Any = None
@@ -141,7 +195,7 @@ def _assert_fee_cells_are_readable(path: Path) -> None:
                 header_row_number = row_number + 1
                 break
         if header_row is None:
-            return  # no Trades table; the layout check reports that itself
+            return [], [], values  # no Trades table; the layout check reports that itself
         # Positions, not Cell.column: read_only mode hands out EmptyCell objects
         # for gaps, which carry no column index.
         fee_columns = {
@@ -150,17 +204,24 @@ def _assert_fee_cells_are_readable(path: Path) -> None:
             if isinstance(cell.value, str) and cell.value.strip() in ("Kommission", "Swap")
         }
         if not fee_columns:
-            return
+            return [], [], values
         for row_number, row in enumerate(rows, start=header_row_number + 1):
             for column, cell in enumerate(row, start=1):
-                if column in fee_columns and cell.data_type == "e":
-                    raise ValueError(
-                        f"MT5 {fee_columns[column]} cell is an Excel error "
-                        f"({cell.value!r}) in row {row_number}: the report is "
-                        "corrupt and the fee cannot be read"
+                if column not in fee_columns:
+                    continue
+                if cell.data_type == "e":
+                    error_cells.append(
+                        _FeeCell(fee_columns[column], row_number, column, cell.value)
                     )
+                elif cell.data_type == "f":
+                    formula_cells.append(
+                        _FeeCell(fee_columns[column], row_number, column, cell.value)
+                    )
+                if wanted is not None and (row_number, column) in wanted:
+                    values[(row_number, column)] = (cell.value, cell.data_type)
     finally:
         workbook.close()
+    return error_cells, formula_cells, values
 
 
 def _resolve_report_clock(

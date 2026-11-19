@@ -35,23 +35,45 @@ def _sp500_path() -> Path:
     return _REPORTS / "SP500_M1.xlsx"
 
 
-def _inject_cached_error(path: Path, coordinate: str) -> None:
-    """Give the formula at ``coordinate`` the cached error result Excel stores.
+def _write_report_with_formula_fee_cell(tmp_path: Path, formula: str) -> tuple[Path, str]:
+    """A report whose entry-fill commission cell holds ``formula``."""
+    path = TestZeroFeesBecomeNone._write_report(
+        TestZeroFeesBecomeNone(), tmp_path, commission=0.0, swap=0.0
+    )
+    workbook = openpyxl.load_workbook(path)
+    sheet = workbook.active
+    commission_cell = None
+    for row in sheet.iter_rows():
+        for cell in row:
+            if cell.value == "Kommission":
+                commission_cell = sheet.cell(row=cell.row + 1, column=cell.column)
+    assert commission_cell is not None
+    coordinate = commission_cell.coordinate
+    commission_cell.value = formula
+    workbook.save(path)
+    return path, coordinate
+
+
+def _inject_cached_result(
+    path: Path, coordinate: str, formula: str, cached_xml: str
+) -> None:
+    """Give the formula at ``coordinate`` the cached result Excel would store.
 
     A report written by openpyxl carries an empty cached value
-    (``<v></v>``), which pandas and this guard both read as blank; Excel stores
-    ``t="e"`` with the error text, so patch that in to model a real report.
+    (``<v></v>``), which pandas and the fee guard both read as blank; Excel
+    stores the computed result, so patch one in to model a real report.
+    ``cached_xml`` is the replacement for everything after ``<c r="...">``,
+    e.g. ``' t="e"><f>1/0</f><v>#DIV/0!</v>'``.
     """
     patched = path.with_suffix(".patched.xlsx")
+    blank = f'<c r="{coordinate}"><f>{formula}</f><v></v></c>'
     with zipfile.ZipFile(path) as source, zipfile.ZipFile(patched, "w") as target:
         for item in source.infolist():
             data = source.read(item.filename)
             if item.filename.startswith("xl/worksheets/sheet"):
                 xml = data.decode()
-                blank = f'<c r="{coordinate}"><f>1/0</f><v></v></c>'
-                errored = f'<c r="{coordinate}" t="e"><f>1/0</f><v>#DIV/0!</v></c>'
                 assert blank in xml, f"formula cell {coordinate} not found"
-                data = xml.replace(blank, errored).encode()
+                data = xml.replace(blank, f'<c r="{coordinate}"{cached_xml}</c>').encode()
             target.writestr(item, data)
     patched.replace(path)
 
@@ -908,19 +930,33 @@ class TestZeroFeesBecomeNone:
         in formula mode such a cell looks like a harmless ``data_type="f"``
         while pandas hands over NaN and the fee would read as "no fees".
         """
-        path = self._write_report(tmp_path, commission=0.0, swap=0.0)
-        workbook = openpyxl.load_workbook(path)
-        sheet = workbook.active
-        commission_cell = None
-        for row in sheet.iter_rows():
-            for cell in row:
-                if cell.value == "Kommission":
-                    commission_cell = sheet.cell(row=cell.row + 1, column=cell.column)
-        assert commission_cell is not None
-        coordinate = commission_cell.coordinate
-        commission_cell.value = "=1/0"
-        workbook.save(path)
-        _inject_cached_error(path, coordinate)
+        path, coordinate = _write_report_with_formula_fee_cell(tmp_path, "=1/0")
+        _inject_cached_result(
+            path, coordinate, "1/0", ' t="e"><f>1/0</f><v>#DIV/0!</v>'
+        )
 
         with pytest.raises(ValueError, match="Kommission cell is an Excel error"):
             MT5XLSXImporter().load(path)
+
+    def test_formula_without_a_cached_result_is_refused(self, tmp_path: Path):
+        """A formula with no cached value must fail, not read as "no fees".
+
+        This is the shape openpyxl itself writes (``<f>1/0</f><v></v>``), so
+        the repo's own fixture generator and test helper produce such reports.
+        pandas reads NaN for them; booking the fee as zero would report an
+        unknown cost as none.
+        """
+        path, _ = _write_report_with_formula_fee_cell(tmp_path, "=1/0")
+
+        with pytest.raises(ValueError, match="formula without a cached result"):
+            MT5XLSXImporter().load(path)
+
+    def test_formula_with_a_cached_number_is_importable(self, tmp_path: Path):
+        """The guard must not over-refuse: a cached result is the value."""
+        path, coordinate = _write_report_with_formula_fee_cell(tmp_path, "=1+1")
+        _inject_cached_result(path, coordinate, "1+1", "><f>1+1</f><v>2</v>")
+
+        trade = MT5XLSXImporter().load(path).trades[0]
+        assert trade.meta["commission"] == pytest.approx(2.0)
+        assert trade.fees == pytest.approx(-2.0)
+        assert trade.net_pnl == pytest.approx(102.0)
