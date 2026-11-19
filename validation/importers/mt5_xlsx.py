@@ -157,6 +157,7 @@ class _FeeCellScan(NamedTuple):
     na_texts: list[_FeeCell]
     formulas: list[_FeeCell]
     values: dict[tuple[int, int], tuple[Any, str]]
+    fill_rows: list[int]
 
 
 def _assert_fee_cells_are_readable(path: Path) -> None:
@@ -169,51 +170,39 @@ def _assert_fee_cells_are_readable(path: Path) -> None:
     the fee columns are checked there before anything is parsed.
 
     Formula cells are refused unless the workbook stores a cached result: a
-    formula without one reads as ``None`` here and as NaN in pandas (any
-    openpyxl-written report is that shape, including this repo's test helper
-    ``_write_report_with_formula_fee_cell``), and a cached *error* is a corrupt
-    report like a literal error cell. A formula with a cached number is the
-    value pandas reads and stays importable.
+    formula without one reads as ``None`` in the cached read and as NaN in
+    pandas (any openpyxl-written report is that shape, including this repo's
+    test helper ``_write_report_with_formula_fee_cell``), and a cached *error*
+    or a cached *NA text* is a corrupt or unreadable value like a literal one.
+    A formula with a cached number is the value pandas reads and stays
+    importable.
+
+    The cached read also decides which rows are fills, because a formula
+    ``Richtung`` cell resolves to its cached value there: pandas imports such
+    a row as a fill, so the guard must not skip it. Only the rows the cached
+    read calls fills are then re-scanned in formula mode for the uncached
+    formulas that read cannot see.
 
     Self-contained on purpose: the sheet is re-scanned for the Trades header
     instead of reusing the parsed row/column indices, which the table
-    extraction drops (all-NaN rows and columns) and a ``skiprows`` kwarg would
-    shift.
+    extraction drops (all-NaN rows and unnamed-header columns) and a
+    ``skiprows`` kwarg would shift.
     """
-    scan = _scan_fee_cells(path, data_only=False)
-    for cell in scan.errors:
+    cached = _scan_fee_cells(path, data_only=True)
+    for cell in cached.errors:
         raise ValueError(
             f"MT5 {cell.label} cell is an Excel error ({cell.value!r}) in row "
             f"{cell.row}: the report is corrupt and the fee cannot be read"
         )
-    for cell in scan.na_texts:
+    for cell in cached.na_texts:
         raise ValueError(
             f"MT5 {cell.label} cell in row {cell.row} holds {cell.value!r}, "
             "which pandas reads as no value: a reported cost may not silently "
             "become zero fees"
         )
-    if not scan.formulas:
-        return
-    # Only a cached result tells a formula's value; the rare workbook that
-    # carries formulas in fee columns pays a second scan for that.
-    cached = _scan_fee_cells(
-        path, data_only=True, wanted={cell.position for cell in scan.formulas}
-    ).values
-    for cell in scan.formulas:
-        cached_value, cached_type = cached[cell.position]
-        if cached_type == "e":
-            raise ValueError(
-                f"MT5 {cell.label} cell is an Excel error ({cached_value!r}) in "
-                f"row {cell.row}: the report is corrupt and the fee cannot be read"
-            )
-        if cached_type == "s" and cached_value in _PANDAS_NO_VALUE_TEXTS:
-            # pandas applies its NA conversion to the cached text, so this
-            # formula reads as "no fees" although the report states a value.
-            raise ValueError(
-                f"MT5 {cell.label} cell in row {cell.row} has the cached result "
-                f"{cached_value!r}, which pandas reads as no value: a reported "
-                "cost may not silently become zero fees"
-            )
+    raw = _scan_fee_cells(path, data_only=False, rows=set(cached.fill_rows))
+    for cell in raw.formulas:
+        cached_value, _ = cached.values[cell.position]
         if cached_value is None:
             raise ValueError(
                 f"MT5 {cell.label} cell in row {cell.row} is a formula without a "
@@ -225,18 +214,22 @@ def _scan_fee_cells(
     path: Path,
     *,
     data_only: bool,
-    wanted: set[tuple[int, int]] | None = None,
+    rows: set[int] | None = None,
 ) -> _FeeCellScan:
     """Stream the Trades table's fee columns of a workbook.
 
     Returns the error cells, the pandas-NA text cells and the formula cells
-    found (as ``_FeeCell``), plus the ``(value, data_type)`` seen at the
-    ``wanted`` ``(row, column)`` positions (empty unless ``wanted`` is given).
+    found (as ``_FeeCell``) plus the fill rows, and the ``(value, data_type)``
+    seen at every fee cell of those rows. ``rows`` restricts the data scan
+    (the second, formula-mode pass looks only at rows the cached read called
+    fills).
     """
     error_cells: list[_FeeCell] = []
     na_text_cells: list[_FeeCell] = []
     formula_cells: list[_FeeCell] = []
     values: dict[tuple[int, int], tuple[Any, str]] = {}
+    fill_rows: list[int] = []
+    wanted_rows = rows
     workbook = load_workbook(path, read_only=True, data_only=data_only)
     try:
         rows = workbook.worksheets[0].iter_rows()
@@ -251,7 +244,7 @@ def _scan_fee_cells(
                 header_row_number = row_number + 1
                 break
         if header_row is None:
-            return _FeeCellScan([], [], [], values)
+            return _FeeCellScan([], [], [], values, [])
         # Positions, not Cell.column: read_only mode hands out EmptyCell objects
         # for gaps, which carry no column index.
         fee_columns = {
@@ -260,7 +253,7 @@ def _scan_fee_cells(
             if isinstance(cell.value, str) and cell.value.strip() in ("Kommission", "Swap")
         }
         if not fee_columns:
-            return _FeeCellScan([], [], [], values)
+            return _FeeCellScan([], [], [], values, [])
         # Only the rows the importer itself reads as fills: the report's
         # trailing totals row (a SUM formula in a fee column, no Richtung) is
         # never a fill, so its cells are the parser's business, not this
@@ -274,18 +267,22 @@ def _scan_fee_cells(
             None,
         )
         if direction_column is None:
-            return _FeeCellScan([], [], [], values)  # the layout check reports this itself
+            return _FeeCellScan([], [], [], values, [])  # the layout check reports this
         for row_number, row in enumerate(rows, start=header_row_number + 1):
+            if wanted_rows is not None and row_number not in wanted_rows:
+                continue
             row_direction = (
                 row[direction_column - 1].value
                 if direction_column - 1 < len(row)
                 else None
             )
-            if (
-                not isinstance(row_direction, str)
-                or row_direction.strip().lower() not in ("in", "out")
-            ):
+            is_fill = (
+                isinstance(row_direction, str)
+                and row_direction.strip().lower() in ("in", "out")
+            )
+            if not is_fill:
                 continue
+            fill_rows.append(row_number)
             for column, cell in enumerate(row, start=1):
                 if column not in fee_columns:
                     continue
@@ -297,20 +294,16 @@ def _scan_fee_cells(
                     formula_cells.append(
                         _FeeCell(fee_columns[column], row_number, column, cell.value)
                     )
-                elif (
-                    cell.data_type == "s"
-                    and cell.value in _PANDAS_NO_VALUE_TEXTS
-                ):
+                elif cell.data_type == "s" and cell.value in _PANDAS_NO_VALUE_TEXTS:
                     # pandas reads these texts as "no value" (no stripping, no
                     # case folding), so the fee would silently become zero.
                     na_text_cells.append(
                         _FeeCell(fee_columns[column], row_number, column, cell.value)
                     )
-                if wanted is not None and (row_number, column) in wanted:
-                    values[(row_number, column)] = (cell.value, cell.data_type)
+                values[(row_number, column)] = (cell.value, cell.data_type)
     finally:
         workbook.close()
-    return _FeeCellScan(error_cells, na_text_cells, formula_cells, values)
+    return _FeeCellScan(error_cells, na_text_cells, formula_cells, values, fill_rows)
 
 
 def _resolve_report_clock(

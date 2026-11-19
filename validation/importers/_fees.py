@@ -1,11 +1,12 @@
 """Shared fee conventions for the MT5 report importers.
 
-Two rules live here, both owned by exactly one function so the XLSX and the
+Three rules live here, each owned by exactly one function so the XLSX and the
 HTML importer cannot drift apart on them:
 
 * :func:`mt5_fee_cell` reads one report cell (``Kommission``/``Swap``).
 * :func:`mt5_signed_costs_to_fee` converts MT5's signs into the Trade
   contract's sign.
+* :func:`mt5_fee_or_none` maps MT5's exact-zero fee to ``None``.
 
 MT5 signs commission and swap from the account's point of view: a cost is
 negative, a swap credit is positive. The :class:`~shared.models.Trade`

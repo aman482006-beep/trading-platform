@@ -45,12 +45,10 @@ def _write_report_with_formula_fee_cell(
     )
     workbook = openpyxl.load_workbook(path)
     sheet = workbook.active
-    fee_cell = None
-    for row in sheet.iter_rows():
-        for cell in row:
-            if cell.value == column:
-                fee_cell = sheet.cell(row=cell.row + 1, column=cell.column)
-    assert fee_cell is not None
+    header_cell = next(
+        cell for row in sheet.iter_rows() for cell in row if cell.value == column
+    )
+    fee_cell = sheet.cell(row=header_cell.row + 1, column=header_cell.column)
     coordinate = fee_cell.coordinate
     fee_cell.value = formula
     workbook.save(path)
@@ -798,9 +796,10 @@ class TestTradeColumnRequired:
 class TestZeroFeesBecomeNone:
     """MT5 reports "no fees" as ``0.0``; the importer stores that as ``None``.
 
-    A mutant flipping ``abs(fees) > 0.0`` to ``>= 0.0`` would store ``0.0`` and
-    still pass every other test, because the fee columns are only exercised with
-    non-zero values. Pin the exact-zero mapping and the net-pnl arithmetic.
+    A mutant that keeps a zero fee as ``0.0`` (or drops a sub-cent one to
+    ``None``) would still pass most other tests, because the fee columns are
+    only exercised with non-zero values. Pin the exact-zero mapping and the
+    net-pnl arithmetic.
     """
 
     def _write_report(
@@ -1004,6 +1003,36 @@ class TestZeroFeesBecomeNone:
         assert commission_cell is not None
         commission_cell.value = "#DIV/0!"
         workbook.save(path)
+
+        with pytest.raises(ValueError, match="Kommission cell is an Excel error"):
+            MT5XLSXImporter().load(path)
+
+    def test_formula_richtung_row_is_scanned(self, tmp_path: Path):
+        """A fill whose Richtung is a formula is scanned, not skipped.
+
+        pandas reads the cached value and imports such a row as a fill, so the
+        guard must resolve the direction the same way: an error fee cell on it
+        has to fail the import instead of being booked as zero fees.
+        """
+        path = self._write_report(tmp_path, commission=0.0, swap=0.0)
+        workbook = openpyxl.load_workbook(path)
+        sheet = workbook.active
+        header_cells = next(
+            row
+            for row in sheet.iter_rows()
+            for cell in row
+            if cell.value == "Kommission"
+        )
+        richtung_cell = next(cell for cell in header_cells if cell.value == "Richtung")
+        kommission_cell = next(cell for cell in header_cells if cell.value == "Kommission")
+        entry_direction = sheet.cell(row=kommission_cell.row + 1, column=richtung_cell.column)
+        entry_fee = sheet.cell(row=kommission_cell.row + 1, column=kommission_cell.column)
+        entry_direction.value = '="in"'
+        entry_fee.value = "#DIV/0!"
+        workbook.save(path)
+        _inject_cached_result(
+            path, entry_direction.coordinate, '"in"', ' t="str"><f>"in"</f><v>in</v>'
+        )
 
         with pytest.raises(ValueError, match="Kommission cell is an Excel error"):
             MT5XLSXImporter().load(path)
