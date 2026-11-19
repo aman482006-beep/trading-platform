@@ -42,7 +42,7 @@
 2. XLSX-Reports enthalten mindestens Orders- und Trades/Deals-Tabellen mit den benötigten Spalten.
 3. Interne `BacktestResult`-Objekte können aus dem Vergleichs-Runner oder einer Datei geladen werden.
 4. Zeitzonen werden soweit möglich normalisiert (ISO 8601 UTC); bei fehlender Zeitzoneninfo wird Broker-Serverzeit angenommen.
-5. Commission/Swap sind in MT5-Reports optional oder 0 (Demo); die rohen MT5-Werte (mit Vorzeichen) liegen pro Trade in `Trade.meta.commission` / `Trade.meta.swap`, die normalisierte positive Kosten in `Trade.fees`; `raw_metadata` trägt die report-level Metadaten (Kopf-Block, `position_fills`-Evidence). Eine Zelle, deren Wert nicht lesbar ist (Excel-Fehler, `n/a`, Formel ohne zwischengespeichertes Ergebnis), bricht den Import ab: ein unbekannter Kostenwert darf nicht als 0 gebucht werden (siehe `validation/importers/_fees.py` und `_assert_fee_cells_are_readable` in `validation/importers/mt5_xlsx.py`). Fehlen die Spalten in der Trades-Tabelle ganz, gilt "keine Gebühren berichtet" (`fees=None`, `net_pnl == pnl`): eine berichtete Abwesenheit, kein unbekannter Wert. Ein umbenannter Spaltenkopf ist davon nicht unterscheidbar — dafür gibt es keine Fixture, offene Maintainer-Frage.
+5. Commission/Swap sind in MT5-Reports optional oder 0 (Demo); sie werden in `raw_metadata` abgelegt, blockieren den Import aber nicht.
 
 ---
 

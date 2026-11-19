@@ -539,9 +539,7 @@ class Trade:
     risk_percent: float | None = None
     exit_reason: str | None = None
     pnl_pct: float | None = None
-    # Total fees over entry and all exits. A positive cost:
-    # net_pnl == pnl - fees, so a rebate (a net swap credit) is negative.
-    fees: float | None = None
+    fees: float | None = None  # total fees (entry + all exits)
     net_pnl: float | None = None
     r_multiple: float | None = None
     mae: float | None = None  # Max Adverse Excursion

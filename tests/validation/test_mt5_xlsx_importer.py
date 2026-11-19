@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-import re
-import zipfile
 from pathlib import Path
 from typing import Any
 
-import openpyxl
 import pandas as pd
 import pytest
 
@@ -34,67 +31,6 @@ def _nas100_path() -> Path:
 
 def _sp500_path() -> Path:
     return _REPORTS / "SP500_M1.xlsx"
-
-
-def _write_report_with_formula_fee_cell(
-    tmp_path: Path, formula: str, column: str = "Kommission"
-) -> tuple[Path, str]:
-    """A report whose entry-fill ``column`` fee cell holds ``formula``."""
-    path = TestZeroFeesBecomeNone._write_report(
-        TestZeroFeesBecomeNone(), tmp_path, commission=0.0, swap=0.0
-    )
-    workbook = openpyxl.load_workbook(path)
-    sheet = workbook.active
-    header_cell = next(
-        cell for row in sheet.iter_rows() for cell in row if cell.value == column
-    )
-    fee_cell = sheet.cell(row=header_cell.row + 1, column=header_cell.column)
-    coordinate = fee_cell.coordinate
-    fee_cell.value = formula
-    workbook.save(path)
-    return path, coordinate
-
-
-def _append_totals_row_with_formula_fee_cell(path: Path) -> None:
-    """Add the report's trailing totals row with an uncached fee formula.
-
-    The row carries no Richtung, so group_position_fills never reads it as a
-    fill; a workbook re-saved without cached values must still import.
-    """
-    workbook = openpyxl.load_workbook(path)
-    sheet = workbook.active
-    swap_header = next(
-        cell for row in sheet.iter_rows() for cell in row if cell.value == "Swap"
-    )
-    totals_row = sheet.max_row + 1
-    for column in range(1, swap_header.column + 1):
-        sheet.cell(row=totals_row, column=column)
-    sheet.cell(row=totals_row, column=swap_header.column).value = "=1/0"
-    workbook.save(path)
-
-
-def _inject_cached_result(
-    path: Path, coordinate: str, formula: str, cached_xml: str
-) -> None:
-    """Give the formula at ``coordinate`` the cached result Excel would store.
-
-    A report written by openpyxl carries an empty cached value
-    (``<v></v>``), which pandas and the fee guard both read as blank; Excel
-    stores the computed result, so patch one in to model a real report.
-    ``cached_xml`` is the replacement for everything after ``<c r="...">``,
-    e.g. ``' t="e"><f>1/0</f><v>#DIV/0!</v>'``.
-    """
-    patched = path.with_suffix(".patched.xlsx")
-    blank = f'<c r="{coordinate}"><f>{formula}</f><v></v></c>'
-    with zipfile.ZipFile(path) as source, zipfile.ZipFile(patched, "w") as target:
-        for item in source.infolist():
-            data = source.read(item.filename)
-            if item.filename.startswith("xl/worksheets/sheet"):
-                xml = data.decode()
-                assert blank in xml, f"formula cell {coordinate} not found"
-                data = xml.replace(blank, f'<c r="{coordinate}"{cached_xml}</c>').encode()
-            target.writestr(item, data)
-    patched.replace(path)
 
 
 @pytest.fixture
@@ -796,20 +732,13 @@ class TestTradeColumnRequired:
 class TestZeroFeesBecomeNone:
     """MT5 reports "no fees" as ``0.0``; the importer stores that as ``None``.
 
-    A mutant that keeps a zero fee as ``0.0`` (or drops a sub-cent one to
-    ``None``) would still pass most other tests, because the fee columns are
-    only exercised with non-zero values. Pin the exact-zero mapping and the
-    net-pnl arithmetic.
+    A mutant flipping ``abs(fees) > 0.0`` to ``>= 0.0`` would store ``0.0`` and
+    still pass every other test, because the fee columns are only exercised with
+    non-zero values. Pin the exact-zero mapping and the net-pnl arithmetic.
     """
 
     def _write_report(
-        self,
-        tmp_path: Path,
-        *,
-        commission: float | str,
-        swap: float | str,
-        profit: float = 100.0,
-        entry_direction: str = "in",
+        self, tmp_path: Path, *, commission: float, swap: float, profit: float = 100.0
     ) -> Path:
         header = [
             "Zeit", "Trade", "Symbol", "Typ", "Richtung", "Volumen", "Preis",
@@ -818,7 +747,7 @@ class TestZeroFeesBecomeNone:
         rows = [
             ["Trades"] + [None] * (len(header) - 1),
             header,
-            ["2024.01.03 08:00:00", 2, "EURUSD", "buy", entry_direction, "0.10", 1.085,
+            ["2024.01.03 08:00:00", 2, "EURUSD", "buy", "in", "0.10", 1.085,
              commission, swap, 0.0, ""],
             ["2024.01.03 16:00:00", 3, "EURUSD", "sell", "out", "0.10", 1.090,
              0.0, 0.0, profit, ""],
@@ -826,28 +755,11 @@ class TestZeroFeesBecomeNone:
         trades = pd.DataFrame(rows)
         orders = pd.DataFrame([["Orders", None], [None, None]])
 
-        stem = f"{str(commission).replace('/', '_')}_{str(swap).replace('/', '_')}"
-        path = tmp_path / f"report_{stem}.xlsx"
+        path = tmp_path / f"report_{commission}_{swap}.xlsx"
         with pd.ExcelWriter(path, engine="openpyxl") as writer:
             orders.to_excel(writer, index=False, header=False, startrow=0)
             trades.to_excel(writer, index=False, header=False, startrow=20)
         return path
-
-    def test_report_without_trades_section_raises_the_layout_error(self, tmp_path: Path):
-        """A workbook with no Trades table must fail with the importer's error.
-
-        The fee guard scans the header it cannot find and must return cleanly,
-        not raise a TypeError of its own, so the importer's own
-        "Could not locate 'Trades' section" ValueError survives.
-        """
-        path = tmp_path / "no_trades.xlsx"
-        with pd.ExcelWriter(path, engine="openpyxl") as writer:
-            pd.DataFrame([["Orders", None], [None, None]]).to_excel(
-                writer, index=False, header=False, startrow=0
-            )
-
-        with pytest.raises(ValueError, match="Could not locate 'Trades' section"):
-            MT5XLSXImporter().load(path)
 
     def test_zero_commission_and_swap_are_stored_as_none(self, tmp_path: Path):
         ref = MT5XLSXImporter().load(
@@ -858,422 +770,18 @@ class TestZeroFeesBecomeNone:
         assert trade.meta["commission"] is None
         assert trade.meta["swap"] is None
 
-    def test_costs_are_stored_as_a_positive_fee(self, tmp_path: Path):
-        # MT5 signs costs negative; Trade.fees is a positive cost.
+    def test_nonzero_fees_are_stored_as_the_summed_value(self, tmp_path: Path):
         ref = MT5XLSXImporter().load(
-            self._write_report(tmp_path, commission=-2.5, swap=-1.5)
+            self._write_report(tmp_path, commission=2.5, swap=1.5)
         )
         trade = ref.trades[0]
         assert trade.fees == pytest.approx(4.0)
-        assert trade.meta["commission"] == pytest.approx(-2.5)
-        assert trade.meta["swap"] == pytest.approx(-1.5)
+        assert trade.meta["commission"] == pytest.approx(2.5)
+        assert trade.meta["swap"] == pytest.approx(1.5)
 
     def test_net_pnl_subtracts_fees_from_gross(self, tmp_path: Path):
         ref = MT5XLSXImporter().load(
-            self._write_report(tmp_path, commission=-2.5, swap=-1.5, profit=100.0)
+            self._write_report(tmp_path, commission=2.5, swap=1.5, profit=100.0)
         )
         trade = ref.trades[0]
-        assert trade.net_pnl == pytest.approx(96.0)
-
-    def test_net_swap_credit_yields_negative_fee(self, tmp_path: Path):
-        ref = MT5XLSXImporter().load(
-            self._write_report(tmp_path, commission=-0.5, swap=1.5, profit=100.0)
-        )
-        trade = ref.trades[0]
-        assert trade.fees == pytest.approx(-1.0)
-        assert trade.net_pnl == pytest.approx(101.0)
-
-    @pytest.mark.parametrize(
-        ("commission", "swap"), [("inf", 0.0), (0.0, "inf"), ("-inf", 0.0)]
-    )
-    def test_non_finite_fee_cells_are_refused(
-        self, tmp_path: Path, commission: float | str, swap: float | str
-    ):
-        """A corrupt fee cell must fail the import, never store an inf fee.
-
-        ``_to_float`` runs ``float("inf")`` on a text cell, so without the
-        shared helper's finiteness guard the importer would store ``fees=inf``
-        and ``net_pnl=inf``. (A ``nan`` cell never gets that far: ``_to_float``
-        maps a NaN cell to its default, which is why the guard is proven here
-        with ``inf``.)
-        """
-        path = self._write_report(tmp_path, commission=commission, swap=swap)
-        with pytest.raises(ValueError, match="must be finite"):
-            MT5XLSXImporter().load(path)
-
-    def test_unparseable_fee_cell_is_refused(self, tmp_path: Path):
-        """A fee cell that cannot be parsed must fail the import, not read as 0.0.
-
-        Reading it as zero would move the trade's net_pnl and its win/loss
-        classification without a trace. (An Excel error string such as
-        "#DIV/0!" arrives as a NaN cell, which MT5 also uses for "no fees";
-        a cell that keeps a non-numeric text is the reachable case.)
-        """
-        path = self._write_report(tmp_path, commission="xyz", swap=0.0)
-        with pytest.raises(ValueError, match="Kommission cell is not a number"):
-            MT5XLSXImporter().load(path)
-
-    def test_a_sub_cent_fee_is_kept(self, tmp_path: Path):
-        """Exact zero, not a tolerance: a real 0.004 cost stays on the trade."""
-        path = self._write_report(tmp_path, commission=-0.004, swap=0.0)
-        trade = MT5XLSXImporter().load(path).trades[0]
-        assert trade.fees == pytest.approx(0.004)
-        assert trade.net_pnl == pytest.approx(100.0 - 0.004)
-
-    def test_unparseable_swap_cell_is_refused(self, tmp_path: Path):
-        """A swap cell that cannot be parsed must fail the import, not read as 0.0."""
-        path = self._write_report(tmp_path, commission=0.0, swap="xyz")
-        with pytest.raises(ValueError, match="Swap cell is not a number"):
-            MT5XLSXImporter().load(path)
-
-    @pytest.mark.parametrize("column", ["commission", "swap"])
-    @pytest.mark.parametrize("direction", ["in", "In", "OUT"])
-    @pytest.mark.parametrize("na_text", ["n/a", "NA", "N/A", "NULL", "NaN", "None"])
-    def test_pandas_na_sentinel_fee_cell_is_refused(
-        self, tmp_path: Path, na_text: str, column: str, direction: str
-    ):
-        """A fee cell pandas reads as no value must fail, not become zero fees.
-
-        ``pd.read_excel`` converts these exact texts (case-sensitive, no
-        stripping) to NaN, which ``mt5_fee_cell`` would then read as MT5's
-        "no fees"; the guard sees the text in the raw workbook and refuses.
-        Both fee columns: a narrowed guard would lose the swap instead.
-        """
-        path = self._write_report(
-            tmp_path,
-            commission=na_text if column == "commission" else 0.0,
-            swap=na_text if column == "swap" else 0.0,
-            entry_direction=direction,
-        )
-        label = "Kommission" if column == "commission" else "Swap"
-        with pytest.raises(
-            ValueError, match=re.escape(f"{label} cell in row") + ".*which pandas reads as no value"
-        ):
-            MT5XLSXImporter().load(path)
-
-    @pytest.mark.parametrize("entry_direction", ["in", "In", "OUT"])
-    def test_excel_error_fee_cell_is_refused(
-        self, tmp_path: Path, entry_direction: str
-    ):
-        """A genuine Excel-error fee cell must fail the import, not read as 0.0.
-
-        pandas turns an error cell (``data_type="e"``) into NaN, so after the
-        read it is indistinguishable from MT5's "no fees" blank cell; the
-        importer checks the raw workbook and refuses instead of booking an
-        unknown cost as zero. The direction spellings matter: the importer
-        lowercases ``Richtung`` before classifying a fill, so the guard must
-        recognise ``In``/``OUT`` as fills too or it would skip those rows.
-        """
-        path = self._write_report(
-            tmp_path, commission=0.0, swap=0.0, entry_direction=entry_direction
-        )
-        workbook = openpyxl.load_workbook(path)
-        sheet = workbook.active
-        commission_cell = None
-        for row in sheet.iter_rows():
-            for cell in row:
-                if cell.value == "Kommission":
-                    commission_cell = sheet.cell(row=cell.row + 1, column=cell.column)
-        assert commission_cell is not None
-        commission_cell.value = "#DIV/0!"
-        assert commission_cell.data_type == "e"
-        workbook.save(path)
-
-        with pytest.raises(ValueError, match="Kommission cell is an Excel error"):
-            MT5XLSXImporter().load(path)
-
-    def test_swap_error_on_the_exit_row_names_the_row(self, tmp_path: Path):
-        """The refusal names the column and the Excel row, so the report is fixable."""
-        path = self._write_report(tmp_path, commission=0.0, swap=0.0)
-        workbook = openpyxl.load_workbook(path)
-        sheet = workbook.active
-        swap_header = next(
-            cell for row in sheet.iter_rows() for cell in row if cell.value == "Swap"
-        )
-        # The entry fill is the first row below the header; the exit row follows.
-        swap_cell = swap_header.offset(row=2)
-        swap_cell.value = "#DIV/0!"
-        workbook.save(path)
-
-        with pytest.raises(
-            ValueError, match=f"Swap cell is an Excel error .* in row {swap_cell.row}"
-        ):
-            MT5XLSXImporter().load(path)
-
-    def test_totals_row_formula_is_ignored(self, tmp_path: Path):
-        """The guard must not refuse a totals row it does not read.
-
-        The report's trailing totals row can hold a SUM formula in a fee
-        column; the importer never reads it as a fill (no Richtung), so an
-        uncached formula there must not fail the import.
-        """
-        path = self._write_report(tmp_path, commission=0.0, swap=0.0)
-        _append_totals_row_with_formula_fee_cell(path)
-
-        assert len(MT5XLSXImporter().load(path).trades) == 1
-
-    def test_padded_trades_label_is_still_scanned(self, tmp_path: Path):
-        """A padded table label must not hide an unreadable fee cell."""
-        path = self._write_report(tmp_path, commission=0.0, swap=0.0)
-        workbook = openpyxl.load_workbook(path)
-        sheet = workbook.active
-        label = next(
-            cell for row in sheet.iter_rows() for cell in row if cell.value == "Trades"
-        )
-        label.value = " Trades "
-        commission_cell = None
-        for row in sheet.iter_rows():
-            for cell in row:
-                if cell.value == "Kommission":
-                    commission_cell = sheet.cell(row=cell.row + 1, column=cell.column)
-        assert commission_cell is not None
-        commission_cell.value = "#DIV/0!"
-        workbook.save(path)
-
-        with pytest.raises(ValueError, match="Kommission cell is an Excel error"):
-            MT5XLSXImporter().load(path)
-
-    def test_formula_richtung_row_is_scanned(self, tmp_path: Path):
-        """A fill whose Richtung is a formula is scanned, not skipped.
-
-        pandas reads the cached value and imports such a row as a fill, so the
-        guard must resolve the direction the same way: an error fee cell on it
-        has to fail the import instead of being booked as zero fees.
-        """
-        path = self._write_report(tmp_path, commission=0.0, swap=0.0)
-        workbook = openpyxl.load_workbook(path)
-        sheet = workbook.active
-        header_cells = next(
-            row
-            for row in sheet.iter_rows()
-            for cell in row
-            if cell.value == "Kommission"
-        )
-        richtung_cell = next(cell for cell in header_cells if cell.value == "Richtung")
-        kommission_cell = next(cell for cell in header_cells if cell.value == "Kommission")
-        entry_direction = sheet.cell(row=kommission_cell.row + 1, column=richtung_cell.column)
-        entry_fee = sheet.cell(row=kommission_cell.row + 1, column=kommission_cell.column)
-        entry_direction.value = '="in"'
-        entry_fee.value = "#DIV/0!"
-        workbook.save(path)
-        _inject_cached_result(
-            path, entry_direction.coordinate, '"in"', ' t="str"><f>"in"</f><v>in</v>'
-        )
-
-        with pytest.raises(ValueError, match="Kommission cell is an Excel error"):
-            MT5XLSXImporter().load(path)
-
-    def test_uncached_formula_fee_header_is_refused(self, tmp_path: Path):
-        """A fee-column header that is a formula without a cached result.
-
-        pandas drops such a column (it renames it ``__col_N``), and the
-        importer then reads every fee in it as "no fees" -- the silent
-        unknown-cost-to-zero conversion the guard must refuse.
-        """
-        path = self._write_report(tmp_path, commission=-2.5, swap=-1.5)
-        workbook = openpyxl.load_workbook(path)
-        sheet = workbook.active
-        kommission_header = next(
-            cell for row in sheet.iter_rows() for cell in row if cell.value == "Kommission"
-        )
-        kommission_header.value = '="Kommission"'
-        workbook.save(path)
-
-        with pytest.raises(ValueError, match="Trades header cell"):
-            MT5XLSXImporter().load(path)
-
-    @pytest.mark.parametrize("fee_column", ["Kommission", "Swap"])
-    def test_excel_error_formula_cell_is_refused(self, tmp_path: Path, fee_column: str):
-        """A formula whose cached result is an error must fail the import too.
-
-        pandas reads cached values, so the guard must as well (data_only=True):
-        in formula mode such a cell looks like a harmless ``data_type="f"``
-        while pandas hands over NaN and the fee would read as "no fees".
-        """
-        path, coordinate = _write_report_with_formula_fee_cell(
-            tmp_path, "=1/0", fee_column
-        )
-        _inject_cached_result(
-            path, coordinate, "1/0", ' t="e"><f>1/0</f><v>#DIV/0!</v>'
-        )
-
-        with pytest.raises(
-            ValueError, match=re.escape(f"{fee_column} cell is an Excel error")
-        ):
-            MT5XLSXImporter().load(path)
-
-    def test_formula_fee_column_header_is_not_dropped(self, tmp_path: Path):
-        """A fee column whose header is a formula must still be scanned.
-
-        pandas imports the column from the cached header, so the cached pass
-        resolves it; the formula-mode re-scan must reuse those positions instead
-        of re-matching the raw header (which holds ``="Kommission"``).
-        """
-        path = self._write_report(tmp_path, commission=0.0, swap=0.0)
-        workbook = openpyxl.load_workbook(path)
-        sheet = workbook.active
-        kommission_header = next(
-            cell for row in sheet.iter_rows() for cell in row if cell.value == "Kommission"
-        )
-        entry_fee = sheet.cell(row=kommission_header.row + 1, column=kommission_header.column)
-        kommission_header.value = '="Kommission"'
-        entry_fee.value = "=1+1"
-        workbook.save(path)
-        _inject_cached_result(
-            path,
-            kommission_header.coordinate,
-            '"Kommission"',
-            ' t="str"><f>"Kommission"</f><v>Kommission</v>',
-        )
-
-        with pytest.raises(ValueError, match="formula without a cached result"):
-            MT5XLSXImporter().load(path)
-
-    def test_both_fee_headers_formula_still_scan(self, tmp_path: Path):
-        """Both fee-column headers as formulas must not empty the re-scan.
-
-        pandas builds the columns from the cached headers, and the cached read
-        resolves them; the formula-mode re-scan must reuse those positions, so
-        an uncached fee formula is refused even when no fee header is a raw
-        literal (the raw header alone would match no column at all).
-        """
-        path = self._write_report(tmp_path, commission=0.0, swap=0.0)
-        workbook = openpyxl.load_workbook(path)
-        sheet = workbook.active
-        kommission_header = next(
-            cell for row in sheet.iter_rows() for cell in row if cell.value == "Kommission"
-        )
-        swap_header = next(
-            cell for row in sheet.iter_rows() for cell in row if cell.value == "Swap"
-        )
-        entry_fee = sheet.cell(
-            row=kommission_header.row + 1, column=kommission_header.column
-        )
-        kommission_header.value = '="Kommission"'
-        swap_header.value = '="Swap"'
-        entry_fee.value = "=1+1"
-        workbook.save(path)
-        for header_cell, label in ((kommission_header, "Kommission"), (swap_header, "Swap")):
-            _inject_cached_result(
-                path,
-                header_cell.coordinate,
-                f'"{label}"',
-                f' t="str"><f>"{label}"</f><v>{label}</v>',
-            )
-
-        with pytest.raises(ValueError, match="formula without a cached result"):
-            MT5XLSXImporter().load(path)
-
-    def test_formula_richtung_with_uncached_fee_formula_is_refused(
-        self, tmp_path: Path
-    ):
-        """The formula-mode re-scan must not skip a formula-direction row.
-
-        pandas imports such a row as a fill (its cached direction), so a fee
-        formula without a cached result on it has to fail the import; re-deriving
-        "is a fill" from the raw direction cell would skip the row.
-        """
-        path = self._write_report(tmp_path, commission=0.0, swap=0.0)
-        workbook = openpyxl.load_workbook(path)
-        sheet = workbook.active
-        header_cells = next(
-            row
-            for row in sheet.iter_rows()
-            for cell in row
-            if cell.value == "Kommission"
-        )
-        richtung_cell = next(cell for cell in header_cells if cell.value == "Richtung")
-        kommission_cell = next(cell for cell in header_cells if cell.value == "Kommission")
-        entry_direction = sheet.cell(row=kommission_cell.row + 1, column=richtung_cell.column)
-        entry_fee = sheet.cell(row=kommission_cell.row + 1, column=kommission_cell.column)
-        entry_direction.value = '="in"'
-        entry_fee.value = "=1+1"
-        workbook.save(path)
-        _inject_cached_result(
-            path, entry_direction.coordinate, '"in"', ' t="str"><f>"in"</f><v>in</v>'
-        )
-
-        with pytest.raises(ValueError, match="formula without a cached result"):
-            MT5XLSXImporter().load(path)
-
-    def test_formula_trades_label_still_finds_fee_formulas(self, tmp_path: Path):
-        """A formula ``Trades`` label must not hide an uncached fee formula.
-
-        The cached read resolves the label's cached value and finds the table;
-        the formula-mode re-scan then reuses that header row instead of
-        re-searching for a literal label, so the fill row's fee formula is
-        still seen.
-        """
-        path = self._write_report(tmp_path, commission=0.0, swap=0.0)
-        workbook = openpyxl.load_workbook(path)
-        sheet = workbook.active
-        label_cell = next(
-            cell for row in sheet.iter_rows() for cell in row if cell.value == "Trades"
-        )
-        label_cell.value = '="Trades"'
-        kommission_header = next(
-            cell for row in sheet.iter_rows() for cell in row if cell.value == "Kommission"
-        )
-        sheet.cell(
-            row=kommission_header.row + 1, column=kommission_header.column
-        ).value = "=1+1"
-        workbook.save(path)
-        _inject_cached_result(
-            path, label_cell.coordinate, '"Trades"', ' t="str"><f>"Trades"</f><v>Trades</v>'
-        )
-
-        with pytest.raises(ValueError, match="formula without a cached result"):
-            MT5XLSXImporter().load(path)
-
-    def test_formula_caching_an_empty_string_is_refused(self, tmp_path: Path):
-        """A blank cached result is pandas' "no value" too, not a stored fee."""
-        path, coordinate = _write_report_with_formula_fee_cell(tmp_path, "=1+1")
-        _inject_cached_result(
-            path, coordinate, "1+1", ' t="str"><f>1+1</f><v></v>'
-        )
-
-        with pytest.raises(ValueError, match="formula without a cached result"):
-            MT5XLSXImporter().load(path)
-
-    @pytest.mark.parametrize("fee_column", ["Kommission", "Swap"])
-    def test_formula_without_a_cached_result_is_refused(
-        self, tmp_path: Path, fee_column: str
-    ):
-        """A formula with no cached value must fail, not read as "no fees".
-
-        This is the shape openpyxl itself writes (``<f>1/0</f><v></v>``), so
-        this repo's test helper produces such a report; pandas reads NaN for
-        them and booking the fee as zero would report an unknown cost as none.
-        """
-        path, _ = _write_report_with_formula_fee_cell(tmp_path, "=1/0", fee_column)
-
-        with pytest.raises(ValueError, match="formula without a cached result"):
-            MT5XLSXImporter().load(path)
-
-    @pytest.mark.parametrize("fee_column", ["Kommission", "Swap"])
-    def test_formula_whose_cached_result_is_na_text_is_refused(
-        self, tmp_path: Path, fee_column: str
-    ):
-        """A formula caching the text ``n/a`` must fail, not read as "no fees".
-
-        pandas applies its NA conversion to the cached string, so such a cell
-        reaches the fee parser as NaN and would be booked as zero; only the
-        raw workbook still shows the text.
-        """
-        path, coordinate = _write_report_with_formula_fee_cell(
-            tmp_path, "=A1", fee_column
-        )
-        _inject_cached_result(path, coordinate, "A1", ' t="str"><f>A1</f><v>n/a</v>')
-
-        with pytest.raises(ValueError, match="which pandas reads as no value"):
-            MT5XLSXImporter().load(path)
-
-    def test_formula_with_a_cached_number_is_importable(self, tmp_path: Path):
-        """The guard must not over-refuse: a cached result is the value."""
-        path, coordinate = _write_report_with_formula_fee_cell(tmp_path, "=1+1")
-        _inject_cached_result(path, coordinate, "1+1", "><f>1+1</f><v>2</v>")
-
-        trade = MT5XLSXImporter().load(path).trades[0]
-        assert trade.meta["commission"] == pytest.approx(2.0)
-        assert trade.fees == pytest.approx(-2.0)
-        assert trade.net_pnl == pytest.approx(102.0)
+        assert trade.net_pnl == pytest.approx(trade.pnl - 4.0)

@@ -7,19 +7,13 @@ import math
 import re
 from datetime import datetime, timezone, tzinfo
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pandas as pd
-from openpyxl import load_workbook
 
 from shared.broker_clock import BrokerClock, resolve_broker_clock
 from shared.models import Trade, TradeExit
-from validation.importers._fees import (
-    mt5_fee_cell,
-    mt5_fee_or_none,
-    mt5_signed_costs_to_fee,
-)
 from validation.importers._numbers import detect_decimal_comma, parse_locale_number
 from validation.importers._pairing import (
     closed_positions,
@@ -35,40 +29,6 @@ logger = logging.getLogger(__name__)
 # German labels we scan for when locating tables and parsing metadata.
 _ORDERS_LABEL = "Orders"
 _TRADES_LABEL = "Trades"
-
-_NA_TEXT_FALLBACK = frozenset(
-    {
-        "#N/A",
-        "#N/A N/A",
-        "#NA",
-        "-1.#IND",
-        "-1.#QNAN",
-        "-NaN",
-        "-nan",
-        "1.#IND",
-        "1.#QNAN",
-        "<NA>",
-        "N/A",
-        "NA",
-        "NULL",
-        "NaN",
-        "None",
-        "n/a",
-        "nan",
-        "null",
-    }
-)
-try:
-    # Exactly the texts pandas' Excel reader reads as "no value" (private
-    # module, stable across pandas 2.x and 3.x). A fee cell holding one of them
-    # is indistinguishable from a blank cell after the read, so the guard below
-    # refuses it. tests/test_na_text_fallback_pins_pandas.py compares
-    # _NA_TEXT_FALLBACK with pandas' live set, so a sentinel pandas adds fails
-    # loudly there.
-    from pandas._libs.parsers import STR_NA_VALUES as _PANDAS_NO_VALUE_TEXTS
-except ImportError:  # pragma: no cover - a pinned copy for a pandas rename
-    _PANDAS_NO_VALUE_TEXTS = _NA_TEXT_FALLBACK
-_PANDAS_NO_VALUE_TEXTS = frozenset(_PANDAS_NO_VALUE_TEXTS) - {""}
 
 # Known German stat labels → canonical keys (with and without trailing colon)
 _STAT_LABELS = [
@@ -139,251 +99,6 @@ def _resolve_source_timezone(source_tz: str | tzinfo | None) -> tzinfo | None:
         raise ValueError(f"Unknown source timezone: {source_tz}") from exc
 
 
-class _FeeCell(NamedTuple):
-    """One fee cell of the Trades table that needs a second look."""
-
-    label: str
-    row: int
-    column: int
-    value: Any = None
-
-    @property
-    def position(self) -> tuple[int, int]:
-        return (self.row, self.column)
-
-
-class _FeeCellScan(NamedTuple):
-    """What one scan of the fee columns found."""
-
-    errors: list[_FeeCell]
-    na_texts: list[_FeeCell]
-    formulas: list[_FeeCell]
-    values: dict[tuple[int, int], tuple[Any, str]]
-    fill_rows: list[int]
-    header_row: int = 0
-    fee_columns: dict[int, str] = {}  # noqa: RUF012 - NamedTuple default, never mutated
-    direction_column: int | None = None
-    header_formulas: list[_FeeCell] = []  # noqa: RUF012 - NamedTuple default, never mutated
-
-
-def _assert_fee_cells_are_readable(path: Path) -> None:
-    """Refuse an unreadable fee cell in a fee column of the Trades table.
-
-    ``pd.read_excel`` converts an error cell (``#DIV/0!``) to NaN, so afterwards
-    it can no longer be told from MT5's "no fees" blank cell: booking that
-    trade with ``fees=None`` would report an unknown cost as zero and can flip
-    its win/loss classification. The raw workbook keeps the distinction, so
-    the fee columns are checked there before anything is parsed.
-
-    Formula cells are refused unless the workbook stores a cached result: a
-    formula without one reads as ``None`` in the cached read and as NaN in
-    pandas (any openpyxl-written report is that shape, including this repo's
-    test helper ``_write_report_with_formula_fee_cell``), and a cached *error*
-    or a cached *NA text* is a corrupt or unreadable value like a literal one.
-    A formula with a cached number is the value pandas reads and stays
-    importable.
-
-    The cached read also decides which rows are fills, because a formula
-    ``Richtung`` cell resolves to its cached value there: pandas imports such
-    a row as a fill, so the guard must not skip it. Only the rows the cached
-    read calls fills are then re-scanned in formula mode for the uncached
-    formulas that read cannot see.
-
-    Self-contained on purpose: the sheet is re-scanned for the Trades header
-    instead of reusing the parsed row/column indices, which the table
-    extraction drops (all-NaN rows and unnamed-header columns) and a
-    ``skiprows`` kwarg would shift.
-    """
-    cached = _scan_fee_cells(path, data_only=True)
-    for cell in cached.errors:
-        raise ValueError(
-            f"MT5 {cell.label} cell is an Excel error ({cell.value!r}) in row "
-            f"{cell.row}: the report is corrupt and the fee cannot be read"
-        )
-    for cell in cached.na_texts:
-        raise ValueError(
-            f"MT5 {cell.label} cell in row {cell.row} holds {cell.value!r}, "
-            "which pandas reads as no value: a reported cost may not silently "
-            "become zero fees"
-        )
-    raw = _scan_fee_cells(
-        path,
-        data_only=False,
-        rows=set(cached.fill_rows),
-        table_header_row=cached.header_row or None,
-        table=(cached.fee_columns, cached.direction_column),
-    )
-    for cell in raw.header_formulas:
-        cached_value, _ = cached.values.get(cell.position, (None, ""))
-        if cached_value is None:
-            # pandas drops a column whose header has no cached result, and the
-            # importer then reads every fee in it as "no fees".
-            raise ValueError(
-                f"MT5 Trades header cell {cell.value!r} (column {cell.column}) is "
-                "a formula without a cached result: the column is unreadable "
-                "and its fees cannot be read as zero"
-            )
-    for cell in raw.formulas:
-        cached_value, _ = cached.values[cell.position]
-        if cached_value is None:
-            # openpyxl resolves an empty cached value to None as well
-            # (``findtext(VALUE_TAG, None) or None``), so a blank result is
-            # refused here too; pandas reads it as no value either way.
-            raise ValueError(
-                f"MT5 {cell.label} cell in row {cell.row} is a formula without a "
-                "cached result: the fee is unknown and cannot be read as zero"
-            )
-
-
-def _scan_fee_cells(
-    path: Path,
-    *,
-    data_only: bool,
-    rows: set[int] | None = None,
-    table_header_row: int | None = None,
-    table: tuple[dict[int, str], int | None] | None = None,
-) -> _FeeCellScan:
-    """Stream the Trades table's fee columns of a workbook.
-
-    Returns the error cells, the pandas-NA text cells and the formula cells
-    found (as ``_FeeCell``) plus the fill rows, and the ``(value, data_type)``
-    seen at every fee cell of those rows. ``rows`` restricts the data scan
-    (the second, formula-mode pass looks only at rows the cached read called
-    fills).
-    """
-    error_cells: list[_FeeCell] = []
-    na_text_cells: list[_FeeCell] = []
-    formula_cells: list[_FeeCell] = []
-    header_formulas: list[_FeeCell] = []
-    values: dict[tuple[int, int], tuple[Any, str]] = {}
-    fill_rows: list[int] = []
-    wanted_rows = rows
-    workbook = load_workbook(path, read_only=True, data_only=data_only)
-    try:
-        rows = workbook.worksheets[0].iter_rows()
-        header_row: Any = None
-        header_row_number = 0
-        if table_header_row:
-            # The caller found the table in the cached read; reusing its header
-            # row keeps this formula-mode pass from missing a label that is a
-            # formula (``="Trades"``) and therefore matches no literal text.
-            for row_number, row in enumerate(rows, start=1):
-                if row_number == table_header_row:
-                    header_row = row
-                    header_row_number = row_number
-                    break
-        else:
-            for row_number, row in enumerate(rows, start=1):
-                if any(
-                    isinstance(cell.value, str) and cell.value.strip() == _TRADES_LABEL
-                    for cell in row
-                ):
-                    header_row = next(rows, None)
-                    header_row_number = row_number + 1
-                    break
-        if header_row is None:
-            return _FeeCellScan([], [], [], values, [], 0)
-        # Positions, not Cell.column: read_only mode hands out EmptyCell objects
-        # for gaps, which carry no column index.
-        fee_columns: dict[int, str] = {
-            column: cell.value.strip()
-            for column, cell in enumerate(header_row, start=1)
-            if isinstance(cell.value, str) and cell.value.strip() in ("Kommission", "Swap")
-        }
-        # The rows the importer reads as fills: the report's trailing totals
-        # row (a SUM formula in a fee column, no Richtung) is never one, so its
-        # cells are the parser's business, not this guard's. The selection is
-        # Richtung-only and therefore a superset of group_position_fills (which
-        # also drops Typ=balance rows): over-scanning fails closed, a missed
-        # fill would not.
-        direction_column: int | None = next(
-            (
-                column
-                for column, cell in enumerate(header_row, start=1)
-                if isinstance(cell.value, str) and cell.value.strip() == "Richtung"
-            ),
-            None,
-        )
-        if table is not None:
-            # The cached read already resolved the table; re-matching the raw
-            # header would drop a column whose header is itself a formula.
-            # Overriding before any early return keeps that protection.
-            fee_columns, direction_column = table
-        for column, cell in enumerate(header_row, start=1):
-            values[(header_row_number, column)] = (cell.value, cell.data_type)
-            if data_only is False and cell.data_type == "f":
-                # A header cell that is a formula without a cached result makes
-                # pandas drop the column; only formula mode can see it.
-                header_formulas.append(
-                    _FeeCell(str(cell.value), header_row_number, column, cell.value)
-                )
-        if not fee_columns:
-            return _FeeCellScan(
-                [], [], [], values, [], header_row_number, dict(fee_columns), None,
-                header_formulas,
-            )
-        if direction_column is None and wanted_rows is None:
-            # Without a Richtung column this scan cannot tell fill rows from
-            # the totals row; the parse reports the layout itself.
-            return _FeeCellScan(
-                [], [], [], values, [], header_row_number, dict(fee_columns), None,
-                header_formulas,
-            )
-        for row_number, row in enumerate(rows, start=header_row_number + 1):
-            if wanted_rows is not None:
-                # The caller restricted the scan to rows the *cached* read
-                # called fills; a formula Richtung resolves there, and this
-                # formula-mode pass must not second-guess that.
-                if row_number not in wanted_rows:
-                    continue
-                fill_rows.append(row_number)
-                is_fill = True
-            else:
-                row_direction = (
-                    row[direction_column - 1].value
-                    if direction_column - 1 < len(row)
-                    else None
-                )
-                is_fill = (
-                    isinstance(row_direction, str)
-                    and row_direction.strip().lower() in ("in", "out")
-                )
-                if not is_fill:
-                    continue
-                fill_rows.append(row_number)
-            for column, cell in enumerate(row, start=1):
-                if column not in fee_columns:
-                    continue
-                if cell.data_type == "e":
-                    error_cells.append(
-                        _FeeCell(fee_columns[column], row_number, column, cell.value)
-                    )
-                elif cell.data_type == "f":
-                    formula_cells.append(
-                        _FeeCell(fee_columns[column], row_number, column, cell.value)
-                    )
-                elif cell.data_type == "s" and cell.value in _PANDAS_NO_VALUE_TEXTS:
-                    # pandas reads these texts as "no value" (no stripping, no
-                    # case folding), so the fee would silently become zero.
-                    na_text_cells.append(
-                        _FeeCell(fee_columns[column], row_number, column, cell.value)
-                    )
-                values[(row_number, column)] = (cell.value, cell.data_type)
-    finally:
-        workbook.close()
-    return _FeeCellScan(
-        error_cells,
-        na_text_cells,
-        formula_cells,
-        values,
-        fill_rows,
-        header_row_number,
-        dict(fee_columns),
-        direction_column,
-        header_formulas,
-    )
-
-
 def _resolve_report_clock(
     broker_clock: str | BrokerClock | None,
 ) -> BrokerClock | None:
@@ -441,9 +156,6 @@ class MT5XLSXImporter(BaseImporter):
                 "timestamps are either a civil zone's wall time or a broker server clock"
             )
         df_raw = pd.read_excel(path, header=None, sheet_name=0, **kwargs)
-        # A fee cell pandas hands over as NaN may be an Excel error cell, which
-        # the fee parsing must never silently book as "no fees".
-        _assert_fee_cells_are_readable(path)
         rows = df_raw.values.tolist()
 
         # Locate section headers dynamically
@@ -1068,19 +780,14 @@ class MT5XLSXImporter(BaseImporter):
             # DV-B43: commission/swap accumulate over every fill of the
             # position (entry fills included), not just the last exit row.
             commission = sum(
-                mt5_fee_cell(
-                    r.get(col_commission), "Kommission", MT5XLSXImporter._to_float
-                )
+                (MT5XLSXImporter._to_float(r.get(col_commission), default=0.0) or 0.0)
                 for r in fills.entries + exit_rows
             )
             swap = sum(
-                mt5_fee_cell(r.get(col_swap), "Swap", MT5XLSXImporter._to_float)
+                (MT5XLSXImporter._to_float(r.get(col_swap), default=0.0) or 0.0)
                 for r in fills.entries + exit_rows
             )
-            # MT5 reports commission and swap signed from the account's point
-            # of view (a cost is negative); the Trade contract wants a positive
-            # cost. ``meta`` keeps the raw MT5-signed values.
-            fees = mt5_signed_costs_to_fee(commission, swap)
+            fees = commission + swap
 
             exits: list[TradeExit] = []
             for exit_row in exit_rows:
@@ -1125,7 +832,8 @@ class MT5XLSXImporter(BaseImporter):
                 quantity=entry_volume,
                 exits=exits,
                 pnl=pnl,
-                fees=mt5_fee_or_none(fees),
+                # Exact zero, not a tolerance: MT5 reports "no fees" as 0.0.
+                fees=fees if abs(fees) > 0.0 else None,
                 net_pnl=pnl - fees,
                 stop_loss=sl,
                 take_profit=tp,

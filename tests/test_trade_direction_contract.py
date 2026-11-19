@@ -30,7 +30,6 @@ def _trade(direction: str, *, exits: list[TradeExit] | None = None) -> Trade:
     )
 
 
-
 def _trade_dict(direction: object) -> dict:
     return {
         "id": 1,
