@@ -884,6 +884,26 @@ class TestZeroFeesBecomeNone:
         assert trade.fees == pytest.approx(0.004)
         assert trade.net_pnl == pytest.approx(100.0 - 0.004)
 
+    def test_unparseable_swap_cell_is_refused(self, tmp_path: Path):
+        """A swap cell that cannot be parsed must fail the import, not read as 0.0."""
+        path = self._write_report(tmp_path, commission=0.0, swap="xyz")
+        with pytest.raises(ValueError, match="Swap cell is not a number"):
+            MT5XLSXImporter().load(path)
+
+    @pytest.mark.parametrize("na_text", ["n/a", "NA", "N/A", "NULL", "NaN", "None"])
+    def test_pandas_na_sentinel_fee_cell_is_refused(
+        self, tmp_path: Path, na_text: str
+    ):
+        """A fee cell pandas reads as no value must fail, not become zero fees.
+
+        ``pd.read_excel`` converts these exact texts (case-sensitive, no
+        stripping) to NaN, which ``mt5_fee_cell`` would then read as MT5's
+        "no fees"; the guard sees the text in the raw workbook and refuses.
+        """
+        path = self._write_report(tmp_path, commission=na_text, swap=0.0)
+        with pytest.raises(ValueError, match="which pandas reads as no value"):
+            MT5XLSXImporter().load(path)
+
     def test_excel_error_fee_cell_is_refused(self, tmp_path: Path):
         """A genuine Excel-error fee cell must fail the import, not read as 0.0.
 

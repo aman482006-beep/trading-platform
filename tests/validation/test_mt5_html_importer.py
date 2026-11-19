@@ -403,6 +403,12 @@ class TestFeeSign:
         assert trades[0].meta["commission"] is None
         assert trades[0].meta["swap"] is None
 
+    def test_unparseable_swap_cell_is_refused(self):
+        """An unparseable swap cell must fail the import, not read as 0.0."""
+        table = self._table("0", "n/a")
+        with pytest.raises(ValueError, match="Swap cell is not a number"):
+            MT5HTMLImporter._build_trades(table, {})
+
     def test_swap_on_an_entry_fill_is_counted(self):
         """DV-B43 sums commission and swap over entry *and* exit fills.
 

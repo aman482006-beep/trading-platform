@@ -36,6 +36,37 @@ logger = logging.getLogger(__name__)
 _ORDERS_LABEL = "Orders"
 _TRADES_LABEL = "Trades"
 
+try:
+    # Exactly the texts pandas' Excel reader reads as "no value" (private
+    # module, stable across pandas 2.x and 3.x). A fee cell holding one of them
+    # is indistinguishable from a blank cell after the read, so the guard below
+    # refuses it; the tests pin the behaviour either way.
+    from pandas._libs.parsers import STR_NA_VALUES as _PANDAS_NO_VALUE_TEXTS
+except ImportError:  # pragma: no cover - a pandas API rename must fail closed
+    _PANDAS_NO_VALUE_TEXTS = frozenset(  # type: ignore[assignment]
+        {
+            "#N/A",
+            "#N/A N/A",
+            "#NA",
+            "-1.#IND",
+            "-1.#QNAN",
+            "-NaN",
+            "-nan",
+            "1.#IND",
+            "1.#QNAN",
+            "<NA>",
+            "N/A",
+            "NA",
+            "NULL",
+            "NaN",
+            "None",
+            "n/a",
+            "nan",
+            "null",
+        }
+    )
+_PANDAS_NO_VALUE_TEXTS = frozenset(_PANDAS_NO_VALUE_TEXTS) - {""}
+
 # Known German stat labels → canonical keys (with and without trailing colon)
 _STAT_LABELS = [
     ("Gesamtanzahl Trades", "total_trades"),
@@ -118,6 +149,15 @@ class _FeeCell(NamedTuple):
         return (self.row, self.column)
 
 
+class _FeeCellScan(NamedTuple):
+    """What one scan of the fee columns found."""
+
+    errors: list[_FeeCell]
+    na_texts: list[_FeeCell]
+    formulas: list[_FeeCell]
+    values: dict[tuple[int, int], tuple[Any, str]]
+
+
 def _assert_fee_cells_are_readable(path: Path) -> None:
     """Refuse an unreadable fee cell in a fee column of the Trades table.
 
@@ -139,20 +179,26 @@ def _assert_fee_cells_are_readable(path: Path) -> None:
     extraction drops (all-NaN rows and columns) and a ``skiprows`` kwarg would
     shift.
     """
-    error_cells, formula_cells, _ = _scan_fee_cells(path, data_only=False)
-    for cell in error_cells:
+    scan = _scan_fee_cells(path, data_only=False)
+    for cell in scan.errors:
         raise ValueError(
             f"MT5 {cell.label} cell is an Excel error ({cell.value!r}) in row "
             f"{cell.row}: the report is corrupt and the fee cannot be read"
         )
-    if not formula_cells:
+    for cell in scan.na_texts:
+        raise ValueError(
+            f"MT5 {cell.label} cell in row {cell.row} holds {cell.value!r}, "
+            "which pandas reads as no value: a reported cost may not silently "
+            "become zero fees"
+        )
+    if not scan.formulas:
         return
     # Only a cached result tells a formula's value; the rare workbook that
     # carries formulas in fee columns pays a second scan for that.
     cached = _scan_fee_cells(
-        path, data_only=True, wanted={cell.position for cell in formula_cells}
-    )[2]
-    for cell in formula_cells:
+        path, data_only=True, wanted={cell.position for cell in scan.formulas}
+    ).values
+    for cell in scan.formulas:
         cached_value, cached_type = cached[cell.position]
         if cached_type == "e":
             raise ValueError(
@@ -171,14 +217,15 @@ def _scan_fee_cells(
     *,
     data_only: bool,
     wanted: set[tuple[int, int]] | None = None,
-) -> tuple[list[_FeeCell], list[_FeeCell], dict[tuple[int, int], Any]]:
+) -> _FeeCellScan:
     """Stream the Trades table's fee columns of a workbook.
 
-    Returns the error cells and the formula cells found (as ``_FeeCell``), and
-    the ``(value, data_type)`` seen at the ``wanted`` ``(row, column)`` positions
-    (empty unless ``wanted`` is given).
+    Returns the error cells, the pandas-NA text cells and the formula cells
+    found (as ``_FeeCell``), plus the ``(value, data_type)`` seen at the
+    ``wanted`` ``(row, column)`` positions (empty unless ``wanted`` is given).
     """
     error_cells: list[_FeeCell] = []
+    na_text_cells: list[_FeeCell] = []
     formula_cells: list[_FeeCell] = []
     values: dict[tuple[int, int], tuple[Any, str]] = {}
     workbook = load_workbook(path, read_only=True, data_only=data_only)
@@ -195,7 +242,7 @@ def _scan_fee_cells(
                 header_row_number = row_number + 1
                 break
         if header_row is None:
-            return [], [], values  # no Trades table; the layout check reports that itself
+            return _FeeCellScan([], [], [], values)
         # Positions, not Cell.column: read_only mode hands out EmptyCell objects
         # for gaps, which carry no column index.
         fee_columns = {
@@ -204,7 +251,7 @@ def _scan_fee_cells(
             if isinstance(cell.value, str) and cell.value.strip() in ("Kommission", "Swap")
         }
         if not fee_columns:
-            return [], [], values
+            return _FeeCellScan([], [], [], values)
         for row_number, row in enumerate(rows, start=header_row_number + 1):
             for column, cell in enumerate(row, start=1):
                 if column not in fee_columns:
@@ -217,11 +264,20 @@ def _scan_fee_cells(
                     formula_cells.append(
                         _FeeCell(fee_columns[column], row_number, column, cell.value)
                     )
+                elif (
+                    cell.data_type == "s"
+                    and cell.value in _PANDAS_NO_VALUE_TEXTS
+                ):
+                    # pandas reads these texts as "no value" (no stripping, no
+                    # case folding), so the fee would silently become zero.
+                    na_text_cells.append(
+                        _FeeCell(fee_columns[column], row_number, column, cell.value)
+                    )
                 if wanted is not None and (row_number, column) in wanted:
                     values[(row_number, column)] = (cell.value, cell.data_type)
     finally:
         workbook.close()
-    return error_cells, formula_cells, values
+    return _FeeCellScan(error_cells, na_text_cells, formula_cells, values)
 
 
 def _resolve_report_clock(
