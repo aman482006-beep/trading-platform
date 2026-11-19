@@ -13,7 +13,7 @@ import math
 
 import pytest
 
-from validation.importers._fees import mt5_fee_cell, mt5_signed_costs_to_fee
+from validation.importers._fees import mt5_fee_cell, mt5_fee_or_none, mt5_signed_costs_to_fee
 
 
 def _never_parses(value: object) -> float | None:
@@ -64,6 +64,23 @@ class TestNonFiniteSumsAreRefused:
         """Never store an inf fee or net_pnl: refuse the value instead."""
         with pytest.raises(ValueError, match="must be finite"):
             mt5_signed_costs_to_fee(commission, swap)
+
+
+class TestFeeOrNone:
+    """The zero-to-``None`` mapping both importers share (``mt5_fee_or_none``)."""
+
+    def test_exact_zero_is_mt5s_no_fees(self):
+        assert mt5_fee_or_none(0.0) is None
+
+    @pytest.mark.parametrize("fee", [0.004, -0.004, 1e-9, -1e-9])
+    def test_a_tiny_non_zero_fee_is_kept(self, fee: float):
+        """Exact zero, not a tolerance: a real sub-cent cost is a cost.
+
+        A swap credit on a small lot can be ``0.004``; mapping it away would
+        contradict ``net_pnl == pnl - fees`` for every consumer that
+        reconstructs the net figure from ``fees``.
+        """
+        assert mt5_fee_or_none(fee) == pytest.approx(fee)
 
 
 class TestFeeCellRule:

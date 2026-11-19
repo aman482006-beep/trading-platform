@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,27 @@ def _nas100_path() -> Path:
 
 def _sp500_path() -> Path:
     return _REPORTS / "SP500_M1.xlsx"
+
+
+def _inject_cached_error(path: Path, coordinate: str) -> None:
+    """Give the formula at ``coordinate`` the cached error result Excel stores.
+
+    A report written by openpyxl carries an empty cached value
+    (``<v></v>``), which pandas and this guard both read as blank; Excel stores
+    ``t="e"`` with the error text, so patch that in to model a real report.
+    """
+    patched = path.with_suffix(".patched.xlsx")
+    with zipfile.ZipFile(path) as source, zipfile.ZipFile(patched, "w") as target:
+        for item in source.infolist():
+            data = source.read(item.filename)
+            if item.filename.startswith("xl/worksheets/sheet"):
+                xml = data.decode()
+                blank = f'<c r="{coordinate}"><f>1/0</f><v></v></c>'
+                errored = f'<c r="{coordinate}" t="e"><f>1/0</f><v>#DIV/0!</v></c>'
+                assert blank in xml, f"formula cell {coordinate} not found"
+                data = xml.replace(blank, errored).encode()
+            target.writestr(item, data)
+    patched.replace(path)
 
 
 @pytest.fixture
@@ -833,6 +855,13 @@ class TestZeroFeesBecomeNone:
         with pytest.raises(ValueError, match="Kommission cell is not a number"):
             MT5XLSXImporter().load(path)
 
+    def test_a_sub_cent_fee_is_kept(self, tmp_path: Path):
+        """Exact zero, not a tolerance: a real 0.004 cost stays on the trade."""
+        path = self._write_report(tmp_path, commission=-0.004, swap=0.0)
+        trade = MT5XLSXImporter().load(path).trades[0]
+        assert trade.fees == pytest.approx(0.004)
+        assert trade.net_pnl == pytest.approx(100.0 - 0.004)
+
     def test_excel_error_fee_cell_is_refused(self, tmp_path: Path):
         """A genuine Excel-error fee cell must fail the import, not read as 0.0.
 
@@ -870,4 +899,28 @@ class TestZeroFeesBecomeNone:
         workbook.save(path)
 
         with pytest.raises(ValueError, match=r"Swap cell is an Excel error .* in row \d+"):
+            MT5XLSXImporter().load(path)
+
+    def test_excel_error_formula_cell_is_refused(self, tmp_path: Path):
+        """A formula whose cached result is an error must fail the import too.
+
+        pandas reads cached values, so the guard must as well (data_only=True):
+        in formula mode such a cell looks like a harmless ``data_type="f"``
+        while pandas hands over NaN and the fee would read as "no fees".
+        """
+        path = self._write_report(tmp_path, commission=0.0, swap=0.0)
+        workbook = openpyxl.load_workbook(path)
+        sheet = workbook.active
+        commission_cell = None
+        for row in sheet.iter_rows():
+            for cell in row:
+                if cell.value == "Kommission":
+                    commission_cell = sheet.cell(row=cell.row + 1, column=cell.column)
+        assert commission_cell is not None
+        coordinate = commission_cell.coordinate
+        commission_cell.value = "=1/0"
+        workbook.save(path)
+        _inject_cached_error(path, coordinate)
+
+        with pytest.raises(ValueError, match="Kommission cell is an Excel error"):
             MT5XLSXImporter().load(path)

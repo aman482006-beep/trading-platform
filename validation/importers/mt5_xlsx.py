@@ -115,12 +115,19 @@ def _assert_fee_cells_are_readable(path: Path) -> None:
     The raw workbook keeps the distinction, so the fee columns are checked
     there before anything is parsed.
 
+    The workbook is read with ``data_only=True`` because pandas reads cached
+    values: a formula whose cached result is an error is ``data_type == "f"``
+    in formula mode but ``"e"`` with the cache, which is what pandas sees.
+    (A formula without a cached value reads as ``None`` here and as NaN in
+    pandas -- openpyxl-written reports; only Excel-stored reports can be told
+    apart.)
+
     Self-contained on purpose: the sheet is re-scanned for the Trades header
     instead of reusing the parsed row/column indices, which the table
     extraction drops (all-NaN rows and columns) and a ``skiprows`` kwarg would
     shift.
     """
-    workbook = load_workbook(path, read_only=True)
+    workbook = load_workbook(path, read_only=True, data_only=True)
     try:
         rows = workbook.worksheets[0].iter_rows()
         header_row: Any = None
