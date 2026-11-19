@@ -833,6 +833,22 @@ class TestZeroFeesBecomeNone:
             trades.to_excel(writer, index=False, header=False, startrow=20)
         return path
 
+    def test_report_without_trades_section_raises_the_layout_error(self, tmp_path: Path):
+        """A workbook with no Trades table must fail with the importer's error.
+
+        The fee guard scans the header it cannot find and must return cleanly,
+        not raise a TypeError of its own, so the importer's own
+        "Could not locate 'Trades' section" ValueError survives.
+        """
+        path = tmp_path / "no_trades.xlsx"
+        with pd.ExcelWriter(path, engine="openpyxl") as writer:
+            pd.DataFrame([["Orders", None], [None, None]]).to_excel(
+                writer, index=False, header=False, startrow=0
+            )
+
+        with pytest.raises(ValueError, match="Could not locate 'Trades' section"):
+            MT5XLSXImporter().load(path)
+
     def test_zero_commission_and_swap_are_stored_as_none(self, tmp_path: Path):
         ref = MT5XLSXImporter().load(
             self._write_report(tmp_path, commission=0.0, swap=0.0)

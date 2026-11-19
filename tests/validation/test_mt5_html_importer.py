@@ -411,6 +411,27 @@ class TestFeeSign:
         with pytest.raises(ValueError, match="Swap cell is not a number"):
             MT5HTMLImporter._build_trades(table, {})
 
+    @pytest.mark.parametrize("column", ["Kommission", "Swap"])
+    @pytest.mark.parametrize("value", ["-2.500", "2.500"])
+    def test_ambiguous_dotted_fee_cell_uses_dot_decimal_first(
+        self, column: str, value: str
+    ):
+        """An ambiguous dot-grouped fee cell resolves dot-first: 2.500 is 2.5.
+
+        The HTML fee columns run through ``mt5_fee_cell`` with
+        ``parse_report_number`` (dot-first, comma fallback), the same rule the
+        price cells use. Reading such a cell as German grouping would book a
+        2.500 fee as 2500 and move net_pnl by ~2497.5.
+        """
+        table = self._table(
+            commission=value if column == "Kommission" else "0",
+            swap=value if column == "Swap" else "0",
+        )
+        trades, _ = MT5HTMLImporter._build_trades(table, {})
+        signed = float(value.replace(",", "."))
+        assert trades[0].fees == pytest.approx(-signed)
+        assert trades[0].net_pnl == pytest.approx(trades[0].pnl - trades[0].fees)
+
     def test_swap_on_an_entry_fill_is_counted(self):
         """DV-B43 sums commission and swap over entry *and* exit fills.
 

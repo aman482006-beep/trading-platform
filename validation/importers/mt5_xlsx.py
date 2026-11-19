@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 import math
 import re
-from dataclasses import field
 from datetime import datetime, timezone, tzinfo
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -162,9 +161,9 @@ class _FeeCellScan(NamedTuple):
     values: dict[tuple[int, int], tuple[Any, str]]
     fill_rows: list[int]
     header_row: int = 0
-    fee_columns: dict[int, str] = field(default_factory=dict)
+    fee_columns: dict[int, str] = {}  # noqa: RUF012 - NamedTuple default, never mutated
     direction_column: int | None = None
-    header_formulas: list[_FeeCell] = field(default_factory=list)
+    header_formulas: list[_FeeCell] = []  # noqa: RUF012 - NamedTuple default, never mutated
 
 
 def _assert_fee_cells_are_readable(path: Path) -> None:
