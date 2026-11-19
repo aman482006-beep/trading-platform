@@ -1025,6 +1025,19 @@ class TestZeroFeesBecomeNone:
         with pytest.raises(ValueError, match="formula without a cached result"):
             MT5XLSXImporter().load(path)
 
+    def test_formula_whose_cached_result_is_na_text_is_refused(self, tmp_path: Path):
+        """A formula caching the text ``n/a`` must fail, not read as "no fees".
+
+        pandas applies its NA conversion to the cached string, so such a cell
+        reaches the fee parser as NaN and would be booked as zero; only the
+        raw workbook still shows the text.
+        """
+        path, coordinate = _write_report_with_formula_fee_cell(tmp_path, "=A1")
+        _inject_cached_result(path, coordinate, "A1", ' t="str"><f>A1</f><v>n/a</v>')
+
+        with pytest.raises(ValueError, match="which pandas reads as no value"):
+            MT5XLSXImporter().load(path)
+
     def test_formula_with_a_cached_number_is_importable(self, tmp_path: Path):
         """The guard must not over-refuse: a cached result is the value."""
         path, coordinate = _write_report_with_formula_fee_cell(tmp_path, "=1+1")

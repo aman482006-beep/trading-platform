@@ -205,6 +205,14 @@ def _assert_fee_cells_are_readable(path: Path) -> None:
                 f"MT5 {cell.label} cell is an Excel error ({cached_value!r}) in "
                 f"row {cell.row}: the report is corrupt and the fee cannot be read"
             )
+        if cached_type == "s" and cached_value in _PANDAS_NO_VALUE_TEXTS:
+            # pandas applies its NA conversion to the cached text, so this
+            # formula reads as "no fees" although the report states a value.
+            raise ValueError(
+                f"MT5 {cell.label} cell in row {cell.row} has the cached result "
+                f"{cached_value!r}, which pandas reads as no value: a reported "
+                "cost may not silently become zero fees"
+            )
         if cached_value is None:
             raise ValueError(
                 f"MT5 {cell.label} cell in row {cell.row} is a formula without a "
