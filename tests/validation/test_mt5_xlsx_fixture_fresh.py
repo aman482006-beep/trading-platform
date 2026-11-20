@@ -30,12 +30,28 @@ from scripts.generate_mt5_xlsx_fixtures import _FIXED_TIME
 
 FIXTURE_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "validation" / "mt5_xlsx"
 GOLDEN_DIR = FIXTURE_DIR / "goldens"
+# Deliberately independent of the generator's ``_FIXTURES``: this list is the
+# pin, and the registration test below fails loudly if the two ever disagree.
 NAMES = ["hedged_partial_open", "position_id_shared"]
 
 _BUILDERS = {
     "hedged_partial_open": generator.build_hedged_partial_open,
     "position_id_shared": generator.build_position_id_shared,
 }
+
+
+def test_generator_registers_every_fixture() -> None:
+    """Every committed fixture is generated, and only those.
+
+    Without this, unregistering a fixture surfaces as a ``FileNotFoundError``
+    on the missing golden (or, if the list were imported from the generator,
+    not at all: the pin would vanish with the registration).
+    """
+    assert set(generator._FIXTURES) == set(NAMES), (
+        "scripts/generate_mt5_xlsx_fixtures.py registers "
+        f"{sorted(generator._FIXTURES)}, the tests pin {sorted(NAMES)}; "
+        "update the generator and the test lists in the same commit"
+    )
 
 
 @pytest.mark.parametrize("name", NAMES)
