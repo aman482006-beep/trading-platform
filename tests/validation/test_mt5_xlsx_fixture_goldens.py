@@ -16,11 +16,17 @@ from typing import Any
 
 import pytest
 
+import scripts.generate_mt5_xlsx_fixtures as generator
 from scripts.generate_mt5_xlsx_fixtures import project_reference
 from validation.importers.mt5_xlsx import MT5XLSXImporter
 
 FIXTURE_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "validation" / "mt5_xlsx"
 GOLDEN_DIR = FIXTURE_DIR / "goldens"
+# This list is deliberately independent of the generator's ``_FIXTURES``: it is
+# the pin. ``test_generator_registers_every_fixture`` fails loudly when a
+# fixture is added to (or dropped from) the generator, so a new workbook is
+# never generated but left unpinned, and a dropped one never disappears
+# silently from both lists at once.
 NAMES = ["hedged_partial_open", "position_id_shared"]
 
 
@@ -42,6 +48,20 @@ def _assert_close(actual: Any, expected: Any, path: str) -> None:
             _assert_close(a, e, f"{path}[{index}]")
     else:
         assert actual == expected, f"{path}: {actual!r} != {expected!r}"
+
+
+def test_generator_registers_every_fixture() -> None:
+    """Every committed fixture is generated, and only those.
+
+    Without this, unregistering a fixture surfaces as a ``FileNotFoundError``
+    on the missing golden (or, if the list were imported from the generator,
+    not at all: the pin would vanish with the registration).
+    """
+    assert set(generator._FIXTURES) == set(NAMES), (
+        "scripts/generate_mt5_xlsx_fixtures.py registers "
+        f"{sorted(generator._FIXTURES)}, the tests pin {sorted(NAMES)}; "
+        "update the generator and the test lists in the same commit"
+    )
 
 
 @pytest.mark.parametrize("name", NAMES)
