@@ -11,7 +11,10 @@ Arithmetic used throughout (EURUSD, 1 lot = 100 000 units):
 * SHORT pnl = (entry - exit) * lots * 100 000
 
 Commission and swap are MT5-signed: a cost is negative. ``Trade.fees`` is the
-signed sum of commission and swap over every fill of the position.
+signed sum of commission and swap over every fill of the position. That
+convention carries the ``net_pnl`` sign bug tracked in #228 ("store MT5 fees
+as a positive cost"), which negates at the importer boundary and flips these
+expectations; until it merges, the xfail below pins the deferral.
 
 Positions in ``hedged_partial_open.xlsx`` (scope = symbol + entry side):
 
@@ -205,7 +208,10 @@ class TestHedgedPartialOpenReport:
         reason=(
             "Known bug: importer sets net_pnl = pnl - fees, but fees are MT5-signed "
             "(commission and swap are negative when they cost money). Net should be "
-            "pnl + fees. Expected net for P1 is 50.00 - 1.40 = 48.60, not 51.40."
+            "pnl + fees. Expected net for P1 is 50.00 - 1.40 = 48.60, not 51.40. "
+            "Tracked fix: #228 stores fees as a positive cost at the importer "
+            "boundary, which keeps net_pnl = pnl - fees correct; drop this marker "
+            "and flip the fee expectations once #228 has merged."
         ),
     )
     def test_net_pnl_is_gross_plus_signed_fees(self, hedged: ValidationReference) -> None:

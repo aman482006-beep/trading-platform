@@ -18,6 +18,13 @@ on the committed data because ``net_pnl`` has the wrong sign (see the reason on
 the marker). They are written as the expected behaviour, so they XPASS and
 fail the moment the bug is fixed; the markers must then be removed. The
 calculator win count for EURUSD passes, because its fees are small swaps.
+
+The sign is not decided here: this PR only pins the fixtures and the
+goldens, so the deferral is explicit. #228 ("store MT5 fees as a positive
+cost") is the fix: it negates at the importer boundary, so ``fees`` becomes
+a positive cost, ``net_pnl == pnl - fees`` is correct and these markers go
+away. Until that PR merges, the xfail reasons below name it as the tracked
+fix.
 """
 
 from __future__ import annotations
@@ -37,7 +44,9 @@ _NET_SIGN_BUG = (
     "Known bug: MT5XLSXImporter (and MT5HTMLImporter) set net_pnl = pnl - fees, "
     "but fees are MT5-signed (commission and swap are negative when they cost "
     "money), so the sign is inverted. MT5's own total equals sum(pnl) + sum(fees) "
-    "in every golden. Remove this marker once net_pnl is fixed."
+    "in every golden. Tracked fix: #228 stores fees as a positive cost at the "
+    "importer boundary, which makes net_pnl = pnl - fees correct; remove this "
+    "marker once #228 has merged."
 )
 
 
