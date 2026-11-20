@@ -395,7 +395,10 @@ def build_hedged_partial_open(path: Path) -> None:
             "sell",
             _TENTH_FILLED,
             1.1020,
-            1.1050,
+            # The level the closing fill actually hit: deal 7 sells back at
+            # 1.1035 and its comment names that stop. An S/L the price never
+            # reaches (1.1050) contradicts the exit that claims it.
+            1.1035,
             None,
             "2024.01.03 09:00:00",
             "filled",
@@ -539,8 +542,12 @@ def build_position_id_shared(path: Path) -> None:
             304,
             -0.25,
             0.0,
-            15.00,
-            10053.50,
+            # FIFO against this fill's own entry (0.05 @ 1.1010):
+            # (1.1030 - 1.1010) * 0.05 * 100 000 = 10.00. The first exit
+            # already consumed the 1.1000 entry, so this fill cannot book
+            # against it.
+            10.00,
+            10048.50,
             _TP_COMMENT_1_10300,
         ],
         [
@@ -555,7 +562,7 @@ def build_position_id_shared(path: Path) -> None:
             -1.00,
             0.0,
             0.0,
-            10052.50,
+            10047.50,
             "Short",
         ],
         [
@@ -570,7 +577,7 @@ def build_position_id_shared(path: Path) -> None:
             -1.00,
             0.0,
             40.00,
-            10091.50,
+            10086.50,
             "tp 1.10800",
         ],
         [
@@ -585,7 +592,7 @@ def build_position_id_shared(path: Path) -> None:
             -0.50,
             0.0,
             0.0,
-            10091.00,
+            10086.00,
             "Entry C",
         ],
         [
@@ -600,7 +607,7 @@ def build_position_id_shared(path: Path) -> None:
             -0.20,
             0.0,
             4.00,
-            10094.80,
+            10089.80,
             "Partial",
         ],
         # 1004 opens on the same side while 1003 still has 0.06 open. Grouping by
@@ -617,7 +624,7 @@ def build_position_id_shared(path: Path) -> None:
             -0.25,
             0.0,
             0.0,
-            10094.55,
+            10089.55,
             "Overlap Long",
         ],
         [
@@ -632,13 +639,13 @@ def build_position_id_shared(path: Path) -> None:
             -0.25,
             0.0,
             5.00,
-            10099.30,
+            10094.30,
             "tp 1.10800",
         ],
     ]
     stats = [
         ["Gesamtanzahl Trades", 3, "Gewonnene Trades (in % von Gesamt)", "3 (100.00%)"],
-        ["Verlorene Trades (in % von Gesamt)", "0 (0.00%)", "Nettogewinn gesamt", 99.30],
+        ["Verlorene Trades (in % von Gesamt)", "0 (0.00%)", "Nettogewinn gesamt", 94.30],
         ["Anzahl Deals", 10],
     ]
     _write_report(

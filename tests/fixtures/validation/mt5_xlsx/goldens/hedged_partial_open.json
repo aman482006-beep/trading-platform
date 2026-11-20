@@ -72,7 +72,7 @@
       "quantity": 0.1,
       "pnl": -15.0,
       "fees": -1.7,
-      "stop_loss": 1.105,
+      "stop_loss": 1.1035,
       "take_profit": null,
       "exit_reason": "stop_loss",
       "tags": [
