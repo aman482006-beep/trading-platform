@@ -19,18 +19,28 @@ Usage::
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zipfile import ZipFile
 
 from openpyxl import Workbook
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 FIXTURE_DIR = PROJECT_ROOT / "tests" / "fixtures" / "validation" / "mt5_xlsx"
 
-# Fixed document timestamp. Re-running the generator gives identical cell content and
-# goldens; the .xlsx bytes still differ because zip entries carry the write time.
+# Fixed document timestamp. Re-running the generator gives identical cell content,
+# goldens and document timestamps; the .xlsx bytes still differ because zip
+# entries carry the write time. ``dcterms:modified`` is stamped with the wall
+# clock by openpyxl itself, so ``_save_with_fixed_timestamp`` re-pins it from
+# the workbook's value after the save.
 _FIXED_TIME = datetime(2024, 1, 1, 0, 0, 0)
+
+# The one XML element openpyxl overwrites at save time
+# (``openpyxl/writer/excel.py``: ``workbook.properties.modified = now``).
+_CORE_PROPS = "docProps/core.xml"
+_MODIFIED_ELEMENT = re.compile(r"(<dcterms:modified\b[^>]*>)[^<]*(</dcterms:modified>)")
 
 _DEALS_HEADER = [
     "Zeit",
@@ -110,8 +120,39 @@ def _write_report(
     wb.properties.creator = "trading-platform fixture generator"
     wb.properties.created = _FIXED_TIME
     wb.properties.modified = _FIXED_TIME
+    _save_with_fixed_timestamp(wb, path)
+
+
+def _save_with_fixed_timestamp(wb: Workbook, path: Path) -> None:
+    """Save ``wb`` to ``path`` with the timestamp it was given, not the wall clock.
+
+    openpyxl's ``save_workbook`` assigns ``workbook.properties.modified = now``
+    before it writes the package (``openpyxl/writer/excel.py``), so without
+    this the saved workbook's modification date — and therefore the fixture's
+    bytes — depends on when the generator happened to run. The stamp the
+    workbook carries is captured first and written back into the saved
+    ``docProps/core.xml``; every other zip entry is copied unchanged.
+    """
+    fixed_modified = wb.properties.modified
     path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(path)
+    if fixed_modified is None:  # pragma: no cover - the generator always sets one
+        return
+    stamp = f"{fixed_modified.isoformat()}Z"
+    with ZipFile(path) as archive:
+        entries = [(item, archive.read(item.filename)) for item in archive.infolist()]
+    with ZipFile(path, "w") as archive:
+        for item, data in entries:
+            if item.filename == _CORE_PROPS:
+                text, replacements = _MODIFIED_ELEMENT.subn(
+                    lambda match: match.group(1) + stamp + match.group(2),
+                    data.decode("utf-8"),
+                    count=1,
+                )
+                if replacements != 1:
+                    raise ValueError(f"{path.name}: no dcterms:modified in {_CORE_PROPS}")
+                data = text.encode("utf-8")
+            archive.writestr(item, data, compress_type=item.compress_type)
 
 
 def _balance(time: str, number: int, balance: float) -> list[Any]:

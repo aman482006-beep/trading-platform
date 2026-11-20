@@ -56,9 +56,13 @@ def test_regenerated_workbook_matches_committed_cells(name: str, tmp_path: Path)
         assert actual.sheetnames == expected.sheetnames
         assert actual.active.dimensions == expected.active.dimensions
         assert actual.active.title == expected.active.title
-        # The document timestamp must stay fixed, so that the fixture content
-        # does not depend on when it happened to be generated.
+        # The document timestamps must stay fixed, so that the fixture content
+        # does not depend on when it happened to be generated. ``modified`` is
+        # asserted too: openpyxl stamps ``dcterms:modified`` with the save time
+        # when it is not set, and only the fixed assignment keeps a re-run from
+        # embedding the wall clock in the workbook's metadata.
         assert actual.properties.created == expected.properties.created == _FIXED_TIME
+        assert actual.properties.modified == expected.properties.modified == _FIXED_TIME
         assert actual.properties.creator == expected.properties.creator
         assert actual.properties.creator, "the fixture must carry a creator"
         actual_grid = [list(row) for row in actual.active.iter_rows(values_only=True)]
