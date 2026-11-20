@@ -24,7 +24,12 @@ committed comparison cases, plus the remaining limitations.
   `Nettogewinn gesamt` exactly: 21868.81 / 43791.14 / 39255.92 (before, it was
   off by twice the total costs). Matrix rows: **unchanged** — the comparison
   matrix metrics come from the XLSX header stats, not from per-trade fees.
-- Remaining limitations: none known.
+- Remaining limitations:
+  - An unparsable Kommission/Swap cell counts as 0 (and a literal `nan` text
+    cell yields a NaN net); there is no fee-cell guard by maintainer decision,
+    new report formats are verified by reading the report.
+  - Per-exit `fees` in the goldens are `null`, so per-exit cost attribution is
+    not recorded; costs are carried on the trade.
 
 ## #203 — comparison matrix reads MT5 reports on the broker clock
 
