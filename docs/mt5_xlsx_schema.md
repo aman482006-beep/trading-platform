@@ -384,7 +384,6 @@ Jede Exit-Zeile wird zu einem `TradeExit`; es gibt pro Position einen
 4. **Sprachabhängigkeit:** Die Report-Kopf-Begriffe sind deutsch (`Strategietesterbericht`, `Ergebnisse`, `Eröffnungszeit`, etc.). Der Importer sollte auf Spalten-Index-Ebene arbeiten (nicht auf Begriffsebene), um Mehrsprachigkeit zu unterstützen.
 5. **Vorzeichen von Kommission und Swap:** MT5 weist Kosten negativ aus. Die Importer (XLSX und HTML) normalisieren an der Importgrenze: `fees = -(Kommission + Swap)`, also ein positiver Kostenbetrag, und `net_pnl = pnl - fees`. Eine Netto-Swap-Gutschrift ergibt entsprechend eine negative `fees`. Die rohen MT5-Werte stehen weiter vorzeichenbehaftet in `meta.commission` und `meta.swap`. Der MT5-Summenwert `Nettogewinn gesamt` entspricht damit `Σ pnl - Σ fees` (geprüft in `tests/validation/test_golden_reconciliation.py`).
 6. **HTML-Reports:** Der `MT5HTMLImporter` verarbeitet HTML-Strategietester-Berichte mit derselben Fee-Normalisierung (siehe Regel 5), demselben Kopf-Block (`Expertenprogramm`, `Symbol`, `Periode`, `Ersteinlage`, `Hebel`) und demselben Summen-Block (Fixtures unter `tests/fixtures/validation/mt5_html/`). Er unterscheidet sich vom XLSX-Importer in der Auszeichnung (HTML-Tabellen statt einer Tabelle) und in der Zeitzonen-Behandlung: der HTML-Importer kennt keinen `broker_clock`, liest Report-Zeitstempel also nur als Civil-Zone oder UTC.
-
 ---
 
 ## Zusammenfassung

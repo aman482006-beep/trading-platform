@@ -19,18 +19,28 @@ Usage::
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zipfile import ZipFile
 
 from openpyxl import Workbook
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 FIXTURE_DIR = PROJECT_ROOT / "tests" / "fixtures" / "validation" / "mt5_xlsx"
 
-# Fixed document timestamp. Re-running the generator gives identical cell content and
-# goldens; the .xlsx bytes still differ because zip entries carry the write time.
+# Fixed document timestamp. Re-running the generator gives identical cell content,
+# goldens and document timestamps; the .xlsx bytes still differ because zip
+# entries carry the write time. ``dcterms:modified`` is stamped with the wall
+# clock by openpyxl itself, so ``_save_with_fixed_timestamp`` re-pins it from
+# the workbook's value after the save.
 _FIXED_TIME = datetime(2024, 1, 1, 0, 0, 0)
+
+# The one XML element openpyxl overwrites at save time
+# (``openpyxl/writer/excel.py``: ``workbook.properties.modified = now``).
+_CORE_PROPS = "docProps/core.xml"
+_MODIFIED_ELEMENT = re.compile(r"(<dcterms:modified\b[^>]*>)[^<]*(</dcterms:modified>)")
 
 _DEALS_HEADER = [
     "Zeit",
@@ -110,8 +120,39 @@ def _write_report(
     wb.properties.creator = "trading-platform fixture generator"
     wb.properties.created = _FIXED_TIME
     wb.properties.modified = _FIXED_TIME
+    _save_with_fixed_timestamp(wb, path)
+
+
+def _save_with_fixed_timestamp(wb: Workbook, path: Path) -> None:
+    """Save ``wb`` to ``path`` with the timestamp it was given, not the wall clock.
+
+    openpyxl's ``save_workbook`` assigns ``workbook.properties.modified = now``
+    before it writes the package (``openpyxl/writer/excel.py``), so without
+    this the saved workbook's modification date — and therefore the fixture's
+    bytes — depends on when the generator happened to run. The stamp the
+    workbook carries is captured first and written back into the saved
+    ``docProps/core.xml``; every other zip entry is copied unchanged.
+    """
+    fixed_modified = wb.properties.modified
     path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(path)
+    if fixed_modified is None:  # pragma: no cover - the generator always sets one
+        return
+    stamp = f"{fixed_modified.isoformat()}Z"
+    with ZipFile(path) as archive:
+        entries = [(item, archive.read(item.filename)) for item in archive.infolist()]
+    with ZipFile(path, "w") as archive:
+        for item, data in entries:
+            if item.filename == _CORE_PROPS:
+                text, replacements = _MODIFIED_ELEMENT.subn(
+                    lambda match: match.group(1) + stamp + match.group(2),
+                    data.decode("utf-8"),
+                    count=1,
+                )
+                if replacements != 1:
+                    raise ValueError(f"{path.name}: no dcterms:modified in {_CORE_PROPS}")
+                data = text.encode("utf-8")
+            archive.writestr(item, data, compress_type=item.compress_type)
 
 
 def _balance(time: str, number: int, balance: float) -> list[Any]:
@@ -354,7 +395,10 @@ def build_hedged_partial_open(path: Path) -> None:
             "sell",
             _TENTH_FILLED,
             1.1020,
-            1.1050,
+            # The level the closing fill actually hit: deal 7 sells back at
+            # 1.1035 and its comment names that stop. An S/L the price never
+            # reaches (1.1050) contradicts the exit that claims it.
+            1.1035,
             None,
             "2024.01.03 09:00:00",
             "filled",
@@ -498,8 +542,12 @@ def build_position_id_shared(path: Path) -> None:
             304,
             -0.25,
             0.0,
-            15.00,
-            10053.50,
+            # FIFO against this fill's own entry (0.05 @ 1.1010):
+            # (1.1030 - 1.1010) * 0.05 * 100 000 = 10.00. The first exit
+            # already consumed the 1.1000 entry, so this fill cannot book
+            # against it.
+            10.00,
+            10048.50,
             _TP_COMMENT_1_10300,
         ],
         [
@@ -514,7 +562,7 @@ def build_position_id_shared(path: Path) -> None:
             -1.00,
             0.0,
             0.0,
-            10052.50,
+            10047.50,
             "Short",
         ],
         [
@@ -529,7 +577,7 @@ def build_position_id_shared(path: Path) -> None:
             -1.00,
             0.0,
             40.00,
-            10091.50,
+            10086.50,
             "tp 1.10800",
         ],
         [
@@ -544,7 +592,7 @@ def build_position_id_shared(path: Path) -> None:
             -0.50,
             0.0,
             0.0,
-            10091.00,
+            10086.00,
             "Entry C",
         ],
         [
@@ -559,7 +607,7 @@ def build_position_id_shared(path: Path) -> None:
             -0.20,
             0.0,
             4.00,
-            10094.80,
+            10089.80,
             "Partial",
         ],
         # 1004 opens on the same side while 1003 still has 0.06 open. Grouping by
@@ -576,7 +624,7 @@ def build_position_id_shared(path: Path) -> None:
             -0.25,
             0.0,
             0.0,
-            10094.55,
+            10089.55,
             "Overlap Long",
         ],
         [
@@ -591,13 +639,13 @@ def build_position_id_shared(path: Path) -> None:
             -0.25,
             0.0,
             5.00,
-            10099.30,
+            10094.30,
             "tp 1.10800",
         ],
     ]
     stats = [
         ["Gesamtanzahl Trades", 3, "Gewonnene Trades (in % von Gesamt)", "3 (100.00%)"],
-        ["Verlorene Trades (in % von Gesamt)", "0 (0.00%)", "Nettogewinn gesamt", 99.30],
+        ["Verlorene Trades (in % von Gesamt)", "0 (0.00%)", "Nettogewinn gesamt", 94.30],
         ["Anzahl Deals", 10],
     ]
     _write_report(

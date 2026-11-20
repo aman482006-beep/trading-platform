@@ -12,7 +12,6 @@ Arithmetic used throughout (EURUSD, 1 lot = 100 000 units):
 
 Commission and swap are MT5-signed (a cost is negative). ``Trade.fees`` is the positive
 cost: the negated sum of commission and swap over every fill of the position.
-
 Positions in ``hedged_partial_open.xlsx`` (scope = symbol + entry side):
 
 * P1 LONG 0.10 round trip, closed by TP.
@@ -132,7 +131,8 @@ class TestHedgedPartialOpenReport:
         assert t.pnl == pytest.approx(-15.00)
         # MT5: entry -0.70; exit -0.70 commission and -0.30 swap -> fees 1.70
         assert t.fees == pytest.approx(1.70)
-        assert t.stop_loss == pytest.approx(1.1050)
+        # The S/L of the entry order 206, which is the level the closing fill hit.
+        assert t.stop_loss == pytest.approx(1.1035)
         assert t.exit_reason == "stop_loss"
 
     def test_long_quantity_is_p1_plus_p2_only(self, hedged: ValidationReference) -> None:
@@ -228,9 +228,11 @@ class TestPositionIdSharedReport:
         t = shared.trades[0]
         assert [(e.price, e.quantity, e.pnl) for e in t.exits] == [
             (pytest.approx(1.1040), pytest.approx(0.10), pytest.approx(40.00)),
-            (pytest.approx(1.1030), pytest.approx(0.05), pytest.approx(15.00)),
+            # FIFO: this fill's own entry is 0.05 @ 1.1010, so
+            # (1.1030 - 1.1010) * 0.05 * 100 000 = 10.00.
+            (pytest.approx(1.1030), pytest.approx(0.05), pytest.approx(10.00)),
         ]
-        assert t.pnl == pytest.approx(55.00)
+        assert t.pnl == pytest.approx(50.00)
         # MT5 -0.50 -0.25 (entries) and -0.50 -0.25 (exits) -> fees 1.50
         assert t.fees == pytest.approx(1.50)
         assert t.exit_reason == "take_profit"
@@ -281,9 +283,9 @@ class TestPositionIdSharedReport:
     def test_total_pnl_matches_hand_reconciliation(self, shared: ValidationReference) -> None:
         """MT5 net = every out-deal profit + every commission over all fills.
 
-        Profits: 40 (1001) + 15 (1001) + 40 (1002) + 4 (1003 partial) + 5 (1004) = 104.00.
+        Profits: 40 (1001) + 10 (1001) + 40 (1002) + 4 (1003 partial) + 5 (1004) = 99.00.
         Commission: -1.50 (1001) -2.00 (1002) -0.70 (1003) -0.50 (1004) = -4.70.
-        104.00 - 4.70 = 99.30.
+        99.00 - 4.70 = 94.30.
         """
-        assert shared.stats["total_pnl"] == pytest.approx(99.30)
-        assert shared.stats["total_return"] == pytest.approx(0.00993)
+        assert shared.stats["total_pnl"] == pytest.approx(94.30)
+        assert shared.stats["total_return"] == pytest.approx(0.00943)

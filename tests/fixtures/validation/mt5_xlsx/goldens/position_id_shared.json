@@ -11,7 +11,7 @@
       "entry_time": "2024-02-01T09:00:00Z",
       "entry_price": 1.1,
       "quantity": 0.15,
-      "pnl": 55.0,
+      "pnl": 50.0,
       "fees": 1.5,
       "stop_loss": null,
       "take_profit": null,
@@ -32,7 +32,7 @@
           "time": "2024-02-01T13:00:00Z",
           "price": 1.103,
           "quantity": 0.05,
-          "pnl": 15.0,
+          "pnl": 10.0,
           "reason": "take_profit"
         }
       ]
@@ -95,9 +95,9 @@
     "winners": 3,
     "losers": 0,
     "win_rate": 100.0,
-    "total_pnl": 99.3,
+    "total_pnl": 94.3,
     "total_deals": 10,
-    "total_return": 0.00993
+    "total_return": 0.00943
   },
   "position_fills": {
     "closed_position_count": 3,
