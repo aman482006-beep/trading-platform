@@ -9917,7 +9917,7 @@
           "quantity": 2.84,
           "pnl": -206.72,
           "reason": null,
-          "fees": -7.41,
+          "fees": null,
           "tags": []
         }
       ],
