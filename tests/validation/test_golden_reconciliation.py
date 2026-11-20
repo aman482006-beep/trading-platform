@@ -6,8 +6,8 @@ to them in ``stats``. Those summary numbers come from MT5, not from the
 importer, so each identity below checks the importer's trade list against an
 independent source.
 
-The identities are checked against the stored JSON, not against a fresh
-import. The source ``.xlsx`` reports are tracked in
+The identities are checked against the stored JSON; the money fields are
+additionally pinned to a fresh import (``TestGoldensMatchFreshImport``). The source ``.xlsx`` reports are tracked in
 ``strategy-comparisons/intraday_volatility_breakout/``, and
 ``scripts/generate_golden_files.py`` re-imports them to regenerate the goldens,
 so a golden can always be re-derived from its report.
