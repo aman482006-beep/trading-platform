@@ -42,7 +42,10 @@ parent Cleanup 16 record.
   triggers when `high >= take_profit`; mirrored for SHORT. Native records this
   as `stop_trigger_side = "bar_low_high"` and
   `take_profit_trigger_side = "bar_high_low"`.
-- Fill price: the protective **level itself**, not the bar close. When a
+- Fill price: the protective **level itself**, not the bar close — and
+  that holds even when the bar gaps through the level: protective exits
+  are not re-priced to the open on a gap today (gap → open for
+  protective exits is the still-open #208 work). When a
   trailing stop is active, native reports reason `trailing_stop`; otherwise
   `stop_loss`. Native names take-profit exits after the level name (`tp`,
   `tp1`, …); vectorbt and signal replay use `take_profit`. Consumers must
@@ -82,6 +85,68 @@ is one place — `_prepare_next_open_execution_data` keeps the exit leg
 unshifted in vectorbt, and `BacktestConfig.signal_exit_fill` (validated to
 `close`/`open`) selects `open` to fill at the exit bar's open instead for
 MT5-parity runs. Stop/TP exits fill at the level in every engine (§1).
+
+**Explicit exit order type (#243).** A strategy may mark a signal exit with an
+exit-when `exit_order_type` series (signal column or indicator) taking `market`
+or `level` (case-insensitive):
+
+- `market` — the exit fills at the signal-exit convention price
+  (`signal_exit_fill`); any `exit_price` on that bar is ignored for pricing.
+- `level` — the exit fills at the strategy's `exit_price`. A `level` exit
+  without a usable (positive, finite) `exit_price` falls back to the market
+  fill, logs a warning once and flags the trade
+  `meta["exit_level_missing_price"]`.
+- a `level` outside the exit bar's traded range is never booked at the
+  level (`contract.exit_level_disposition`, evaluated on the ask range for
+  a SHORT exit when `ask_ohlc` data is enabled). On the *untraded* side —
+  above the bar's high for a LONG exit, below the low for a SHORT exit —
+  the order could never have filled: it falls back to the market fill,
+  warns once and flags `meta["exit_level_unreachable"]`. On the
+  *marketable* side — below the low for a LONG exit, above the high for a
+  SHORT exit — the resting order was marketable at the open, so under the
+  gap-through-level convention it fills at the bar's **open** and flags
+  `meta["exit_level_gapped"]`. (This is `level`-exit semantics only:
+  protective stop/TP legs fill at their level even on a gap-through —
+  gap → open for them lands with #208.)
+  Direction-specific, like every open fill: a LONG exit sells the bid at
+  the raw open, while a SHORT exit buys the ask at `open + spread` when a
+  spread is configured. With explicit `ask_high`/`ask_low` columns but no
+  `spread_price_col`, reachability is still judged on the ask range while
+  the fill stays the raw open (spread 0) — the same convention every
+  open fill already follows. `level` has **limit-order semantics**: an
+  untraded-side level is "unreachable" and falls back to the market fill.
+  A strategy whose `exit_price` is really a *stop* (e.g. a sell stop
+  above the whole bar after a gap down) should express it through the
+  `stop_loss` legs instead — a stop leg fills at its level whenever the
+  bar trades through it, including on a gap-through (gap → open for
+  protective exits lands with #208), which is the per-bar
+  trigger/fill-at-level behaviour `level` deliberately does not
+  reproduce. This applies to every level fill, explicit `level`
+  and vectorbt's legacy implicit `exit_price` alike.
+- absent or unrecognized — the **legacy fallback** applies per engine:
+  vectorbt treats a usable `exit_price` as a level fill; native fills at the
+  convention price and ignores `exit_price` (an unrecognized non-empty value
+  warns once). PyneCore does not consume the series — its exits are
+  Pine-native orders, re-priced by `_apply_fill_parity` (§5).
+
+Per-engine support for `exit_order_type` / `exit_price` on signal exits:
+
+| engine | `exit_order_type` | `exit_price` without it |
+|---|---|---|
+| native (`TradeEngine`) | `market`/`level` honored; absent/unrecognized → market fill | ignored |
+| vectorbt | `market`/`level` honored; absent/unrecognized → legacy rule | usable value → level fill (legacy) |
+| pynecore | not consumed — Pine-native orders, `_apply_fill_parity` (§5) | n/a |
+| signal_replay | not consumed — replays recorded fills | n/a |
+| lean | not consumed | n/a |
+| live (`live_runner/`) | **not consumed** — every signal exit is a market order, so a strategy emitting `level` diverges between backtest and live | n/a |
+
+The order type is evaluated only on a real exit signal in every consumer: the
+forced end-of-data close fills at the convention price and ignores
+`exit_price`/`exit_order_type` entirely, matching native's `end_of_data`
+close. The parsing lives in `runner.engines.contract`
+(`normalize_exit_order_type`, `usable_exit_price`, `exit_level_disposition`) —
+native and vectorbt read the same spelling table; the other engines listed
+above do not consume the series at all.
 
 **Pynecore CLI bounds.** Pynecore additionally hands each symbol's frame to
 the external `pyne` CLI (`--from`/`--to`). The CLI parses those values with

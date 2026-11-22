@@ -30,7 +30,17 @@ from runner.engine_pkg.orders import Order, OrderType, Position
 from runner.engine_pkg.result import build_indicator_series, build_result
 from runner.engines._shared import resolve_ask_high_low, resolve_bar_spread
 from runner.engines.base import BacktestConfig
-from runner.engines.contract import flag_missing_intrabar, resolve_same_bar_exit
+from runner.engines.contract import (
+    EXIT_LEVEL_GAPPED,
+    EXIT_LEVEL_UNREACHABLE,
+    EXIT_ORDER_TYPE_LEVEL,
+    exit_level_disposition,
+    exit_order_type_is_present,
+    flag_missing_intrabar,
+    normalize_exit_order_type,
+    resolve_same_bar_exit,
+    usable_exit_price,
+)
 from runner.fees import resolve_fee_model
 from shared.models import (
     BacktestResult,
@@ -178,6 +188,7 @@ class TradeEngine:
         self._realized_pnl = 0.0
         self._trade_counter = 0
         self._signals_frame: pd.DataFrame | None = None
+        self._warned_exit_order_keys: set[str] = set()
         self._intrabar = self._prepare_intrabar(intrabar_data)
         self._progress_callback = progress_callback
         self._progress_start = float(progress_start)
@@ -1001,9 +1012,49 @@ class TradeEngine:
         )
         self.closed_trades.append(trade)
 
-    def _close_position(self, row: pd.Series, i: int, reason: str) -> None:
+    def _warn_exit_order_once(self, key: str, message: str, *args: Any) -> None:
+        if key in self._warned_exit_order_keys:
+            return
+        self._warned_exit_order_keys.add(key)
+        logger.warning(message, *args)
+
+    def _close_position(
+        self,
+        row: pd.Series,
+        i: int,
+        reason: str,
+        *,
+        exit_order_type: Any = None,
+        exit_price: Any = None,
+    ) -> None:
         if not self.positions:
             return
+
+        # Explicit exit order type (#243): "level" fills the signal exit at the
+        # strategy's exit_price instead of the convention price; "market" and
+        # an unspecified value keep the legacy market fill (native never read
+        # exit_price before this contract existed).
+        order_type = normalize_exit_order_type(exit_order_type)
+        if order_type is None and exit_order_type_is_present(exit_order_type):
+            self._warn_exit_order_once(
+                "exit_order_type_invalid",
+                "%s: unrecognized exit_order_type value %r; expected 'market' "
+                "or 'level'. Falling back to the market fill.",
+                self.symbol,
+                exit_order_type,
+            )
+        level_exit_price: float | None = None
+        level_missing_price = False
+        if order_type == EXIT_ORDER_TYPE_LEVEL:
+            level_exit_price = usable_exit_price(exit_price)
+            if level_exit_price is None:
+                level_missing_price = True
+                self._warn_exit_order_once(
+                    "exit_level_missing_price",
+                    "%s: exit_order_type='level' but no usable exit_price on "
+                    "the exit bar; falling back to the market fill.",
+                    self.symbol,
+                )
 
         # D4 (Phase 3, A-M1 — implemented): unified Fill-zum-Trigger-Close
         # for signal exits — the exit fills at the trigger bar's close by
@@ -1021,12 +1072,90 @@ class TradeEngine:
         base_exit = float(row["open"]) if fill_at_open else float(row["close"])
         time_iso = self._to_iso(row["timestamp"])
         next_positions: list[Position] = []
+        ask_high, ask_low = self._ask_bar(row)
 
         for position in self.positions:
-            exit_price = base_exit + (spread if position.direction == "SHORT" else 0.0)
+            position_level = level_exit_price
+            level_unreachable = False
+            level_gapped = False
+            if position_level is not None:
+                # A-H4/A-L5: a SHORT exit buys the ask, so reachability is
+                # judged on the ask range when ask-side data is enabled —
+                # the same side _check_stops and _update_equity use.
+                bar_high = row.get("high")
+                bar_low = row.get("low")
+                if position.direction != "LONG":
+                    if ask_high is not None:
+                        bar_high = ask_high
+                    if ask_low is not None:
+                        bar_low = ask_low
+                disposition = exit_level_disposition(
+                    direction=position.direction,
+                    level=position_level,
+                    high=bar_high,
+                    low=bar_low,
+                )
+                if disposition == EXIT_LEVEL_UNREACHABLE:
+                    # A level the exit bar never traded through could not
+                    # have filled — fall back to the market fill rather
+                    # than book a fantasy price.
+                    position_level = None
+                    level_unreachable = True
+                    self._warn_exit_order_once(
+                        "exit_level_unreachable",
+                        "%s: exit_order_type='level' price %.6f is outside the "
+                        "exit bar's traded range; falling back to the market fill.",
+                        self.symbol,
+                        level_exit_price,
+                    )
+                elif disposition == EXIT_LEVEL_GAPPED:
+                    # The level sat beyond the bar on the marketable side:
+                    # the resting order was marketable at the open, so it
+                    # fills at the bar's open (gap-through-level), never at
+                    # the level itself.
+                    position_level = None
+                    level_gapped = True
+                    self._warn_exit_order_once(
+                        "exit_level_gapped",
+                        "%s: exit_order_type='level' price %.6f gapped the "
+                        "exit bar's open; filling at the open instead of the "
+                        "level.",
+                        self.symbol,
+                        level_exit_price,
+                    )
+            if position_level is not None:
+                # A level fill trades at the level itself — no spread, like
+                # the stop/TP legs.
+                fill_price = position_level
+            elif level_gapped:
+                # Gap-through-level: marketable at the open. A SHORT buy
+                # lifts the ask (open + spread); a LONG sell hits the bid.
+                open_value = row.get("open")
+                gap_base = (
+                    float(open_value)
+                    if open_value is not None and pd.notna(open_value)
+                    else float(row["close"])
+                )
+                fill_price = gap_base + (
+                    self._bar_spread(row)
+                    if position.direction != "LONG"
+                    else 0.0
+                )
+            else:
+                fill_price = base_exit + (
+                    spread if position.direction == "SHORT" else 0.0
+                )
+            if level_missing_price:
+                position.meta["exit_level_missing_price"] = True
+            if level_unreachable:
+                position.meta["exit_level_unreachable"] = True
+            if level_gapped:
+                position.meta["exit_level_gapped"] = True
+            if order_type is not None:
+                position.meta["exit_order_type"] = order_type
             self._close_partial(
                 position,
-                price=exit_price,
+                price=fill_price,
                 qty=position.remaining_qty,
                 time_iso=time_iso,
                 reason=reason,
@@ -1558,7 +1687,13 @@ class TradeEngine:
                 self._create_order(merged_row, i, direction)
 
             if bool(exits.iloc[i]):
-                self._close_position(row, i, reason="signal")
+                self._close_position(
+                    row,
+                    i,
+                    reason="signal",
+                    exit_order_type=merged_row.get("exit_order_type"),
+                    exit_price=merged_row.get("exit_price"),
+                )
 
             self._update_equity(row, i)
 
