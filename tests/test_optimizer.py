@@ -1119,6 +1119,29 @@ class TestRiskAdjustedObjective:
         assert value == 100.0
         assert terms == {"sparsity_factor": 1.0, "drawdown_factor": 1.0}
 
+    def test_null_drawdown_gets_maximum_haircut(self) -> None:
+        from runner.optimizer import _risk_adjusted_metric_value
+
+        value, terms = _risk_adjusted_metric_value(
+            100.0,
+            {"total_trades": 30, "max_drawdown_pct": None},
+            metric_key="total_pnl",
+            direction="maximize",
+        )
+        assert value == 0.0
+        assert terms["drawdown_factor"] == 0.0
+
+    def test_missing_drawdown_gets_maximum_haircut(self) -> None:
+        from runner.optimizer import _risk_adjusted_metric_value
+
+        value, terms = _risk_adjusted_metric_value(
+            100.0,
+            {"total_trades": 30},
+            metric_key="total_pnl",
+            direction="maximize",
+        )
+        assert value == 0.0
+        assert terms["drawdown_factor"] == 0.0
     def test_losing_value_passes_through_raw(self) -> None:
         from runner.optimizer import _risk_adjusted_metric_value
 
