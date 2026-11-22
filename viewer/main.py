@@ -1639,46 +1639,10 @@ class PortfoliosDeduplicateRequest(SQLModel):
     ids: list[str] = PydanticField(default_factory=list)
 
 
-_SAFE_ASSET_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
-
-
-def _safe_asset_id(raw_id: object) -> str:
-    """Normalize a client-supplied asset id for file-backed operations.
-
-    Returns an empty string for ids that are blank or that could participate
-    in a path traversal (path separators, ``..`` segments). Ids are only ever
-    joined onto a fixed directory below, and the join is containment-checked
-    again by :func:`_contained_asset_path`.
-    """
-    normalized = str(raw_id or "").strip()
-    if not normalized:
-        return ""
-    if normalized in {".", ".."}:
-        return ""
-    if not _SAFE_ASSET_ID_RE.match(normalized):
-        return ""
-    return normalized
-
-
-def _contained_asset_path(base_dir: Path, asset_id: str, suffix: str) -> Path | None:
-    """Join ``asset_id`` onto ``base_dir`` if the result stays inside it.
-
-    The resolved candidate must be contained in the resolved base directory,
-    otherwise ``None`` is returned so the caller never builds an unlink path
-    from raw input. See :func:`_contained_client_data_file` for the
-    client-path variant of the same containment contract.
-    """
-    normalized = _safe_asset_id(asset_id)
-    if not normalized:
-        return None
-    base = base_dir.resolve()
-    raw_candidate = base_dir / f"{normalized}{suffix}"
-    if raw_candidate.is_symlink():
-        return None
-    candidate = raw_candidate.resolve()
-    if candidate.parent != base:
-        return None
-    return candidate
+# The id→path containment contract lives in ONE place (viewer.core, #230);
+# these aliases keep the historical viewer.main names for routes and tests.
+_safe_asset_id = legacy_viewer._safe_asset_id
+_contained_asset_path = legacy_viewer._contained_asset_path
 
 
 def _contained_client_data_file(
@@ -1917,12 +1881,14 @@ def _load_result(backtest_id: str) -> BacktestResult | None:
     if result is not None:
         return result
 
-    path = BACKTESTS_DIR / f"{backtest_id}.trades.json"
-    if not path.exists():
+    # Containment, not a bare join: the id is a route parameter, and an
+    # unresolved `..`/absolute form must never read outside BACKTESTS_DIR (#230).
+    path = _contained_asset_path(BACKTESTS_DIR, backtest_id, BACKTEST_TRADES_SUFFIX)
+    if path is None or not path.exists():
         return None
 
     try:
-        fallback_result = BacktestResult.load(str(path))
+        fallback_result = BacktestResult.load(path, root=BACKTESTS_DIR)
         save_result_to_sqlite(fallback_result)
         return fallback_result
     except Exception as exc:
@@ -9778,7 +9744,11 @@ async def rename_backtest(backtest_id: str, payload: NameUpdateRequest) -> dict[
 
     result.meta.notes = updated_name
     BACKTESTS_DIR.mkdir(parents=True, exist_ok=True)
-    output_path = BACKTESTS_DIR / f"{backtest_id}.trades.json"
+    # The write side of the same id→path join the loader contains (#230): a
+    # stored row loaded by id must never be written outside BACKTESTS_DIR.
+    output_path = _contained_asset_path(BACKTESTS_DIR, backtest_id, BACKTEST_TRADES_SUFFIX)
+    if output_path is None:
+        raise HTTPException(status_code=400, detail="Invalid backtest id")
     try:
         result.save(output_path)
         save_result_to_sqlite(result)
