@@ -607,6 +607,43 @@ uv run python -m live_runner.daemon 2>&1 | tee "docs/reports/live_daemon_$(date 
 
 Keep the daemon running long enough to verify Discord connection, paper order submission, fill handling, and `reconcile_executions`.
 
+### ACTIVE deployments nothing can trade (#242)
+
+The daemon's only signal path is Discord. A deployment whose `signal_source` is `internal` (the default)
+with status `ACTIVE` has no live strategy runner behind it: it still gets a broker adapter and an execution
+listener, so the dashboard and the listener log make it look live, but it will never place an order. The same
+holds for any stored `signal_source` that is neither `internal` nor `discord`.
+
+The deployment-sync loop alerts this at ERROR, carrying `alert: "untradeable_active_deployment"` and
+`untradeable_reason` in the log `data`, with the id, account and signal source of each affected deployment.
+Where Sentry is configured (a DSN: `initialize_sentry` is a no-op without one), its `LoggingIntegration`
+sends ERROR as an event, so the alert reaches Sentry too — as a field of the record's `data` (an extra on the
+event), not as a Sentry tag, so filter it on `untradeable_reason`/`alert` as event data.
+
+It is not repeated on every tick of the (permanent) sync loop: the first tick of every daemon start reports
+each affected row, and a row is reported again only when its status or signal source changes, so restarting
+or repointing is what you see again. The daemon does not block or stop: the operator stops the row or moves
+it to a Discord signal source.
+
+Both preflights warn for these rows using the same definition
+(`live_runner.deployment_policy.untradeable_signal_source_reason`), so a clean preflight no longer hides
+them, but they see different things:
+
+- **yaml preflight** (`live_runner/preflight.py`): warns for every ACTIVE non-Discord deployment in the
+  `live_deployments.yaml` it validates.
+- **`--check-db` preflight** (`live_runner/preflight_db.py`): reads the ACTIVE rows out of SQLite instead.
+  It warns for an untradeable row whose YAML twin is *tradeable* (Discord) or absent, because the YAML
+  side is then quiet about it; when the twin is itself untradeable the YAML check has already reported
+  the pair and a second warning for the same row would only double-count. A stored `signal_source` outside
+  `KNOWN_SIGNAL_SOURCES` (`internal` plus everything the daemon can trade) still fails this preflight (exit
+  1) rather than warning, because nothing routes the row as configured. Adding a source to the daemon's
+  tradeable set does not make it storable: `LiveDeploymentConfig.signal_source` is a Literal over
+  `internal`/`discord` and the DB read coerces anything else to `internal`, so a new source is a
+  model-and-migration change (`live_runner/deployment_policy.py` says so where the set is defined).
+
+A live strategy runner is a separate decision; until one exists, every `ACTIVE` `internal` row is untradeable by
+design, not by accident.
+
 ## Kill Switch (#300)
 
 One operator action halts trading. It is written to the `live_kill_switch` table of the live
