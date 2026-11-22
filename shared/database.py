@@ -1282,7 +1282,7 @@ def _normalize_task_record(row: Any) -> BackgroundTaskRecord | None:
     if isinstance(row, BackgroundTaskRecord):
         return row
     if hasattr(row, "_mapping"):
-        values = list(getattr(row, "_mapping").values())
+        values = list(row._mapping.values())
         if values:
             return _normalize_task_record(values[0])
         return None
@@ -5873,7 +5873,13 @@ def _scalar_stats_for_save(
         ).where(BacktestRecord.id == backtest_id)
     ).first()
     if row is not None:
-        current.update(zip((name for name, _ in _SCALAR_STAT_COLUMNS), row))
+        # `strict=True` is the invariant the comment above is defending: the
+        # select list and the row are built from the same tuple, so a length
+        # mismatch means a column moved, and failing here is the only way that
+        # does not publish a mislabelled stat.
+        current.update(
+            zip((name for name, _ in _SCALAR_STAT_COLUMNS), row, strict=True)
+        )
     resolved: dict[str, float] = {}
     for name, _default in _SCALAR_STAT_COLUMNS:
         # `default=None` makes "the producer did not name it" and "the producer declared it
@@ -6185,7 +6191,7 @@ def _coerce_backtest_row_id(row: Any) -> str | None:
     if row is None:
         return None
     if hasattr(row, "_mapping"):
-        mapping = getattr(row, "_mapping")
+        mapping = row._mapping
         value = mapping.get("id")
         return str(value) if value else None
     if isinstance(row, (tuple, list)) and row and row[0]:
@@ -6349,7 +6355,7 @@ def _extract_backtest_and_trade_count(row: Any) -> tuple[BacktestRecord | None, 
         return row, 0
 
     if hasattr(row, "_mapping"):
-        values = list(getattr(row, "_mapping").values())
+        values = list(row._mapping.values())
     elif isinstance(row, (tuple, list)):
         values = list(row)
     else:
@@ -6409,7 +6415,7 @@ def list_backtest_fingerprint_rows() -> list[dict[str, Any]]:
     for row in rows:
         backtest = row if isinstance(row, BacktestRecord) else None
         if backtest is None and hasattr(row, "_mapping"):
-            values = list(getattr(row, "_mapping").values())
+            values = list(row._mapping.values())
             if values and isinstance(values[0], BacktestRecord):
                 backtest = values[0]
         if backtest is None and isinstance(row, (tuple, list)) and row and isinstance(row[0], BacktestRecord):
@@ -7041,7 +7047,7 @@ def _unwrap_equity_point_row(raw_row: Any) -> EquityPoint | None:
     if isinstance(raw_row, EquityPoint):
         row = raw_row
     elif hasattr(raw_row, "_mapping"):
-        values = list(getattr(raw_row, "_mapping").values())
+        values = list(raw_row._mapping.values())
         row = values[0] if values else None
     elif isinstance(raw_row, (tuple, list)):
         row = raw_row[0] if raw_row else None
@@ -7187,7 +7193,7 @@ def _equity_preview_query_params(
 
 def _equity_preview_row_fields(row: Any) -> tuple[str, str, Any] | None:
     if hasattr(row, "_mapping"):
-        mapping = getattr(row, "_mapping")
+        mapping = row._mapping
         return (
             str(mapping.get("backtest_id") or "").strip(),
             str(mapping.get("time") or "").strip(),
@@ -7249,7 +7255,7 @@ def _unwrap_model_row(row: Any) -> Any:
     if row is None:
         return None
     if hasattr(row, "_mapping"):
-        mapping = getattr(row, "_mapping")
+        mapping = row._mapping
         values = list(mapping.values())
         return values[0] if values else None
     if isinstance(row, (tuple, list)):
