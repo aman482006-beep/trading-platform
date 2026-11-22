@@ -16,6 +16,70 @@ Status: credential-gated as of 2026-07-13.
   a mode that only comes from the bot's own config default, which is read from the processor the
   deployment runs.
 
+## Ops Alert Channel (#304)
+
+The daemon can push alert-worthy log records to a Discord-compatible webhook so an operator is
+paged instead of only finding problems in the logs. Implementation: `shared/alerts.py`, installed
+by `run_daemon()` at daemon start; importing `live_runner.daemon` does not install the alert sink
+(logging and Sentry setup still happen at import).
+
+Set the variables in the environment the daemon runs with — e.g. exported before start or in the
+sourced `.accounts.env` / a systemd `EnvironmentFile`.
+
+- `OPS_ALERT_WEBHOOK_URL` — webhook URL. **Unset disables alerting entirely**; the daemon then
+  behaves exactly as before. There is no other configuration needed to turn it on.
+- `OPS_ALERT_MAX_PER_MINUTE` (default `12`) — alerts per sliding minute; overflow is dropped and
+  the drop count is folded into the next alert that does go out.
+- `OPS_ALERT_DEDUP_SECONDS` (default `300`) — alerts with the same dedup key inside this window
+  send once. The key is the `data.alert` marker plus the record's `account_id`,
+  `deployment_id`, `service_id` and `symbol` when present — so the same marker on a different
+  deployment is a different alert, but a changed payload (e.g. new mismatch quantities) under the
+  same marker and scope is still suppressed until the window expires. For records without a
+  marker the key is logger + level + message template (not the formatted message) plus the same
+  scope identifiers.
+- `OPS_ALERT_MIN_LEVEL` (default `ERROR`) — minimum level for level-triggered alerts, as a level
+  name (`CRITICAL`) or number. Raise it to `CRITICAL` to page only on emergencies; an explicit
+  `data.alert` marker still bypasses the floor because it is a deliberate operator alert. An
+  invalid value falls back to `ERROR` rather than muting the channel.
+- `OPS_ALERT_EVENTS` (unset = everything) — comma-separated allowlist of event classes. An entry
+  matches a record's `data.alert` marker (e.g. `exit_ledger_mismatch`) or its logger name; when set,
+  only matching records page, so routine errors can be filtered without touching call sites. Logger
+  names match the logging hierarchy: `trading.live-runner` also covers
+  `trading.live-runner.<child>` but not `trading.live-runnerx`. **Markers and `CRITICAL` records
+  always page regardless of the allowlist** — the allowlist exists to filter routine errors, and
+  muting those two would hide real emergencies. Note that today all live modules log under the
+  single logger `trading.live-runner` (`get_logger("live-runner")`), so a logger-name allowlist can
+  only select "the whole live daemon", not one module inside it.
+- `OPS_ALERT_IGNORE` (unset = nothing ignored) — comma-separated denylist of fnmatch patterns
+  (e.g. `poll failed for *`, `*heartbeat*`) matched against the message template and the rendered
+  message. Matching is `fnmatchcase`: case-sensitive, and a pattern cannot itself contain a comma
+  (the comma separates entries). A match drops the record even when it is a `data.alert` marker or
+  `CRITICAL`, so this is the explicit "this one routine error is noise" switch — a broad pattern
+  such as `*failed*` can silently mute the known emergency markers, which is why setting it logs a
+  startup warning. Use it to mute a single noisy ERROR without touching call sites; prefer it over
+  a broad `OPS_ALERT_EVENTS` allowlist.
+
+The effective filter (min level, allowlist, denylist) is logged once at startup on the
+`trading.alerts` logger, and setting `OPS_ALERT_EVENTS` or `OPS_ALERT_IGNORE` additionally logs a
+warning — a filter that matches nothing, or a denylist wide enough to mute the emergency markers,
+would otherwise leave the channel silently dead or silently mute.
+
+What is alerted: every `ERROR`/`CRITICAL` record (or whatever `OPS_ALERT_MIN_LEVEL` sets), plus
+any record carrying `data.alert` (the explicit operator-alert marker, e.g. `exit_ledger_mismatch`)
+at any level — `data.alert` markers route even when `LOG_LEVEL` would keep the record out of the
+file/console output — then filtered by `OPS_ALERT_IGNORE` and, for routine errors only,
+`OPS_ALERT_EVENTS`.
+
+Guarantees: the sink is fire-and-forget on a bounded queue (256 alerts). A full queue or a slow
+webhook drops and counts alerts; it can never block or raise into a trading path. A failed send
+(e.g. a Discord 429 or 5xx) is counted and logged on the `trading.alerts` logger, not retried — a single
+lost alert is accepted for v1 rather than risking a retry storm against a struggling webhook.
+The sink's own logger (`trading.alerts`) never pages, so a failing webhook cannot feed alerts
+back into the channel.
+Payloads are
+redacted with the same rules as the JSON log formatter before they leave the process. Only the
+live daemon installs the sink today; other entry points are unaffected.
+
 ## Live Trailing Stops
 
 Central definition: `shared/trailing.py` (`LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER`). Execution:

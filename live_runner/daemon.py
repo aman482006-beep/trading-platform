@@ -121,6 +121,7 @@ from risk.live import (
 )
 from risk.models import realized_risk_amount, realized_risk_percent
 from scheduler.scheduler import ServiceScheduler
+from shared.alerts import SHUTDOWN_FLUSH_SECONDS, close_alert_sink, install_alert_sink
 from shared.constants import normalize_timeframe
 from shared.database import (
     LIVE_DISPATCH_ENTRY_STATUSES,
@@ -6181,132 +6182,163 @@ async def run_daemon(
     *,
     accounts_env: Path | str | None = None,
 ) -> None:
-    accounts_env = _accounts_env_file(accounts_env)
-    logger.info(
-        "Starting live daemon",
-        extra={"data": {"accounts_env": str(accounts_env)}},
-    )
-    # The loss breaker resolves LOSS_BREAKER_* env file-first through the same
-    # accounts file the daemon was started with; without this a per-account
-    # override in a non-default --accounts-env file would be silently ignored.
-    set_accounts_env_file(accounts_env)
-    active_adapters: dict[str, BaseLiveAdapter] = {}
-    active_listener_tasks: dict[str, asyncio.Task[None]] = {}
-    active_discord_tasks: dict[str, asyncio.Task[None]] = {}
-    active_discord_bots: dict[str, DiscordSignalSource] = {}
-    active_discord_bot_tasks: dict[str, asyncio.Task[None]] = {}
-    scheduler = ServiceScheduler()
-
-    await asyncio.to_thread(_discover_and_register_discord_services, accounts_env, log_summary=True)
-    await asyncio.to_thread(_recover_failed_services)
-    await scheduler.start()
-
-    deployment_snapshot: list[LiveDeploymentConfig] = []
-    sync_task = asyncio.create_task(
-        sync_deployments_loop(
-            active_adapters,
-            active_listener_tasks,
-            active_discord_tasks,
-            accounts_env=accounts_env,
-            deployment_snapshot=deployment_snapshot,
-        ),
-        name="deployment-sync-loop",
-    )
-    service_sync_task = asyncio.create_task(
-        sync_services_loop(
-            active_discord_bots,
-            active_discord_bot_tasks,
-            scheduler,
-            accounts_env=accounts_env,
-        ),
-        name="service-sync-loop",
-    )
-    balance_task = _start_balance_poller(active_adapters, deployment_snapshot)
-    trailing_task = asyncio.create_task(
-        run_trailing_stops_loop(
-            LiveTrailingStopManager(),
-            eligible_adapters=lambda: _trailing_eligible_adapters(active_adapters),
-            current_deployments=lambda: list(deployment_snapshot),
-        ),
-        name="trailing-stops-loop",
-    )
-    commission_task = asyncio.create_task(
-        _backfill_commissions_loop(active_adapters), name="commission-backfill"
-    )
+    # Ops alert channel (#304): ERROR records and explicit `alert=` records are
+    # pushed to OPS_ALERT_WEBHOOK_URL when configured; unset disables it and the
+    # daemon behaves exactly as before. Installed here rather than at import so
+    # tools that merely import daemon helpers (--help, smoke scripts, tests)
+    # stay free of the worker thread and webhook side effects. Fire-and-forget:
+    # it cannot block or raise into the trading paths.
+    install_alert_sink()
     try:
-        await asyncio.gather(
-            sync_task, service_sync_task, balance_task, trailing_task, commission_task
+        accounts_env = _accounts_env_file(accounts_env)
+        logger.info(
+            "Starting live daemon",
+            extra={"data": {"accounts_env": str(accounts_env)}},
         )
-    except asyncio.CancelledError:
-        logger.info("Live daemon cancelled")
-        raise
-    except Exception as exc:  # except-kind: money-decision
-        logger.exception("Live daemon crashed")
-        with contextlib.suppress(Exception):
-            capture_exception(
-                exc,
-                service_name="live-runner",
-                context={"component": "live_daemon", "phase": "run_daemon"},
+        # The loss breaker resolves LOSS_BREAKER_* env file-first through the same
+        # accounts file the daemon was started with; without this a per-account
+        # override in a non-default --accounts-env file would be silently ignored.
+        set_accounts_env_file(accounts_env)
+        active_adapters: dict[str, BaseLiveAdapter] = {}
+        active_listener_tasks: dict[str, asyncio.Task[None]] = {}
+        active_discord_tasks: dict[str, asyncio.Task[None]] = {}
+        active_discord_bots: dict[str, DiscordSignalSource] = {}
+        active_discord_bot_tasks: dict[str, asyncio.Task[None]] = {}
+        scheduler = ServiceScheduler()
+
+        try:
+            await asyncio.to_thread(
+                _discover_and_register_discord_services, accounts_env, log_summary=True
             )
-        raise
-    finally:
-        # B2: cancel EVERYTHING (sync + balance loops leaked before) and
-        # await the cancels — fire-and-forget cancel() leaves pending tasks
-        # and "Task was destroyed" warnings behind.
-        for task in (
-            sync_task,
-            service_sync_task,
-            balance_task,
-            trailing_task,
-            commission_task,
-        ):
-            if not task.done():
-                task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.to_thread(_recover_failed_services)
+            await scheduler.start()
+
+            deployment_snapshot: list[LiveDeploymentConfig] = []
+            sync_task = asyncio.create_task(
+                sync_deployments_loop(
+                    active_adapters,
+                    active_listener_tasks,
+                    active_discord_tasks,
+                    accounts_env=accounts_env,
+                    deployment_snapshot=deployment_snapshot,
+                ),
+                name="deployment-sync-loop",
+            )
+            service_sync_task = asyncio.create_task(
+                sync_services_loop(
+                    active_discord_bots,
+                    active_discord_bot_tasks,
+                    scheduler,
+                    accounts_env=accounts_env,
+                ),
+                name="service-sync-loop",
+            )
+            balance_task = _start_balance_poller(active_adapters, deployment_snapshot)
+            trailing_task = asyncio.create_task(
+                run_trailing_stops_loop(
+                    LiveTrailingStopManager(),
+                    eligible_adapters=lambda: _trailing_eligible_adapters(
+                        active_adapters
+                    ),
+                    current_deployments=lambda: list(deployment_snapshot),
+                ),
+                name="trailing-stops-loop",
+            )
+            commission_task = asyncio.create_task(
+                _backfill_commissions_loop(active_adapters), name="commission-backfill"
+            )
+        except Exception:  # except-kind: money-decision
+            # A startup failure (broken DB, bad config) propagates out of
+            # asyncio.run as a traceback, not an ERROR record — log one here so
+            # the alert sink can page on the very failure an operator needs.
+            logger.exception("Live daemon failed to start")
+            raise
+        try:
             await asyncio.gather(
+                sync_task, service_sync_task, balance_task, trailing_task, commission_task
+            )
+        except asyncio.CancelledError:
+            logger.info("Live daemon cancelled")
+            raise
+        except Exception as exc:  # except-kind: money-decision
+            logger.exception("Live daemon crashed")
+            with contextlib.suppress(Exception):
+                capture_exception(
+                    exc,
+                    service_name="live-runner",
+                    context={"component": "live_daemon", "phase": "run_daemon"},
+                )
+            raise
+        finally:
+            # B2: cancel EVERYTHING (sync + balance loops leaked before) and
+            # await the cancels — fire-and-forget cancel() leaves pending tasks
+            # and "Task was destroyed" warnings behind.
+            for task in (
                 sync_task,
                 service_sync_task,
                 balance_task,
                 trailing_task,
                 commission_task,
-                return_exceptions=True,
-            )
-        for task in list(active_listener_tasks.values()):
-            if not task.done():
-                task.cancel()
-        for task in list(active_discord_tasks.values()):
-            if not task.done():
-                task.cancel()
-        for task in list(active_discord_bot_tasks.values()):
-            if not task.done():
-                task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await asyncio.gather(
-                *list(active_listener_tasks.values()),
-                *list(active_discord_tasks.values()),
-                *list(active_discord_bot_tasks.values()),
-                return_exceptions=True,
-            )
-        for source in list(active_discord_bots.values()):
+            ):
+                if not task.done():
+                    task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.gather(
+                    sync_task,
+                    service_sync_task,
+                    balance_task,
+                    trailing_task,
+                    commission_task,
+                    return_exceptions=True,
+                )
+            for task in list(active_listener_tasks.values()):
+                if not task.done():
+                    task.cancel()
+            for task in list(active_discord_tasks.values()):
+                if not task.done():
+                    task.cancel()
+            for task in list(active_discord_bot_tasks.values()):
+                if not task.done():
+                    task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.gather(
+                    *list(active_listener_tasks.values()),
+                    *list(active_discord_tasks.values()),
+                    *list(active_discord_bot_tasks.values()),
+                    return_exceptions=True,
+                )
+            for source in list(active_discord_bots.values()):
+                with contextlib.suppress(Exception):
+                    await source.disconnect(failed=False)
+            # #308: flush the raw-signal archive last - records still queued by
+            # the just-cancelled listeners must reach disk before exit. Off the
+            # event loop: close() joins the writer thread.
+            try:
+                await asyncio.to_thread(get_signal_archive().close, timeout=5.0)
+            except Exception:  # except-kind: loop-survival
+                logger.warning(
+                    "Signal archive close failed during shutdown",
+                    exc_info=True,
+                )
             with contextlib.suppress(Exception):
-                await source.disconnect(failed=False)
-        # #308: flush the raw-signal archive last — records still queued by
-        # the just-cancelled listeners must reach disk before exit. Off the
-        # event loop: close() joins the writer thread.
+                await scheduler.stop()
+            logger.info(
+                "Stopping live daemon",
+                extra={
+                    "data": {
+                        "active_listener_tasks": len(active_listener_tasks),
+                        "active_discord_tasks": len(active_discord_tasks),
+                        "active_discord_bot_tasks": len(active_discord_bot_tasks),
+                    }
+                },
+            )
+    finally:
+        # Flush queued alerts (bounded): the shutdown/crash/startup-failure
+        # ERROR records are the ones most likely to be sitting in the queue.
+        # Covers startup failures too, where the task-cleanup finally above
+        # never ran.
         with contextlib.suppress(Exception):
-            await asyncio.to_thread(get_signal_archive().close, timeout=5.0)
-        with contextlib.suppress(Exception):
-            await scheduler.stop()
-        logger.info(
-            "Stopping live daemon",
-            extra={
-                "data": {
-                    "active_listener_tasks": len(active_listener_tasks),
-                    "active_discord_tasks": len(active_discord_tasks),
-                    "active_discord_bot_tasks": len(active_discord_bot_tasks),
-                }
-            },
-        )
+            close_alert_sink(timeout=SHUTDOWN_FLUSH_SECONDS)
 
 
 def main() -> None:
