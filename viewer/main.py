@@ -1451,6 +1451,12 @@ class BacktestRunSignalsRequest(SQLModel):
     max_position_pct: float | None = None
     max_positions: int | None = None
     auto_download: bool = True
+    # #361/#84: the replay adapter fails closed without an explicit fee
+    # declaration; the viewer requires the caller to declare costs up front —
+    # fees_zero for a conscious no-cost run, or fee_rate/fee_flat_per_trade.
+    fee_rate: float | None = None
+    fee_flat_per_trade: float | None = None
+    fees_zero: bool = False
 
 
 class BacktestRunFromSignalsRequest(SQLModel):
@@ -1466,6 +1472,9 @@ class BacktestRunFromSignalsRequest(SQLModel):
     max_position_pct: float | None = None
     max_positions: int | None = None
     auto_download: bool = True
+    fee_rate: float | None = None
+    fee_flat_per_trade: float | None = None
+    fees_zero: bool = False
 
 
 class PortfolioStrategyConfig(SQLModel):
@@ -11454,6 +11463,54 @@ def _validated_signal_replay_request(
     )
 
 
+def _validated_signal_replay_fee_params(payload: BacktestRunSignalsRequest) -> dict[str, Any]:
+    """Resolve the replay fee declaration (#361), failing closed like #84.
+
+    ``SignalReplayAdapter.run`` refuses to run without an explicit fee model
+    (``resolve_fee_model`` raises on missing config), so the viewer requires
+    the caller to declare costs in the request — ``fees_zero`` for a conscious
+    no-cost run, or ``fee_rate``/``fee_flat_per_trade`` mirroring the CLI
+    flags — instead of letting every replay task die inside the worker with a
+    config error. The flags conflict exactly like ``--fees-zero`` does on the
+    CLI.
+    """
+    fee_rate = payload.fee_rate
+    fee_flat_per_trade = payload.fee_flat_per_trade
+    # #361: reject negative/NaN/inf declarations here — ``resolve_fee_model``
+    # clamps negatives to 0.0 downstream, which would turn a declared cost into
+    # a silent zero-cost run (and inf into non-finite fees).
+    for field_name, value in (
+        ("fee_rate", fee_rate),
+        ("fee_flat_per_trade", fee_flat_per_trade),
+    ):
+        if value is not None and (not math.isfinite(float(value)) or float(value) < 0.0):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{field_name} must be a finite, non-negative number",
+            )
+    if payload.fees_zero:
+        if fee_rate is not None or fee_flat_per_trade is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="fees_zero conflicts with fee_rate/fee_flat_per_trade",
+            )
+        return {"fees": "zero"}
+    fee_params: dict[str, Any] = {}
+    if fee_rate is not None:
+        fee_params["fee_rate"] = float(fee_rate)
+    if fee_flat_per_trade is not None:
+        fee_params["fee_flat_per_trade"] = float(fee_flat_per_trade)
+    if not fee_params:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "fee configuration required: pass fee_rate/fee_flat_per_trade "
+                "or fees_zero=true (#84 fail-closed)"
+            ),
+        )
+    return fee_params
+
+
 def _register_signal_replay_task(
     *,
     payload: BacktestRunSignalsRequest,
@@ -11468,6 +11525,7 @@ def _register_signal_replay_task(
     timeframe: str,
     start_dt: datetime,
     end_dt: datetime,
+    fee_params: dict[str, Any],
 ) -> tuple[str, Any, int]:
     """Create the replay task record, restart config and job placeholder."""
     task_id = str(uuid.uuid4())[:8]
@@ -11505,6 +11563,7 @@ def _register_signal_replay_task(
             "max_positions": max_positions,
             "signal_processor": signal_processor_name or None,
             "signal_count": len(normalized_signals),
+            "fee_params": dict(fee_params),
         },
     )
     _running_jobs[task_id] = {
@@ -11577,6 +11636,10 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
         max_position_pct,
         max_positions,
     ) = _validated_signal_replay_request(payload)
+    # #361: resolve the fee declaration BEFORE registering the task — a
+    # missing/conflicting declaration is a 400, not a task that dies in the
+    # worker on the adapter's fail-closed fee check.
+    fee_params = _validated_signal_replay_fee_params(payload)
 
     default_timeframe = requested_timeframe or "1h"
     normalized_signals, replay_source_label = await _gather_replay_signals(
@@ -11597,7 +11660,6 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
     symbols = sorted({str(item["symbol"]).strip().upper() for item in normalized_signals})
     start_str = start_dt.date().isoformat()
     end_str = end_dt.date().isoformat()
-    symbols = sorted({str(item["symbol"]).strip().upper() for item in normalized_signals})
     task_id, log_file, stage_total = _register_signal_replay_task(
         payload=payload,
         symbols=symbols,
@@ -11611,24 +11673,9 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
         timeframe=timeframe,
         start_dt=start_dt,
         end_dt=end_dt,
+        fee_params=fee_params,
     )
     _set_task_status(task_id, "queued")
-    _update_task_fields(
-        task_id,
-        restart_config={
-            "signal_source": replay_source_label,
-            "account_id": account_id,
-            "start_date": start_str,
-            "end_date": end_str,
-            "timeframe": timeframe,
-            "capital": float(payload.capital or 100000.0),
-            "risk_per_trade_pct": risk_per_trade_pct,
-            "max_position_pct": max_position_pct,
-            "max_positions": max_positions,
-            "signal_processor": signal_processor_name or None,
-            "signal_count": len(normalized_signals),
-        },
-    )
     _register_job(
         task_id,
         {
@@ -11739,6 +11786,7 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
                     initial_capital=float(payload.capital or 100000.0),
                     default_timeframe=timeframe,
                     signal_processor_name=signal_processor_name or None,
+                    fee_params=fee_params,
                 )
                 result = adapter.run(
                     signals=replay_signals,
@@ -11751,6 +11799,9 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
                         "signal_processor": signal_processor_name or None,
                         "account_id": account_id or None,
                         "signal_count": len(replay_signals),
+                        # The adapter merges metadata into BacktestMeta.parameters,
+                        # so the saved result records which cost model produced it.
+                        "fee_params": dict(fee_params),
                     },
                     progress_callback=lambda percent, _message: report_stage(
                         handle,
@@ -11886,7 +11937,12 @@ async def _load_and_filter_csv_signals(
     "/api/backtests/run-from-signals",
     status_code=202,
     responses={
-        400: {"description": "Invalid signal_source, filepath, date range or no replayable signals"},
+        400: {
+            "description": (
+                "Invalid signal_source, filepath, date range, missing/conflicting "
+                "fee declaration, or no replayable signals"
+            )
+        },
         403: {"description": "Signal CSV is outside the OHLCV data directory"},
     },
 )
@@ -11905,6 +11961,9 @@ async def run_backtest_from_signals(payload: BacktestRunFromSignalsRequest) -> d
             max_position_pct=payload.max_position_pct,
             max_positions=payload.max_positions,
             auto_download=payload.auto_download,
+            fee_rate=payload.fee_rate,
+            fee_flat_per_trade=payload.fee_flat_per_trade,
+            fees_zero=payload.fees_zero,
         )
         return await run_backtest_signals(replay_payload)
 
@@ -11952,6 +12011,9 @@ async def run_backtest_from_signals(payload: BacktestRunFromSignalsRequest) -> d
         max_position_pct=payload.max_position_pct,
         max_positions=payload.max_positions,
         auto_download=payload.auto_download,
+        fee_rate=payload.fee_rate,
+        fee_flat_per_trade=payload.fee_flat_per_trade,
+        fees_zero=payload.fees_zero,
     )
     return await run_backtest_signals(replay_payload)
 
