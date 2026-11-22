@@ -139,16 +139,19 @@ def _risk_adjusted_metric_value(
         trade_count = int(stats.get("total_trades", 0) or 0)
     except (TypeError, ValueError):
         trade_count = 0
+    raw_max_dd = stats.get("max_drawdown_pct")
     try:
-        max_dd = abs(float(stats.get("max_drawdown_pct", 0.0) or 0.0))
+        max_dd = abs(float(raw_max_dd))
+        drawdown_known = math.isfinite(max_dd)
     except (TypeError, ValueError):
         max_dd = 0.0
-    if not math.isfinite(max_dd):
+        drawdown_known = False
+    if not drawdown_known:
         max_dd = 0.0
     # Pre-mortem T3: stats publish drawdown as a FRACTION (e.g. 0.05, not
     # 5.0). Percent-scale input would silently zero every trial via the
     # min(max_dd, 1.0) clamp — fail loud instead.
-    if max_dd > 1.0:
+    if drawdown_known and max_dd > 1.0:
         raise ValueError(
             f"max_drawdown_pct {max_dd} looks percent-scaled; expected a fraction <= 1.0."
         )
@@ -156,7 +159,13 @@ def _risk_adjusted_metric_value(
         0.0,
         min(1.0, trade_count / max(int(min_trades_for_full_credit), 1)),
     )
-    drawdown_factor = max(0.0, 1.0 - min(max_dd, 1.0) * max(drawdown_penalty_weight, 0.0))
+    # Unknown drawdown data must not be treated as a risk-free run. Missing,
+    # null, invalid, or non-finite values receive the maximum haircut.
+    drawdown_factor = (
+        max(0.0, 1.0 - min(max_dd, 1.0) * max(drawdown_penalty_weight, 0.0))
+        if drawdown_known
+        else 0.0
+    )
     terms = {"sparsity_factor": sparsity, "drawdown_factor": drawdown_factor}
     return value * sparsity * drawdown_factor, terms
 
