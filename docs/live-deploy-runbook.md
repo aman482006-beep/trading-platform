@@ -330,6 +330,129 @@ clean-up.
   `held`, with the new `stop_price`; the parent's `legs` then show the new stop and the unchanged
   take-profit leg. Through the adapter the stop moved 11.35 -> 11.52 with the take profit intact.
 
+## Internal strategy live runner (#348)
+
+ACTIVE deployments with `signal_source`/`signal_source_type` = `internal` are
+evaluated by `live_runner/internal_strategy_runner.py` (daemon task
+`internal-strategy-loop`, 15 s tick). Discord deployments are unaffected —
+their signals still arrive through the channel listeners.
+
+**Opt-in.** An internal deployment is only evaluated when
+`settings["internal_runner_enabled"]` is explicitly truthy (`true`, `1`,
+`yes`, `on`). Deployments that predate the runner stay inert until an
+operator sets the flag per deployment — there is no way to distinguish a
+pre-existing ACTIVE row from a new one, so the flag gates all of them.
+
+**Risk policy (maintainer decision 2026-11-22).**
+
+- An entry with **no take-profit level** is allowed: it is stamped
+  `take_profit_policy=unbounded_exit_on_opposite_signal`, so the strategy's
+  own `exits` signals are its exit mechanism — matching the backtest. A stop
+  is still required.
+- An entry with **no stop loss** gets a broker stop at the engine's fallback
+  distance (`fallback_stop_pct` of the entry price — the same fallback the
+  engine uses for sizing). Live never runs unprotected.
+- Entries per symbol are capped by `settings["internal_max_open_per_symbol"]`
+  (falling back to a same-named `STRATEGY_META` parameter): **default 1 open
+  position per deployment+symbol**. Only `1` is accepted today — N>1 is not
+  supported end-to-end (per-position sizing, protection and exits on the
+  qty-netted live ledger are unresolved; maintainer decision 2026-11-22:
+  N=1, N>1 is #382), so any other value fails closed: **entries are disabled
+  for the deployment but exits keep flowing** — a bad cap must never
+  suppress an exit on an open position. Open positions are counted from the
+  deployment's own persisted ledger with oldest-first FIFO attribution of
+  reducing fills; an entry with no fills counts only while the broker still
+  lists its order as working or holds a non-zero position in the symbol
+  (a filled-but-unbooked entry is not working, so the position is what
+  proves it open), so a canceled or expired unfilled order does not lock
+  the symbol. The count is updated within a pass so same-pass signals
+  cannot exceed the cap, and the deployment total is capped at the engine
+  maximum of 5. If the ledger, the broker's working-order list or its
+  positions cannot be read, entries fail closed the same way — exits still
+  evaluate.
+  A same-bar reversal (exit + new entry on one bar) emits the exit but the
+  entry waits one bar: the closing position still counts against the cap
+  until the next evaluation.
+  **Known window:** an entry that reached `adapter.submit_order` but whose
+  `broker_order_id` was never persisted (a crash between the broker accept
+  and the write, or a lost submit response) carries only its signal id — no
+  broker order id and no fills yet. While the broker's position in the
+  symbol is flat *and* the order is no longer working, that row counts as 0
+  open entries, so a same-symbol entry could be submitted in that window.
+  The window closes as soon as either the fill is booked or the broker
+  position goes non-zero; there is no persisted "submitted" marker on the
+  signal row to close it earlier (#360 review).
+- **Session-bound symbols** (anything the venue calendar does not resolve to
+  24/7) are only *actioned* while the venue is open, using
+  `shared.venue_calendar`. Daily-and-longer bars may be held over the market
+  close; a bar whose data runs into the session close becomes actionable at
+  the next session open, matching the engine's next-bar-open fill. A bar
+  counts when it *overlaps* a trading interval, not when it opens inside
+  one — a 09:00 ET hourly bar is regular-hours data for its 09:30-10:00
+  portion. Session logic gates actionability, never the indicator input:
+  intraday strategies see every nominally closed feed bar, including
+  extended-hours bars, matching the unfiltered backtest dataset. Bars with
+  no session overlap produce no signals, and an unresolvable venue calendar
+  fails closed.
+
+**What runs.** For each deployment symbol the runner fetches bars through the
+adapter's existing `get_market_data` (no new network client; an adapter that
+cannot serve bars for the timeframe fails closed and the deployment is
+skipped), keeps only *closed* bars, and calls the deployment strategy's own
+`generate_signals(df, params)` through the native engine's
+`_call_strategy`/`_normalize_strategy_output`/`_resolve_direction`/
+`_extract_levels` — the same code path a backtest uses, with
+`STRATEGY_META["parameters"]` defaults (per-deployment
+`settings.strategy_parameters` stays refused, exactly as the promotion gate
+binds it). Up to 1000 bars of history are requested per evaluation, which
+bounds indicator warmup; a strategy needing deeper history than the feed
+serves cannot be evaluated faithfully.
+
+**Timing contract.** The native engine evaluates a signal on bar T's close,
+records T's `close` as the entry reference, and fills the resulting market
+order at the *next* bar's open; signal exits fill at the trigger bar's close.
+Live maps this to: evaluate on the just-closed bar T and submit immediately —
+the broker fill lands at (or very near) the open of bar T+1 for entries, and
+at approximately T's close for exits. Sizing geometry uses T's `close`, the
+same reference the engine records. A signal is only actionable while bar T+1
+is still forming (30 s grace plus a feed-lag allowance of
+`min(120 s, 10% of the bar)`, measured from the bar's session-aware close —
+never a full extra bar); an older bar is stale and is
+never traded. Bars that closed while the daemon was down are stale by
+definition: only the newest closed bar is actionable after a restart, and
+missed bars are never backfilled with orders. Missing, malformed, unclosed or
+out-of-window bars fail closed — no order is emitted.
+
+**Orders.** Emitted intents go through the daemon's
+`_submit_internal_strategy_signal` → `_trade_signal_to_live_signal` →
+`_prepare_claim_and_submit_signal`, the same prepare/claim/submit path as
+Discord signals: live level resolution, risk sizing, the SL/TP guard, the
+promotion gate, the demo/paper hard block, the submission lease and adapter
+persistence all apply unchanged. A strategy `exits` row becomes a
+reduce-only `FULL_EXIT` against the deployment's own ledger quantity — it can
+never open or extend a position. A `SHORT` entry on a deployment without
+`allow_short` is skipped (it must not be reinterpreted as an exit). Entries
+carrying more than one take-profit level — or a single partial (`tp_pct` /
+`fraction < 1`) level — are skipped: the live bracket carries a single
+full-size TP and emitting only the first would silently drop the native
+partial-exit ladder. Entries carrying engine sizing-only stop fields
+(`sizing_sl_price`/`sizing_stop`/`sizing_sl`/`stop_distance`) are likewise
+skipped — the live path cannot reproduce the engine's sizing math. A
+`signal_processor` configuration is refused outright: processors are a
+Discord-pipeline concept the internal path never runs. An entry with no TP
+level is emitted with the unbounded-TP policy above; an entry with no stop
+gets the fallback-distance broker stop, so the daemon's SL/TP guard always
+sees a real stop. A *stale* exit is skipped like a stale entry — with the
+unbounded-TP policy the position is then held until the fallback stop or
+the next exit signal.
+
+**Idempotency.** Each emitted intent carries a producer-stable
+`metadata.idempotency_key` derived from deployment, symbol, timeframe, bar
+close and intent kind. Within a process the runner tracks the newest
+processed bar per deployment+symbol; across a restart the same closed bar
+re-evaluates to the same key, and the adapter's `save_live_signal` dedupe
+returns the persisted row instead of placing a second broker order.
+
 ## Periodic Broker Reconciliation (#303)
 
 The daemon runs `live_runner/broker_reconciliation.py` on the deployment sync

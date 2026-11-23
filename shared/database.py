@@ -7,7 +7,7 @@ import os
 import re
 import subprocess
 import threading
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -38,7 +38,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 from sqlmodel.sql.expression import SelectOfScalar
 
-from shared.alpaca_symbols import classify_alpaca_symbol
+from shared.alpaca_symbols import classify_alpaca_symbol, crypto_pair_key
 from shared.constants import DATA_DIR as RESOLVED_DATA_DIR
 from shared.constants import normalize_symbols
 from shared.fill_keys import canonical_utc_timestamp
@@ -4020,6 +4020,213 @@ def get_live_deployment_net_filled_qty(deployment_id: str, symbol: str) -> float
                 f"({normalized_symbol}) has no known position sign; refusing to size an exit."
             )
     return net
+
+
+def list_live_deployment_unfilled_entry_order_refs(deployment_id: str) -> set[str]:
+    """Order references of this deployment's entries that have no fills yet (#360).
+
+    Returns every broker order id *and* signal id (the broker's client order
+    id is the canonical signal id) carried by entry signals whose persisted
+    fill quantity is at most ``_EXIT_FILL_TOLERANCE``. Only the broker can say
+    whether such an order is still working or dead, so the caller asks for the
+    working-order list only when this set is non-empty.
+    """
+    normalized_deployment_id = str(deployment_id or "").strip()
+    if not normalized_deployment_id:
+        raise ValueError("A deployment id is required for the unfilled entry refs")
+    init_db()
+    with get_session() as session:
+        signal_rows = session.exec(
+            select(
+                LiveSignalModel.id,
+                LiveSignalModel.symbol,
+                LiveSignalModel.broker_order_id,
+                LiveSignalModel.source,
+                LiveSignalModel.metadata_json,
+            ).where(LiveSignalModel.deployment_id == normalized_deployment_id)
+        ).all()
+        fill_rows = session.exec(
+            select(
+                LiveExecutionModel.signal_id,
+                func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0),
+            )
+            .join(LiveSignalModel, LiveExecutionModel.signal_id == LiveSignalModel.id)
+            .where(LiveSignalModel.deployment_id == normalized_deployment_id)
+            .group_by(LiveExecutionModel.signal_id)
+        ).all()
+    filled_by_signal = {str(signal_id): float(filled or 0.0) for signal_id, filled in fill_rows}
+
+    refs: set[str] = set()
+    for signal_id, symbol, broker_order_id, source, metadata in signal_rows:
+        if not str(symbol or "").strip():
+            continue
+        metadata_dict = metadata if isinstance(metadata, dict) else {}
+        is_close = (
+            _is_exit_only_signal_metadata(metadata_dict)
+            or str(source or "") == BROKER_CLOSE_SIGNAL_SOURCE
+        )
+        if is_close:
+            continue
+        if filled_by_signal.get(str(signal_id), 0.0) > _EXIT_FILL_TOLERANCE:
+            continue
+        refs.add(str(signal_id))
+        if broker_order_id:
+            refs.add(str(broker_order_id))
+    return refs
+
+
+def list_live_deployment_open_entry_counts_by_symbol(
+    deployment_id: str,
+    working_order_ids: Collection[str] | None = None,
+    broker_held_symbols: Collection[str] | None = None,
+) -> dict[str, int]:
+    """Open entry count per symbol for one deployment (#360 maintainer decision).
+
+    An *open entry* is a persisted entry signal — not exit-only and not a
+    broker-side close — that still holds quantity: its filled quantity minus
+    the reducing fills attributed to it, allocated oldest-first, is above
+    ``_EXIT_FILL_TOLERANCE``. Reducing fills are every fill on the
+    deployment's exit-only signals plus every broker-side close signal for
+    the symbol: the same rows the net ledger sums with the opposite sign.
+
+    FIFO attribution is an approximation — a deployment-level FULL_EXIT is
+    not tied to one entry — but it is conservative in the direction that
+    matters: a partially closed oldest entry keeps counting until its own
+    residual reaches zero.
+
+    An entry with no fills yet counts as one open position **only while the
+    broker still lists its order as working** — a DAY entry that expired
+    unfilled or an order cancelled after acceptance must not lock the symbol
+    forever (#360 review). ``working_order_ids`` is the adapter's
+    ``working_order_ids()`` result: broker order ids and client order ids
+    (the canonical signal id). An entry matches on either its persisted
+    ``broker_order_id`` or its signal id. When ``working_order_ids`` is
+    ``None`` the working status cannot be proven, so every unfilled entry
+    that carries a broker order id still counts — the fail-closed direction.
+
+    A *filled* order is not working either, so the working list alone cannot
+    tell "dead unfilled" from "filled but its fill is not yet booked" (the
+    trade-update stream is down, the post-restart reconcile has not run, or
+    persistence lags a bar). ``broker_held_symbols`` is the adapter's
+    non-zero-position symbol set for the account: a not-working unfilled
+    entry that carries a broker order id counts as open while its symbol is
+    held — over-counting when another deployment holds the symbol only
+    blocks entries, the fail-closed direction. ``broker_held_symbols=None``
+    means the position state could not be proven, so such an entry still
+    counts — again fail-closed. Entries with neither fills nor any order
+    reference never reached the broker and do not count.
+
+    Returns ``{SYMBOL: open entry count}`` for symbols with at least one
+    open entry; flat symbols are absent.
+    """
+    normalized_deployment_id = str(deployment_id or "").strip()
+    if not normalized_deployment_id:
+        raise ValueError("A deployment id is required for the open entry counts")
+    working = (
+        {str(order_id) for order_id in working_order_ids}
+        if working_order_ids is not None
+        else None
+    )
+    # Broker position symbols and stored signal symbols spell the same pair
+    # differently (Alpaca reports crypto as ``BTCUSD`` while a signal may say
+    # ``BTC/USD``): compare on ``crypto_pair_key``, which collapses every
+    # crypto spelling and leaves equities (``BRK.B``, ``BF-B``) untouched.
+    held_symbols = (
+        {crypto_pair_key(symbol) for symbol in broker_held_symbols}
+        if broker_held_symbols is not None
+        else None
+    )
+    init_db()
+    with get_session() as session:
+        signal_rows = session.exec(
+            select(
+                LiveSignalModel.id,
+                LiveSignalModel.symbol,
+                LiveSignalModel.timestamp,
+                LiveSignalModel.broker_order_id,
+                LiveSignalModel.source,
+                LiveSignalModel.metadata_json,
+            ).where(LiveSignalModel.deployment_id == normalized_deployment_id)
+        ).all()
+        fill_rows = session.exec(
+            select(
+                LiveExecutionModel.signal_id,
+                func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0),
+            )
+            .join(LiveSignalModel, LiveExecutionModel.signal_id == LiveSignalModel.id)
+            .where(LiveSignalModel.deployment_id == normalized_deployment_id)
+            .group_by(LiveExecutionModel.signal_id)
+        ).all()
+    filled_by_signal = {str(signal_id): float(filled or 0.0) for signal_id, filled in fill_rows}
+
+    by_symbol: dict[str, list[dict[str, Any]]] = {}
+    for signal_id, symbol, timestamp, broker_order_id, source, metadata in signal_rows:
+        normalized_symbol = str(symbol or "").strip().upper()
+        if not normalized_symbol:
+            continue
+        by_symbol.setdefault(normalized_symbol, []).append(
+            {
+                "signal_id": str(signal_id),
+                "timestamp": timestamp,
+                "broker_order_id": str(broker_order_id or ""),
+                "source": str(source or ""),
+                "metadata": metadata if isinstance(metadata, dict) else {},
+                "filled_qty": filled_by_signal.get(str(signal_id), 0.0),
+            }
+        )
+
+    counts: dict[str, int] = {}
+    for symbol, signals in by_symbol.items():
+        reducing_qty = 0.0
+        entries: list[dict[str, Any]] = []
+        for signal in signals:
+            metadata = signal["metadata"]
+            is_close = (
+                _is_exit_only_signal_metadata(metadata)
+                or str(signal["source"] or "") == BROKER_CLOSE_SIGNAL_SOURCE
+            )
+            if is_close:
+                reducing_qty += max(0.0, signal["filled_qty"])
+            else:
+                entries.append(signal)
+        entries.sort(
+            key=lambda item: (
+                item["timestamp"] is None,
+                item["timestamp"] or datetime.min.replace(tzinfo=timezone.utc),
+                item["signal_id"],
+            )
+        )
+        remaining_reduction = reducing_qty
+        open_count = 0
+        for entry in entries:
+            entry_qty = max(0.0, entry["filled_qty"])
+            if entry_qty <= _EXIT_FILL_TOLERANCE:
+                if working is None:
+                    still_open = bool(entry["broker_order_id"])
+                else:
+                    still_open = (
+                        entry["broker_order_id"] in working
+                        or entry["signal_id"] in working
+                    )
+                    if not still_open and entry["broker_order_id"]:
+                        # Not working: a filled-but-unbooked entry looks the
+                        # same as a dead unfilled one. The broker's non-zero
+                        # position is the proof it is still open; an
+                        # unreadable position set fails closed.
+                        still_open = (
+                            held_symbols is None
+                            or crypto_pair_key(symbol) in held_symbols
+                        )
+                if still_open:
+                    open_count += 1
+                continue
+            closed = min(entry_qty, remaining_reduction)
+            remaining_reduction -= closed
+            if entry_qty - closed > _EXIT_FILL_TOLERANCE:
+                open_count += 1
+        if open_count:
+            counts[symbol] = open_count
+    return counts
 
 
 def get_account_net_filled_qty_by_deployment(account_id: str, symbol: str) -> dict[str, float]:
