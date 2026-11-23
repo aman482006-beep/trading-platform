@@ -1,5 +1,13 @@
 # Cross-Engine Backtest Contract
 
+> **Freeze notice (#318, 2026-11-21).** Per
+> `docs/adr/0001-native-single-strategy-engine.md`, `native` is the single
+> strategy engine going forward. `vectorbt`, `pynecore` and the LEAN *run*
+> path are frozen (bug fixes only, no new features) and scheduled for
+> removal; LEAN becomes import-only. This contract will shrink to native +
+> signal replay once they are gone. Selecting a frozen engine emits a
+> `DeprecationWarning`.
+
 Status: contract for the backtest engine adapters (`runner/engines/`), shared
 primitives in `runner/engines/contract.py`, conformance tests in
 `tests/test_engine_contract.py`.
@@ -42,7 +50,9 @@ parent Cleanup 16 record.
   triggers when `high >= take_profit`; mirrored for SHORT. Native records this
   as `stop_trigger_side = "bar_low_high"` and
   `take_profit_trigger_side = "bar_high_low"`.
-- Fill price: the protective **level itself**, not the bar close — with one
+- Fill price: the protective **level itself ± the resolved slippage
+  model**, not the bar close (since #130 stop/TP fills slip like every
+  other fill; with `slippage="none"` the level is exact) — with one
   owner-decided exception (2026-11-13, realism / MT5 + live-broker parity): a
   bar that **opens beyond** the level gapped through it and fills at the
   bar's **open**, the price actually available; an open exactly at the level
@@ -57,10 +67,77 @@ parent Cleanup 16 record.
   `stop_loss`. Native names take-profit exits after the level name (`tp`,
   `tp1`, …); vectorbt and signal replay use `take_profit`. Consumers must
   treat both spellings as the same event class.
+- Level aliases: `take_profit` and `tp_price` are two spellings of the SAME
+  plain take-profit level (as `stop_loss`/`sl_price` are one stop). Both engines
+  resolve the pair once, and both use the canonical-first order
+  `risk.live.resolve_live_levels`, the validation comparison and the engine
+  resolvers use (#237): when a row carries both, `take_profit` wins and
+  `tp_price` is the fallback when it is absent, null or unusable. Native
+  resolves it inside `TradeEngine._extract_levels`; vectorbt resolves it in
+  `_find_indicator_series` (which alias series to read) and
+  `_resolve_take_profit_price` (the entry-bar value), canonical spelling first,
+  so the winner never depends on the order the strategy published them in.
+  One alias pair must never become two levels: both would
+  be named `tp`, so the row's single intended level filled as two take-profit
+  legs that shared the `tp_pct` fraction, and the phantom candidate also took
+  a share of the default `1/n` split (an explicit `tpN_pct` fraction is keyed
+  by level name, so only the default denominator of the numbered levels
+  changes).
+- Unusable take-profit price: a level whose price is non-numeric, non-finite
+  or `<= 0` arms no level in either engine. Live refuses the whole signal
+  instead (`resolve_live_levels` raises, see `docs/live-risk-consistency.md`),
+  so neither engine books a take-profit the market cannot price: a LONG level
+  of `0` is reached by every bar. The stop pair is validated only by live —
+  the stop feeds position sizing, so an engine-side refusal would change risk,
+  not just exits.
+- Last level rule: the LAST pending take-profit level takes the position's
+  remaining quantity, so a ladder closes the position instead of leaving a
+  dust remainder, and a single level closes the whole position (the same
+  outcome a single live bracket order produces). A `fraction` below 1 on the
+  last level therefore does not keep part of the position open; a strategy
+  that wants a remainder held past its last level needs a later signal exit.
 - Vectorbt has no bar-loop position model: protective levels are resolved on
   the entry bar and enforced through the intrabar walk (§3). Without intrabar
   data, exits happen on the scheduled signal exit and the levels are recorded
   in `trade.meta` (`sl_price`, `tp_price`).
+
+### Slippage (fill-price cost model, #130)
+
+Slippage is applied to the **fill price** in the adverse direction —
+never as a separate cost line, so `pnl`, `net_pnl`, the equity curve and
+sizing equity all carry the same cost. For the fixed-bps models that
+means buys fill higher and sells fill lower; the bar-spread model
+charges the quoted spread **once per round trip, on the buy side only**
+(canonical OHLC is the bid series: buys lift to the ask, sells stay on
+the bid) — an implementer porting this must not subtract the spread on
+sells as well or the spread is charged twice.
+Scope per the maintainer decision: the **native** engine and **signal
+replay** only (the engines #318 keeps; LEAN stays import-only; vectorbt
+and pynecore do not model slippage and record that fact in
+`meta.data["slippage"]` when run through the CLI).
+
+- `runner.slippage.resolve_slippage_model` resolves one model per run (per
+  symbol where asset classes differ) from engine params:
+  `slippage="none"|"zero"` is the explicit parity opt-out that reproduces
+  pre-#130 gross fills; `"spread"` uses the bar's bid/ask columns
+  (MT5-tester-like) with a fixed-bps fallback; `"bps"`/`slippage_bps` is a
+  fixed-bps model; absent config picks the per-asset-class default
+  (FX/CFD-like classes → bar spread, equities → 5 bps, crypto → 10 bps,
+  all overridable via `slippage_defaults`/`slippage_default_bps`).
+- Instruments are classified from the `ohlcv/{source}/{asset_class}/…`
+  parquet path; runs that cannot be classified — or whose class maps to
+  no slippage model — REFUSE under the default `auto` resolution
+  (fail closed like fees, #84): pass `slippage="none"` for a deliberate
+  gross run or an explicit cost (`"bps"`/`"spread"`/`slippage_bps`).
+- Every run records the resolved model per symbol in
+  `meta.data["slippage"]["models"]` (plus the data's `price_basis`), so a
+  reader never has to guess which cost model produced the numbers.
+- When a strategy already prices the spread through `spread_price_col`,
+  the auto model degrades to fixed bps so the quoted spread is not
+  charged twice. `ask_ohlc` does not degrade the model — it only moves
+  SHORT stop/TP *triggers* onto the ask side, and those ask-triggered
+  exits pass `fill_side="ask"` so the bar spread is not charged twice on
+  them either.
 
 ## 2. End-date boundary
 
@@ -234,7 +311,10 @@ Implementation:
   rule below denominates is **realized cash** — `initial_capital` plus the net
   PnL of closed trade legs. The mark-to-market equity that feeds the equity
   curve is never a sizing input: an open position's paper profit is not
-  spendable and an unrealized drawdown is not a realized loss. Native holds it
+  spendable and an unrealized drawdown is not a realized loss. The one
+  documented exception is the native free-margin leverage check (#347),
+  which reads mark-to-market equity and used margin by design (MT5-style
+  margin) — see `docs/sizing-semantics.md`. Native holds it
   in `TradeEngine._sizing_equity` (decision record D2,
   `docs/cleanup-16d1-money-path-semantics.md`); vectorbt accumulates it inline
   and records it as `trade.meta["risk_math"]["equity_at_entry"]`; pynecore walks
@@ -262,9 +342,36 @@ Implementation:
   vectorbt records the decision in `trade.meta["risk_math"]`
   (`sizing_mode`, `risk_target_usd`, `stop_distance`, `required_notional`,
   `final_notional`, `capped_by_max_position`, `capped_by_max_leverage`).
+  **Leverage-cap basis divergence (#347):** vectorbt holds at most one
+  position, so its free margin always equals equity and its
+  `equity × max_leverage` cap already *is* the MT5 rule. PyneCore keeps
+  overlapping trades (`open_ledger`) and caps
+  `equity × max_leverage − open_notional` on *realized* equity — a
+  different rule; it is frozen and slated for deletion (#318). The native
+  engine sizes against **free margin** — mark-to-market equity minus the
+  margin open positions already use — and clamps the quantity (floored to
+  `lot_step` when the leverage cap binds) instead of refusing; an unknown
+  broker maximum means 1x.
+- **`entry` is the price the order actually fills at**, for every order type
+  (MARKET: the next bar's open, plus the configured spread for a LONG;
+  LIMIT/STOP: their trigger price). Pre-fill
+  creation sizing is only a pending-order estimate and must never survive into
+  the position: because the caps are evaluated against the fill price, a
+  quantity derived from the signal bar's close sizes a position *beyond* the
+  cap whenever the next open gaps (repro: 103.4k notional on 100k equity at a
+  1x cap). Native's `_fill_pending_orders` re-sizes at the fill for every
+  order type, the no-explicit-stop fallback included.
+- **The sizing `equity` is realized cash in the native engine** (`initial_capital
+  +` realized PnL, net of fees — Cleanup 16-D1 F21/D2; cash from a partial exit
+  is reduced by the round-trip fees the open position still owes), never the
+  mark-to-market reporting equity of the curve: an open position's paper profit
+  is not spendable and a paper drawdown must not deflate new sizes. The native
+  engine records that same figure as `equity_at_entry`. **Exception:**
+  `SignalReplayAdapter` deliberately marks open positions to market when sizing
+  (D9, `docs/cleanup-16d1-money-path-semantics.md`).
 - Native additionally supports `fixed_risk_amount` sizing with MT5 tick
   metadata (`tick_size`, `tick_value`, `lot_step`, `min_lot`, `max_lot`);
-  the result is still capped by `max_leverage` unless
+  the result is still capped by `max_leverage` (free margin, #347) unless
   `cap_fixed_risk_by_leverage = false`. With `lot_step > 0`, `max_lot` is
   floored to `lot_step` once, so an off-grid `max_lot` cannot yield an
   off-grid size; the documented exception is no grid at all — with
@@ -325,8 +432,12 @@ Implementation:
 - **Equity sizing** (no risk config): `qty = equity / entry_price`, capped by
   `max_leverage`.
 - Without an explicit stop, engines fall back to a documented default stop
-  distance (native/risk engine: `fallback_stop_pct = 2%`; vectorbt: 2% of
-  entry) — the fallback must be visible in the trade meta, not silent.
+  distance — **2% of the fill price** (native/risk engine:
+  `fallback_stop_pct = 2%`, applied to the entry the risk engine is handed;
+  vectorbt: `entry_price * 0.02`) — the fallback must be visible in the trade
+  meta, not silent. It is a real fill-time risk input, so a stopless order is
+  sized from it like any other order (this supersedes the 16-D1 stopless-MARKET
+  exception recorded in `docs/cleanup-16d1-money-path-semantics.md` D4).
 - **Multi-symbol shared equity (D5, A-M4):** per-symbol engines size each
   trade from the full starting capital; on multi-symbol runs the adapters
   replay all trades onto ONE running portfolio equity
@@ -339,7 +450,10 @@ Implementation:
   runs skip the replay (identity). PyneCore performs the equivalent merged
   sizing pass after parsing all symbols: entries are processed in timestamp
   order against one realized-equity ledger, and the aggregate open notional
-  is capped by shared `max_leverage`.
+  is capped by shared `max_leverage`. **#347 exception:** a trade whose
+  quantity was clamped by the free-margin leverage rule is rescaled by
+  `shared_equity / equity_at_entry` like every other trade — an
+  approximation that is not flagged in the trade meta.
 
 ## 5. Execution-timing models (documented divergence)
 
@@ -413,6 +527,27 @@ canonical ones via `EngineStatsKeys.merge_over_canonical`; they may add keys
 but never remove or overwrite them — a same-named engine key loses the
 collision, so consumers always read the canonical value.
 
+**Sharpe/Sortino convention (#229).** The equity curve is resampled to one
+observation per calendar day (the production `attach_daily_equity` shape
+fills every day, flat days included), then the calendar-filled rows —
+weekend/holiday days the venue was closed, whose forward-filled equity can
+only produce a zero return — are dropped before the ratio is computed.
+Trading days come from the venue calendar resolved from the run's symbols,
+source and asset-class metadata (`shared.venue_calendar`); a symbol whose
+venue cannot be resolved falls back to the Monday–Friday grid. The ratio is
+annualised at 252 for equities/FX/CFDs and 365 for an all-crypto (24/7)
+book, published as `equity_return_periods_per_year`. Cross-platform parity
+(the MT5 audit matrix in `validation/statistics/cross_platform.py`) applies
+this identical formula to realized-exit equity curves rebuilt from BOTH
+trade lists — initial capital plus cumulative net PnL booked at each
+position's last exit, calendar-filled to the production daily shape —
+rather than comparing against MT5's printed
+Sharpe-Ratio, which uses MT5's own convention; the printed value is kept
+as `sharpe_ratio_reported`, and the platform artifact's mark-to-market
+Sharpe is kept as `sharpe_ratio_mtm`. Because both sides now run the same
+formula on the same curve shape, identical trade lists give identical
+parity Sharpes; the trade list remains the primary parity evidence.
+
 ## 7. `total_bars`
 
 Decision Record (Cleanup 16-A, F6): **`meta.total_bars` is the number of bars
@@ -437,3 +572,48 @@ intrabar resolution (native + vectorbt), sizing from the actual stop (including
 cap behavior), the canonical stats key set per engine, `total_bars` semantics,
 market-entry fill parity, signal-replay's documented same-bar-close exception,
 and the pynecore restatement containment property.
+
+`tests/test_differential_reference_strategies.py` complements the conformance
+suite with differential tests: three textbook strategies (SMA crossover with
+all-in sizing, Donchian breakout with ATR stop/target and fixed-risk sizing,
+RSI mean reversion with a time exit) are run on the native and vectorbt engines
+and compared trade by trade with small independent reference simulators written
+in the test module (synthetic edge-case series and one real EURUSD 15m slice,
+zero and non-zero costs). Known engine deviations are recorded there as
+`xfail(strict=True)` with the exact location and reproducer.
+
+### The real-data slice is downloaded, not committed
+
+The one real slice (600 EURUSD 15m bars: real gaps, a weekend, irregular ranges)
+used to be a committed fixture under `tests/fixtures/differential/`. It is
+generated on demand instead, because this repository is public and vendor market
+data is licensed to be *queried*, not redistributed through a history anyone can
+clone - and because a fixture inside the test tree reads as a source of truth.
+
+```bash
+# writes $DATA_DIR/differential_reference/eurusd_15m_slice.csv
+python -m scripts.fetch_differential_slice
+```
+
+* `DIFFERENTIAL_REAL_SLICE_CSV` overrides that path (CI points it at a path it
+  restores from `actions/cache`, keyed on the fetch script and `data_tools/`).
+* `REQUIRE_REAL_DATA_SLICE=1` turns a missing slice into a test failure. On pull
+  requests CI sets it only after the fetch step succeeds, so a Dukascopy
+  download failure warns and skips the real-data scenarios instead of failing
+  the job; on push to main the fetch step fails on a download error, so the
+  slice is always required there. Locally a missing slice skips them with a
+  message naming the script.
+* A slice that is present but malformed (wrong row count, non-monotonic stamps,
+  non-finite OHLC, `high < max(open, close)`, `low > min(open, close)`) always
+  fails - see `data_tools/differential_slice.py`, which owns the window, the
+  15m aggregation rules (the platform's own, via `data_tools/resample.py`) and
+  the validation.
+* The committed fixture's provenance was mislabelled: bar for bar it was an
+  **MT5 export**, not Dukascopy bid data, so it could not be regenerated from any
+  downloader. The slice is now fetched from Dukascopy's bid minute candles for
+  the same window; the values therefore differ from the removed file (prices by
+  ~0.0008 on average, volumes more, since Dukascopy reports float volumes where
+  the MT5 export carried integer tick counts). The contract these tests check is
+  engine-versus-reference on one frame, so a different quote series validates
+  the same thing - and `tests/test_differential_slice_contract.py` pins the
+  window, the rules and the CSV schema without a network.

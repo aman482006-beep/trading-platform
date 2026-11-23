@@ -497,6 +497,11 @@ def test_run_daemon_shutdown_flushes_signal_archive(
     monkeypatch.setattr(daemon, "_poll_balances", _noop_loop)
     monkeypatch.setattr(daemon, "run_trailing_stops_loop", _noop_loop)
     monkeypatch.setattr(daemon, "_backfill_commissions_loop", _noop_loop)
+    # The internal strategy loop runs forever by design; like the other
+    # gather members it must be stubbed for run_daemon to reach shutdown.
+    monkeypatch.setattr(daemon, "run_internal_strategy_loop", _noop_loop)
+
+    monkeypatch.setattr(daemon, "run_broker_reconciliation_loop", _noop_loop)
 
     asyncio.run(daemon.run_daemon(accounts_env=tmp_path / "accounts.env"))
 
@@ -662,30 +667,106 @@ def _live_deployment(**overrides) -> LiveDeploymentConfig:
     return LiveDeploymentConfig(**options)
 
 
-def _trade_signal(symbol: str = "AAPL") -> TradeSignal:
+def _trade_signal(
+    symbol: str = "AAPL",
+    *,
+    action: str = "buy",
+    metadata: dict[str, object] | None = None,
+) -> TradeSignal:
+    signal_metadata = {
+        "discord_message_id": "m-1",
+        "discord_channel_id": "channel-1",
+        "discord_author_id": "bot-1",
+        "discord_bot_name": "ramjet",
+        "discord_signal_type": "ram_jet_oversold_buy",
+        "received_at": datetime.now(timezone.utc).isoformat(),
+    }
+    signal_metadata.update(metadata or {})
     return TradeSignal(
-        action="buy",
+        action=action,
         symbol=symbol,
         entry_price=190.5,
         stop_loss=185.0,
         take_profit=200.0,
         timeframe="1h",
-        metadata={
-            "discord_message_id": "m-1",
-            "discord_channel_id": "channel-1",
-            "discord_author_id": "bot-1",
-            "discord_bot_name": "ramjet",
-            "discord_signal_type": "ram_jet_oversold_buy",
-            "received_at": datetime.now(timezone.utc).isoformat(),
-        },
+        metadata=signal_metadata,
     )
+
+
+def _exit_trade_signal() -> TradeSignal:
+    from live_runner.exit_signals import FULL_EXIT, exit_intent_metadata
+
+    return _trade_signal(
+        action="sell",
+        metadata=exit_intent_metadata(FULL_EXIT),
+    )
+
+
+def _dispatch_deployment(
+    *,
+    status: str = "ACTIVE",
+    signal_config: dict[str, object] | None = None,
+) -> LiveDeploymentConfig:
+    config = {
+        "trusted_author_ids": ["bot-1"],
+    }
+    config.update(signal_config or {})
+    return _live_deployment(
+        status=status,
+        symbols=["AAPL"],
+        signal_config=config,
+    )
+
+
+def _patch_dispatch_db(monkeypatch, deployments: list[LiveDeploymentConfig]) -> None:
+    current = {str(deployment.id): deployment for deployment in deployments}
+    monkeypatch.setattr(
+        daemon,
+        "get_live_deployment",
+        lambda deployment_id: current.get(str(deployment_id)),
+    )
+    monkeypatch.setattr(daemon, "_live_account_broker_login", lambda _account_id: "")
+
+
+def _record_submissions(monkeypatch) -> list[dict[str, object]]:
+    submissions: list[dict[str, object]] = []
+
+    async def _submit(
+        account_id,
+        adapter,
+        deployment,
+        trade_signal,
+        *,
+        signal_timeframe,
+        wait_enabled,
+    ):
+        submissions.append(
+            {
+                "account_id": account_id,
+                "adapter": adapter,
+                "deployment_id": str(deployment.id),
+                "signal": trade_signal,
+                "signal_timeframe": signal_timeframe,
+                "wait_enabled": wait_enabled,
+            }
+        )
+
+    monkeypatch.setattr(daemon, "_submit_normalized_discord_signal", _submit)
+    return submissions
+
+
+def _decision_records() -> list[dict]:
+    return [
+        record
+        for record in _all_records()
+        if record.get("type") == "discord_signal_decision"
+    ]
 
 
 def test_dispatch_symbol_gate_refusal_is_archived(
     archive_env: SignalArchive, monkeypatch
 ) -> None:
     deployment = _live_deployment()
-    monkeypatch.setattr(daemon, "_deployment_is_currently_active", lambda _d: True)
     monkeypatch.setattr(daemon, "_live_account_broker_login", lambda _a: "")
     asyncio.run(
         daemon._dispatch_discord_trade_signal(
@@ -703,6 +784,89 @@ def test_dispatch_symbol_gate_refusal_is_archived(
     assert records[0]["reason"] == "symbol_not_covered"
     assert records[0]["deployment_id"] == str(deployment.id)
     assert records[0]["discord_message_id"] == "m-1"
+
+
+def test_paused_deployment_entry_records_deployment_not_active(
+    archive_env: SignalArchive, monkeypatch
+) -> None:
+    deployment = _dispatch_deployment(status="PAUSED")
+    submissions = _record_submissions(monkeypatch)
+    _patch_dispatch_db(monkeypatch, [deployment])
+
+    asyncio.run(
+        daemon._dispatch_discord_trade_signal(
+            "acc-1",
+            adapter=object(),
+            deployments_for_channel=[deployment],
+            trade_signal=_trade_signal(),
+            accounts_env_values={},
+        )
+    )
+    archive_env.flush(timeout=5.0)
+
+    records = _decision_records()
+    assert len(records) == 1
+    assert records[0]["outcome"] == "refused"
+    assert records[0]["reason"] == "deployment_not_active"
+    assert records[0]["deployment_id"] == str(deployment.id)
+    assert submissions == []
+
+
+def test_paused_deployment_exit_dispatches_without_not_active_record(
+    archive_env: SignalArchive, monkeypatch
+) -> None:
+    deployment = _dispatch_deployment(status="PAUSED")
+    submissions = _record_submissions(monkeypatch)
+    _patch_dispatch_db(monkeypatch, [deployment])
+
+    asyncio.run(
+        daemon._dispatch_discord_trade_signal(
+            "acc-1",
+            adapter=object(),
+            deployments_for_channel=[deployment],
+            trade_signal=_exit_trade_signal(),
+            accounts_env_values={},
+        )
+    )
+    archive_env.flush(timeout=5.0)
+
+    assert [submission["deployment_id"] for submission in submissions] == [
+        str(deployment.id)
+    ]
+    assert all(
+        record.get("reason") != "deployment_not_active"
+        for record in _decision_records()
+    )
+
+
+def test_invalid_wait_config_skips_only_that_deployment(
+    archive_env: SignalArchive, monkeypatch
+) -> None:
+    broken = _dispatch_deployment(signal_config={"wait_candle_close": "sooon"})
+    valid = _dispatch_deployment(signal_config={"wait_candle_close": False})
+    submissions = _record_submissions(monkeypatch)
+    _patch_dispatch_db(monkeypatch, [broken, valid])
+
+    asyncio.run(
+        daemon._dispatch_discord_trade_signal(
+            "acc-1",
+            adapter=object(),
+            deployments_for_channel=[broken, valid],
+            trade_signal=_trade_signal(),
+            accounts_env_values={},
+        )
+    )
+    archive_env.flush(timeout=5.0)
+
+    records = _decision_records()
+    assert len(records) == 1
+    assert records[0]["outcome"] == "refused"
+    assert records[0]["reason"] == "invalid_deployment_config"
+    assert records[0]["deployment_id"] == str(broken.id)
+    assert [submission["deployment_id"] for submission in submissions] == [
+        str(valid.id)
+    ]
+    assert submissions[0]["wait_enabled"] is False
 
 
 def test_prepare_stale_signal_records_refusal(
@@ -757,16 +921,61 @@ def test_claim_and_submit_success_records_traded(
         timestamp=datetime.now(timezone.utc),
         metadata=dict(normalized.metadata),
     )
-    prepared_signal = SimpleNamespace(symbol="AAPL", action="buy")
+    prepared_signal = SimpleNamespace(
+        symbol="AAPL",
+        action="buy",
+        theoretical_price=190.5,
+        metadata={
+            "entry_price": 190.5,
+            "stop_loss": 185.0,
+            "take_profit": 200.0,
+        },
+    )
 
     async def _prepare_order(_adapter, _deployment, _signal):
         return prepared_signal, 1.0
+
+    async def _caps_passthrough(_adapter, _deployment, _signal, *, qty, risk_config):
+        # The caps have their own suite (test_live_pre_submit_caps.py); this
+        # test pins the archive record, so the check is stubbed to a pass —
+        # the SimpleNamespace signal/adapter doubles cannot satisfy its
+        # broker reads.
+        return qty
 
     class _Adapter:
         async def submit_order(self, _signal, qty=None):
             return "ord-42"
 
+        async def get_quote(self, symbol):
+            from live_runner.base_adapter import LiveQuote
+
+            return LiveQuote(
+                bid=190.5,
+                ask=190.5,
+                timestamp=datetime.now(timezone.utc),
+                source="test",
+            )
+
+        async def get_pip_value(self, symbol):
+            from live_runner.base_adapter import LivePipValue
+
+            return LivePipValue(
+                value=1.0,
+                units_per_qty=1.0,
+                conversion_rate=1.0,
+                quote_asset="USD",
+                account_asset="USD",
+                source="test",
+            )
+
+        async def get_equity(self):
+            return 100_000.0
+
+        async def get_used_margin(self):
+            return 0.0
+
     monkeypatch.setattr(daemon, "prepare_order_with_risk", _prepare_order)
+    monkeypatch.setattr(daemon, "enforce_pre_submit_caps", _caps_passthrough)
     monkeypatch.setattr(
         daemon, "claim_live_deployment_submission", lambda *_a, **_k: True
     )

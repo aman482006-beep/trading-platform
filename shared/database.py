@@ -7,12 +7,13 @@ import os
 import re
 import subprocess
 import threading
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
+from urllib.parse import parse_qsl, unquote
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from sqlalchemy import (
@@ -37,7 +38,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 from sqlmodel.sql.expression import SelectOfScalar
 
-from shared.alpaca_symbols import classify_alpaca_symbol
+from shared.alpaca_symbols import classify_alpaca_symbol, crypto_pair_key
 from shared.constants import DATA_DIR as RESOLVED_DATA_DIR
 from shared.constants import normalize_symbols
 from shared.fill_keys import canonical_utc_timestamp
@@ -94,7 +95,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # configuration at a different point in the import order and could disagree
 # with the DATA_DIR this module already resolved.
 DATA_DIR = RESOLVED_DATA_DIR
-DB_PATH = DATA_DIR / "backtests.db"
+DB_FILENAME = "backtests.db"
+DB_PATH = DATA_DIR / DB_FILENAME
 # Optional engine override. New code should call get_engine(); importing
 # ENGINE no longer forces engine creation at import time. Tests that need a
 # bespoke engine set this attribute directly (it is part of the module
@@ -107,11 +109,100 @@ def _sqlite_url(path: Path) -> str:
 
 
 def _default_database_url() -> str:
-    return _sqlite_url(DATA_DIR / "backtests.db")
+    return _sqlite_url(DATA_DIR / DB_FILENAME)
 
 
 def _is_sqlite_url(url: str) -> bool:
     return url.strip().lower().startswith("sqlite")
+
+
+#: Query values SQLAlchemy's ``asbool`` coercion reads as true for the ``uri`` parameter - the
+#: spelling that turns a ``file:`` database name into a SQLite URI filename.
+_SQLITE_URI_TRUE_VALUES = frozenset({"true", "yes", "on", "y", "t", "1"})
+
+
+def _sqlite_uri_file_path(body: str) -> str:
+    """The path inside a ``file:`` URI body, after ``uri=true`` was established.
+
+    ``file:/abs/db``, ``file:rel/db`` and ``file::memory:`` name their text after the prefix
+    directly. ``file://<authority>/<path>`` carries an authority SQLite accepts only when it is
+    empty or ``localhost`` (``file://localhost/abs/db`` is ``/abs/db``); any other authority is
+    refused by SQLite itself, so there is no file to name and the empty string is returned.
+    """
+    if not body.startswith("//"):
+        return body
+    authority, separator, path = body[2:].partition("/")
+    if authority not in ("", "localhost"):
+        return ""
+    result = separator + path if separator else ""
+    # On Windows ``file:///C:/x.db`` is the drive path ``C:/x.db``: SQLite drops the leading
+    # slash before a drive letter there, and keeping it would name ``/C:/x.db`` - a file the
+    # engine never opens, so the single-instance lock would sit beside the wrong path. On
+    # POSIX the same spelling is a literal ``/C:`` directory, so the strip is Windows-only.
+    if (
+        os.name == "nt"
+        and len(result) > 2
+        and result[0] == "/"
+        and result[1].isalpha()
+        and result[2] == ":"
+    ):
+        return result[1:]
+    return result
+
+
+def sqlite_url_file(url: str) -> str:
+    """The file part of a SQLite URL: query string and fragment stripped, percent-decoding undone.
+
+    ``DATABASE_URL`` is handed straight to SQLAlchemy, which reads everything after the first
+    ``?`` as driver options rather than as part of the filename, so
+    ``sqlite:////abs/backtests.db?timeout=30`` opens ``/abs/backtests.db``. Splitting the raw URL
+    kept ``?timeout=30`` in the path, and a ``Path`` carrying it is not a file: a working database
+    was reported as "Database file not found".
+
+    Empty when the URL names no file (``sqlite://``, or a ``file:`` URI in ``mode=memory``); the
+    caller decides what that means.
+
+    ``sqlite:///file:/abs/db.db?uri=true`` is SQLAlchemy's URI form for the same database as
+    ``sqlite:////abs/db.db``. The ``file:`` prefix is URI syntax the SQLite driver parses - and
+    only when ``uri=true`` enables URI filenames: without it the driver opens a literal file
+    named ``file:live.db``, so the prefix is kept. In URI mode the ``localhost`` authority of
+    ``file://localhost/...`` is normalised away and ``mode=memory`` names an in-memory database,
+    which has no file at all.
+    """
+    head, _, query = url.partition("?")
+    head = head.partition("#")[0]
+    raw_part = head.split("///", 1)[1] if "///" in head else ""
+    params = parse_qsl(query.partition("#")[0], keep_blank_values=True)
+    uri_mode = any(
+        key == "uri" and value.strip().lower() in _SQLITE_URI_TRUE_VALUES
+        for key, value in params
+    )
+    if raw_part.startswith("file:"):
+        if not uri_mode:
+            return unquote(raw_part)
+        if any(
+            key == "mode" and value.strip().lower() == "memory" for key, value in params
+        ):
+            # ``file:memdb1?mode=memory&cache=shared&uri=true`` is a named in-memory database.
+            return ""
+        return unquote(_sqlite_uri_file_path(raw_part[len("file:") :]))
+    return unquote(raw_part)
+
+
+def live_db_path() -> Path:
+    """The live database file this process trades.
+
+    The SQLite file ``DATABASE_URL`` names when it names one, so a caller acting on the file itself
+    (the daemon's single-instance lock, which sits next to it) sees the file the engine really
+    opens. A URL that names no file - in-memory, a bare ``sqlite://``, or another dialect - has no
+    file to point at, so the ``DATA_DIR/backtests.db`` default is used.
+    """
+    url = os.environ.get("DATABASE_URL", "").strip()
+    if url and _is_sqlite_url(url):
+        raw_file = sqlite_url_file(url)
+        if raw_file and raw_file != ":memory:":
+            return Path(raw_file)
+    return DATA_DIR / DB_FILENAME
 
 
 def _create_database_engine() -> Any:
@@ -2638,6 +2729,116 @@ def _log_duplicate_live_signal_skipped(record: LiveSignalModel) -> None:
     )
 
 
+#: What :func:`_pause_live_deployment_for_conflict` reports about the halt.
+#: "PAUSED": this call wrote the pause. "already-halted": the deployment was already
+#: PAUSED or STOPPED, so no new halt was needed (a redelivered conflict).
+CONFLICT_HALT_PAUSED = "PAUSED"
+CONFLICT_HALT_ALREADY_HALTED = "already-halted"
+
+#: The status a deployment may open a new position from (#126 decision: a pause or a stop
+#: blocks entries in every wording of the rule).
+LIVE_DISPATCH_ENTRY_STATUSES: tuple[str, ...] = ("ACTIVE",)
+
+#: The statuses a deployment may close a position from. PAUSED is included on purpose
+#: (#126 decision): "stop opening new positions" must not also stop a deployment closing
+#: what it already holds, or a pause forced by a broker-order-id conflict would leave the
+#: known position open until its stop. STOPPED keeps its own cancel-and-flatten
+#: enforcement and is absent.
+#:
+#: One definition for every gate that has to answer it, here and not next to any one of
+#: them, because the three callers live in three modules and widening the exit rule in one
+#: of them only is how a close silently stops reaching the broker: the daemon's dispatch
+#: statuses (:data:`live_runner.daemon.EXIT_DISPATCH_STATUSES`), the atomic submission
+#: claim's SQL filter (:func:`claim_live_deployment_submission`) and the halt's
+#: "already halted" set (:func:`pause_live_deployment_for_order_conflict`) all derive from
+#: this tuple. The values are module constants written here, never caller text, so no
+#: request payload can widen them.
+LIVE_DISPATCH_EXIT_STATUSES: tuple[str, ...] = ("ACTIVE", "PAUSED")
+
+#: The statuses a conflict halt never touches: they are a stronger operator intent (or a
+#: row that is already halted), so a re-pause must leave them exactly as they are.
+CONFLICT_HALT_EXEMPT_STATUSES: tuple[str, ...] = ("PAUSED", "STOPPED")
+
+
+def _pause_live_deployment_for_conflict(session: Session, deployment_id: object) -> str:
+    """Halt the deployment named by a conflicted signal, in the caller's transaction.
+
+    The pause is *narrow* on purpose: only this deployment stops. Other deployments on
+    the same broker account keep trading, and their positions are untouched.
+
+    Writes through the caller's ``session`` rather than :func:`update_live_deployment_status`
+    so the halt and the conflict record that justifies it commit together; a second
+    session would take its own write lock inside the open transaction and deadlock. The
+    row write itself is the shared one (:func:`_apply_live_deployment_status_row`), so
+    the stamp and timestamp rules cannot drift between the two writers.
+
+    Refuses (:data:`CONFLICT_HALT_ALREADY_HALTED`) when the row is already PAUSED - a
+    redelivered conflict re-halts nothing - and when it is STOPPED, which is a stronger
+    operator intent with its own cancel-and-flatten enforcement that this must never
+    downgrade. A deleted deployment is left deleted: the conflict record on the signal is
+    the evidence that survives.
+    """
+    normalized = str(deployment_id or "").strip()
+    if not normalized:
+        return CONFLICT_HALT_ALREADY_HALTED
+    row = session.get(LiveDeploymentModel, normalized)
+    if row is None:
+        logger.warning(
+            "Broker order id conflict on a signal whose deployment no longer exists "
+            "(deployment_id=%s); the conflict stays recorded on the signal",
+            normalized,
+        )
+        return CONFLICT_HALT_ALREADY_HALTED
+    current_status = str(row.status or "").strip().upper()
+    if current_status in {"PAUSED", "STOPPED"}:
+        return CONFLICT_HALT_ALREADY_HALTED
+    # The same row write `update_live_deployment_status` performs, in this transaction
+    # rather than through a second session: a conflict halt that took its own write lock
+    # inside this one would deadlock, and one that committed separately would leave a
+    # crash between the two commits with a persisted conflict on a still-ACTIVE row.
+    _apply_live_deployment_status_row(row, "PAUSED")
+    session.add(row)
+    return CONFLICT_HALT_PAUSED
+
+
+def pause_live_deployment_for_order_conflict(deployment_id: str) -> str:
+    """Pause one deployment for an unresolved broker order id conflict, atomically.
+
+    The periodic half of the halt (the detection half is
+    :func:`_reconcile_existing_live_signal`, which writes inside its own transaction).
+    Same rule, one conditional statement: the ``WHERE`` re-tests the row status, so a
+    deployment that became ``STOPPED`` between a caller's decision and this call cannot
+    be turned into ``PAUSED`` - a weaker state, whose write clears
+    ``stopped_enforced_at`` and would report a stop that never got proved.
+
+    Returns:
+
+    * :data:`CONFLICT_HALT_PAUSED` - this call wrote the pause;
+    * :data:`CONFLICT_HALT_ALREADY_HALTED` - nothing to do (already PAUSED or STOPPED,
+      already deleted, or no such deployment).
+    """
+    normalized = str(deployment_id or "").strip()
+    if not normalized:
+        return CONFLICT_HALT_ALREADY_HALTED
+    now = _utcnow_naive()
+    init_db()
+    # The same shared tuple the daemon's halt set and the claim filter read, so the three
+    # copies of "which statuses stop a conflict re-pause" cannot widen apart.
+    halt_exempt_list = ", ".join(f"'{status}'" for status in CONFLICT_HALT_EXEMPT_STATUSES)
+    with get_session() as session:
+        result = session.execute(
+            text(
+                "UPDATE live_deployments "
+                "SET status = 'PAUSED', stopped_enforced_at = NULL, updated_at = :now "
+                "WHERE id = :deployment_id "
+                f"AND UPPER(status) NOT IN ({halt_exempt_list})"
+            ),
+            {"now": now, "deployment_id": normalized},
+        )
+        session.commit()
+    return CONFLICT_HALT_PAUSED if int(result.rowcount or 0) == 1 else CONFLICT_HALT_ALREADY_HALTED
+
+
 def _reconcile_existing_live_signal(
     session: Session, existing: LiveSignalModel, record: LiveSignalModel
 ) -> None:
@@ -2690,14 +2891,38 @@ def _reconcile_existing_live_signal(
         metadata[BROKER_ORDER_CONFLICTS_KEY] = conflicts
         existing.metadata_json = metadata
         session.add(existing)
+    # Fail closed (#126): the halt and the conflict record share one transaction. A warning
+    # alone leaves the deployment trading while a broker order it does not track may hold
+    # a position, so the affected deployment is paused here and cannot place further
+    # entries. Committing the pause separately would leave a crash between the two commits
+    # with a persisted conflict on a still-ACTIVE deployment.
+    halt_now = _pause_live_deployment_for_conflict(session, existing.deployment_id)
     # Ends the write transaction opened above; a no-op commit when nothing changed.
     session.commit()
     logger.error(
-        "Conflicting broker_order_id for duplicate live signal: an untracked broker "
-        "order may exist (signal_id=%s, tracked=%s, conflicting=%s)",
+        "ALERT: conflicting broker_order_id for duplicate live signal: an untracked "
+        "broker order may exist and the deployment was halted. Resolve the conflict "
+        "with the broker before reactivating the deployment "
+        "(signal_id=%s, deployment_id=%s, tracked=%s, conflicting=%s, halt=%s)",
         existing.id,
+        existing.deployment_id,
         existing_broker_id,
         new_broker_id,
+        halt_now,
+        extra={
+            "data": {
+                "alert": "live_broker_order_id_conflict",
+                "signal_id": str(existing.id),
+                "deployment_id": str(existing.deployment_id),
+                "tracked_broker_order_id": existing_broker_id,
+                "conflicting_broker_order_id": new_broker_id,
+                "conflicting_broker_order_ids": list(conflicts),
+                # What this call did to the halt: "PAUSED" when it wrote the pause, and
+                # "already-halted" when the deployment was already PAUSED/STOPPED, so a
+                # redelivery is not reported as a fresh halt.
+                "deployment_halt": halt_now,
+            }
+        },
     )
 
 
@@ -3797,6 +4022,213 @@ def get_live_deployment_net_filled_qty(deployment_id: str, symbol: str) -> float
     return net
 
 
+def list_live_deployment_unfilled_entry_order_refs(deployment_id: str) -> set[str]:
+    """Order references of this deployment's entries that have no fills yet (#360).
+
+    Returns every broker order id *and* signal id (the broker's client order
+    id is the canonical signal id) carried by entry signals whose persisted
+    fill quantity is at most ``_EXIT_FILL_TOLERANCE``. Only the broker can say
+    whether such an order is still working or dead, so the caller asks for the
+    working-order list only when this set is non-empty.
+    """
+    normalized_deployment_id = str(deployment_id or "").strip()
+    if not normalized_deployment_id:
+        raise ValueError("A deployment id is required for the unfilled entry refs")
+    init_db()
+    with get_session() as session:
+        signal_rows = session.exec(
+            select(
+                LiveSignalModel.id,
+                LiveSignalModel.symbol,
+                LiveSignalModel.broker_order_id,
+                LiveSignalModel.source,
+                LiveSignalModel.metadata_json,
+            ).where(LiveSignalModel.deployment_id == normalized_deployment_id)
+        ).all()
+        fill_rows = session.exec(
+            select(
+                LiveExecutionModel.signal_id,
+                func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0),
+            )
+            .join(LiveSignalModel, LiveExecutionModel.signal_id == LiveSignalModel.id)
+            .where(LiveSignalModel.deployment_id == normalized_deployment_id)
+            .group_by(LiveExecutionModel.signal_id)
+        ).all()
+    filled_by_signal = {str(signal_id): float(filled or 0.0) for signal_id, filled in fill_rows}
+
+    refs: set[str] = set()
+    for signal_id, symbol, broker_order_id, source, metadata in signal_rows:
+        if not str(symbol or "").strip():
+            continue
+        metadata_dict = metadata if isinstance(metadata, dict) else {}
+        is_close = (
+            _is_exit_only_signal_metadata(metadata_dict)
+            or str(source or "") == BROKER_CLOSE_SIGNAL_SOURCE
+        )
+        if is_close:
+            continue
+        if filled_by_signal.get(str(signal_id), 0.0) > _EXIT_FILL_TOLERANCE:
+            continue
+        refs.add(str(signal_id))
+        if broker_order_id:
+            refs.add(str(broker_order_id))
+    return refs
+
+
+def list_live_deployment_open_entry_counts_by_symbol(
+    deployment_id: str,
+    working_order_ids: Collection[str] | None = None,
+    broker_held_symbols: Collection[str] | None = None,
+) -> dict[str, int]:
+    """Open entry count per symbol for one deployment (#360 maintainer decision).
+
+    An *open entry* is a persisted entry signal — not exit-only and not a
+    broker-side close — that still holds quantity: its filled quantity minus
+    the reducing fills attributed to it, allocated oldest-first, is above
+    ``_EXIT_FILL_TOLERANCE``. Reducing fills are every fill on the
+    deployment's exit-only signals plus every broker-side close signal for
+    the symbol: the same rows the net ledger sums with the opposite sign.
+
+    FIFO attribution is an approximation — a deployment-level FULL_EXIT is
+    not tied to one entry — but it is conservative in the direction that
+    matters: a partially closed oldest entry keeps counting until its own
+    residual reaches zero.
+
+    An entry with no fills yet counts as one open position **only while the
+    broker still lists its order as working** — a DAY entry that expired
+    unfilled or an order cancelled after acceptance must not lock the symbol
+    forever (#360 review). ``working_order_ids`` is the adapter's
+    ``working_order_ids()`` result: broker order ids and client order ids
+    (the canonical signal id). An entry matches on either its persisted
+    ``broker_order_id`` or its signal id. When ``working_order_ids`` is
+    ``None`` the working status cannot be proven, so every unfilled entry
+    that carries a broker order id still counts — the fail-closed direction.
+
+    A *filled* order is not working either, so the working list alone cannot
+    tell "dead unfilled" from "filled but its fill is not yet booked" (the
+    trade-update stream is down, the post-restart reconcile has not run, or
+    persistence lags a bar). ``broker_held_symbols`` is the adapter's
+    non-zero-position symbol set for the account: a not-working unfilled
+    entry that carries a broker order id counts as open while its symbol is
+    held — over-counting when another deployment holds the symbol only
+    blocks entries, the fail-closed direction. ``broker_held_symbols=None``
+    means the position state could not be proven, so such an entry still
+    counts — again fail-closed. Entries with neither fills nor any order
+    reference never reached the broker and do not count.
+
+    Returns ``{SYMBOL: open entry count}`` for symbols with at least one
+    open entry; flat symbols are absent.
+    """
+    normalized_deployment_id = str(deployment_id or "").strip()
+    if not normalized_deployment_id:
+        raise ValueError("A deployment id is required for the open entry counts")
+    working = (
+        {str(order_id) for order_id in working_order_ids}
+        if working_order_ids is not None
+        else None
+    )
+    # Broker position symbols and stored signal symbols spell the same pair
+    # differently (Alpaca reports crypto as ``BTCUSD`` while a signal may say
+    # ``BTC/USD``): compare on ``crypto_pair_key``, which collapses every
+    # crypto spelling and leaves equities (``BRK.B``, ``BF-B``) untouched.
+    held_symbols = (
+        {crypto_pair_key(symbol) for symbol in broker_held_symbols}
+        if broker_held_symbols is not None
+        else None
+    )
+    init_db()
+    with get_session() as session:
+        signal_rows = session.exec(
+            select(
+                LiveSignalModel.id,
+                LiveSignalModel.symbol,
+                LiveSignalModel.timestamp,
+                LiveSignalModel.broker_order_id,
+                LiveSignalModel.source,
+                LiveSignalModel.metadata_json,
+            ).where(LiveSignalModel.deployment_id == normalized_deployment_id)
+        ).all()
+        fill_rows = session.exec(
+            select(
+                LiveExecutionModel.signal_id,
+                func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0),
+            )
+            .join(LiveSignalModel, LiveExecutionModel.signal_id == LiveSignalModel.id)
+            .where(LiveSignalModel.deployment_id == normalized_deployment_id)
+            .group_by(LiveExecutionModel.signal_id)
+        ).all()
+    filled_by_signal = {str(signal_id): float(filled or 0.0) for signal_id, filled in fill_rows}
+
+    by_symbol: dict[str, list[dict[str, Any]]] = {}
+    for signal_id, symbol, timestamp, broker_order_id, source, metadata in signal_rows:
+        normalized_symbol = str(symbol or "").strip().upper()
+        if not normalized_symbol:
+            continue
+        by_symbol.setdefault(normalized_symbol, []).append(
+            {
+                "signal_id": str(signal_id),
+                "timestamp": timestamp,
+                "broker_order_id": str(broker_order_id or ""),
+                "source": str(source or ""),
+                "metadata": metadata if isinstance(metadata, dict) else {},
+                "filled_qty": filled_by_signal.get(str(signal_id), 0.0),
+            }
+        )
+
+    counts: dict[str, int] = {}
+    for symbol, signals in by_symbol.items():
+        reducing_qty = 0.0
+        entries: list[dict[str, Any]] = []
+        for signal in signals:
+            metadata = signal["metadata"]
+            is_close = (
+                _is_exit_only_signal_metadata(metadata)
+                or str(signal["source"] or "") == BROKER_CLOSE_SIGNAL_SOURCE
+            )
+            if is_close:
+                reducing_qty += max(0.0, signal["filled_qty"])
+            else:
+                entries.append(signal)
+        entries.sort(
+            key=lambda item: (
+                item["timestamp"] is None,
+                item["timestamp"] or datetime.min.replace(tzinfo=timezone.utc),
+                item["signal_id"],
+            )
+        )
+        remaining_reduction = reducing_qty
+        open_count = 0
+        for entry in entries:
+            entry_qty = max(0.0, entry["filled_qty"])
+            if entry_qty <= _EXIT_FILL_TOLERANCE:
+                if working is None:
+                    still_open = bool(entry["broker_order_id"])
+                else:
+                    still_open = (
+                        entry["broker_order_id"] in working
+                        or entry["signal_id"] in working
+                    )
+                    if not still_open and entry["broker_order_id"]:
+                        # Not working: a filled-but-unbooked entry looks the
+                        # same as a dead unfilled one. The broker's non-zero
+                        # position is the proof it is still open; an
+                        # unreadable position set fails closed.
+                        still_open = (
+                            held_symbols is None
+                            or crypto_pair_key(symbol) in held_symbols
+                        )
+                if still_open:
+                    open_count += 1
+                continue
+            closed = min(entry_qty, remaining_reduction)
+            remaining_reduction -= closed
+            if entry_qty - closed > _EXIT_FILL_TOLERANCE:
+                open_count += 1
+        if open_count:
+            counts[symbol] = open_count
+    return counts
+
+
 def get_account_net_filled_qty_by_deployment(account_id: str, symbol: str) -> dict[str, float]:
     """Every deployment's signed net filled quantity for ``symbol`` on one account.
 
@@ -3842,6 +4274,91 @@ def get_account_net_filled_qty_by_deployment(account_id: str, symbol: str) -> di
         key = str(deployment_id)
         ledgers[key] = ledgers.get(key, 0.0) + signed
     return ledgers
+
+
+def list_live_account_filled_symbols(account_id: str) -> list[str]:
+    """Symbols with at least one persisted fill on one account.
+
+    Reconciliation compares every symbol the ledger can hold a position in, not
+    only symbols that still have an unfilled order (#303).
+    """
+    normalized_account_id = str(account_id or "").strip()
+    if not normalized_account_id:
+        raise ValueError("An account id is required for the filled-symbol ledger")
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            select(func.distinct(func.upper(LiveSignalModel.symbol)))
+            .join(LiveExecutionModel, LiveExecutionModel.signal_id == LiveSignalModel.id)
+            .join(LiveDeploymentModel, LiveDeploymentModel.id == LiveSignalModel.deployment_id)
+            .where(LiveDeploymentModel.account_id == normalized_account_id)
+        ).all()
+    return sorted({str(symbol).strip().upper() for symbol in rows if str(symbol or "").strip()})
+
+
+def list_live_account_order_expectations(account_id: str) -> list[dict[str, Any]]:
+    """Persisted signals on one account with their broker id and fill total.
+
+    Reconciliation uses these rows to know which broker orders the ledger still
+    expects to be working and which client order ids name a signal (#303). The
+    requested quantity is read from signal metadata by the caller; this function
+    only returns the persisted facts.
+    """
+    normalized_account_id = str(account_id or "").strip()
+    if not normalized_account_id:
+        raise ValueError("An account id is required for order expectations")
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            select(
+                LiveSignalModel.id,
+                LiveSignalModel.deployment_id,
+                LiveSignalModel.symbol,
+                LiveSignalModel.action,
+                LiveSignalModel.broker_order_id,
+                LiveSignalModel.metadata_json,
+                LiveSignalModel.timestamp,
+                func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0),
+            )
+            .join(LiveDeploymentModel, LiveDeploymentModel.id == LiveSignalModel.deployment_id)
+            .outerjoin(LiveExecutionModel, LiveExecutionModel.signal_id == LiveSignalModel.id)
+            .where(LiveDeploymentModel.account_id == normalized_account_id)
+            .group_by(
+                LiveSignalModel.id,
+                LiveSignalModel.deployment_id,
+                LiveSignalModel.symbol,
+                LiveSignalModel.action,
+                LiveSignalModel.broker_order_id,
+                LiveSignalModel.metadata_json,
+                LiveSignalModel.timestamp,
+            )
+        ).all()
+    return [
+        {
+            "signal_id": str(signal_id),
+            "deployment_id": str(deployment_id),
+            "symbol": str(symbol or "").strip().upper(),
+            "action": str(action or "").strip().lower(),
+            "broker_order_id": str(broker_order_id or "").strip(),
+            # A stored non-object metadata value must not raise here: the
+            # reconciliation loop treats a comparison failure as an
+            # unreadable pass, and an unreadable *requested qty* already
+            # fails closed (the order stays expected). Normalise instead.
+            "metadata": dict(metadata_json) if isinstance(metadata_json, dict) else {},
+            "timestamp": timestamp,
+            "filled_qty": float(filled_qty or 0.0),
+        }
+        for (
+            signal_id,
+            deployment_id,
+            symbol,
+            action,
+            broker_order_id,
+            metadata_json,
+            timestamp,
+            filled_qty,
+        ) in rows
+    ]
 
 
 #: A filled quantity this close to the requested one counts as fully filled.
@@ -4125,11 +4642,16 @@ def _newest_filled_entry_signal(
         offset += len(rows)
 
 
-def list_live_signal_broker_order_conflicts(limit: int = 200) -> list[dict[str, Any]]:
+def list_live_signal_broker_order_conflicts(limit: int | None = 200) -> list[dict[str, Any]]:
     """Signals whose duplicate delivery carried a different broker order id.
 
     Each row is a potentially untracked broker order: ``conflicting_broker_order_ids``
     should be checked against the broker's open orders and positions.
+
+    ``limit=None`` reads every conflicted signal. It is for the reads that must not
+    silently truncate the truth - the halt enforcement and the health read - and it
+    costs no extra work: the scan behind this is a full table scan either way, so the
+    cap only bounds the rows that come back, not the query.
     """
     init_db()
     # Filter and cap in SQL so only conflicted rows are returned (the scan itself is still a
@@ -4142,13 +4664,13 @@ def list_live_signal_broker_order_conflicts(limit: int = 200) -> list[dict[str, 
     conflict_count = func.json_array_length(
         LiveSignalModel.metadata_json, f"$.{BROKER_ORDER_CONFLICTS_KEY}"
     )
+    statement = (
+        select(LiveSignalModel).where(conflict_count > 0).order_by(LiveSignalModel.timestamp.desc())
+    )
+    if limit is not None:
+        statement = statement.limit(max(1, int(limit)))
     with get_session() as session:
-        rows = session.exec(
-            select(LiveSignalModel)
-            .where(conflict_count > 0)
-            .order_by(LiveSignalModel.timestamp.desc())
-            .limit(max(1, int(limit)))
-        ).all()
+        rows = session.exec(statement).all()
     conflicts: list[dict[str, Any]] = []
     for row in rows:
         ids = _conflicting_broker_order_ids(row.metadata_json or {})
@@ -4164,6 +4686,80 @@ def list_live_signal_broker_order_conflicts(limit: int = 200) -> list[dict[str, 
             }
         )
     return conflicts
+
+
+def resolve_live_signal_broker_order_conflicts(signal_id: str) -> list[str]:
+    """Clear the recorded conflicting broker order ids for one signal.
+
+    The way out of a conflict halt (#126): while a conflict stays recorded the daemon
+    keeps the deployment paused, so a resolution cannot be a status write and nothing
+    else. This removes the key from the signal's metadata and returns the ids it
+    removed. A malformed value stored under the key (not a list) is removed too: it
+    keeps the signal in every conflict listing, and nothing can be reconciled against
+    a spelling the ledger refuses to read.
+
+    The caller is an explicit operator action - the viewer's resolve endpoint, which
+    requires a confirmation naming the deployment and audits the call. It is not
+    reachable from a signal payload: :meth:`LiveSignalModel.from_live_signal` drops a
+    producer-supplied conflict list, and nothing else writes this key.
+
+    Returns ``[]`` for an unknown signal or one with no recorded conflict, so a caller
+    can tell "nothing to resolve" from "resolved" without reading the row.
+
+    A duplicate that lands *after* this commit still re-records the conflict, and the
+    daemon re-pauses the deployment at the next tick. That is the fail-closed direction
+    and the operator sees it in the same health read; a duplicate that commits *before*
+    this read is the one the write lock covers, because it has to be seen rather than
+    clobbered.
+    """
+    normalized = str(signal_id or "").strip()
+    if not normalized:
+        return []
+    init_db()
+    with get_session() as session:
+        # Take the write lock before reading, exactly like the conflict ledger's own
+        # read-modify-write does. Without it a duplicate committing between this read
+        # and this write would be clobbered by a stale copy of the metadata: the operator
+        # would be told the conflict was resolved and the recording that replaced it
+        # would have vanished with no record anywhere.
+        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        record = session.get(LiveSignalModel, normalized)
+        if record is None:
+            return []
+        metadata = dict(record.metadata_json or {})
+        removed = _conflicting_broker_order_ids(metadata)
+        if not removed and BROKER_ORDER_CONFLICTS_KEY not in metadata:
+            return []
+        metadata.pop(BROKER_ORDER_CONFLICTS_KEY, None)
+        record.metadata_json = metadata
+        session.add(record)
+        session.commit()
+    return removed
+
+
+def deployments_with_broker_order_conflicts(
+    limit: int | None = 200,
+) -> dict[str, list[dict[str, Any]]]:
+    """Unresolved broker order id conflicts, grouped by deployment id.
+
+    The read behind the halt: the daemon's conflict enforcement re-pauses every
+    deployment that still carries an unresolved conflict, and the viewer reports them
+    to operators. One query for the whole fleet, so neither side scans signals per
+    deployment. Both callers are periodic (a 60 s service-sync tick and an HTTP
+    request), so the cost to remember is the one already documented on
+    ``list_live_signal_broker_order_conflicts``: the scan behind this has no index for
+    the JSON key.
+
+    ``limit=None`` reads the whole ledger. The enforcement uses it on purpose: a cap
+    that silently dropped an older conflict would leave a deployment the resolution
+    cannot clear and the halt never re-asserts, and that truncation would be invisible
+    in the response. Bounded callers (an HTTP payload) keep an explicit limit and say
+    so, rather than inheriting a default nobody asked for.
+    """
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for conflict in list_live_signal_broker_order_conflicts(limit=limit):
+        grouped.setdefault(str(conflict["deployment_id"]), []).append(conflict)
+    return grouped
 
 
 def get_live_signal_timestamp(signal_id: str) -> datetime | None:
@@ -4716,7 +5312,9 @@ def _resolve_deployment_signal_source(deployment: LiveDeploymentConfig) -> tuple
 
 
 def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentConfig:
+    from live_runner.broker_reconciliation import validate_broker_reconciliation_settings
     from live_runner.loss_breaker import deployment_loss_breaker_limits
+    from live_runner.pre_submit_caps import validate_pre_submit_cap_settings
     from live_runner.stockkit_routing import validate_stockkit_deployment_route
     from risk.live import entry_gate_settings
 
@@ -4724,6 +5322,12 @@ def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentCo
     # dispatch: a value such as max_entry_deviation_sl_fraction=25 would
     # otherwise sit in the database until the first signal is rejected.
     entry_gate_settings(deployment.settings)
+    # Same for the broker-reconciliation settings (#303): a typo'd boolean
+    # or out-of-range interval is refused here, not silently defaulted later.
+    validate_broker_reconciliation_settings(deployment.settings)
+    # Same for the pre-submit hard caps (#302): a malformed cap must not sit
+    # in the database until the first order is refused by it.
+    validate_pre_submit_cap_settings(deployment.settings)
     # Loss breaker settings (#301) get the same treatment: a malformed
     # threshold would otherwise refuse every entry at dispatch.
     deployment_loss_breaker_limits(deployment)
@@ -4786,8 +5390,148 @@ def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentCo
     return record.to_live_deployment()
 
 
+#: ``settings`` key the broker reconciler uses for its entry-only halt (#303).
+#: The value is a small marker dict; only a marker written by the reconciler
+#: itself is cleared automatically (see :func:`resume_live_deployment_entries_halt`).
+ENTRIES_HALT_SETTINGS_KEY = "broker_reconciliation_entries_halted"
+ENTRIES_HALT_ACTOR = "broker_reconciliation"
+
+
+def entries_halt_marker_is_halted(value: object) -> bool:
+    """Whether a settings value counts as an entries halt.
+
+    This mirrors the atomic claim predicate in
+    :func:`claim_live_deployment_submission`: missing/null/false/0/"" are not
+    halted, while every other JSON value - including an empty object or array -
+    fails closed as halted.
+    """
+    if value is None or value is False:
+        return False
+    if isinstance(value, str):
+        return value != ""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        # Truthiness, not a float compare: 0/0.0 clear, NaN and every other
+        # number halt (fail closed), matching SQLite's ``IN (0, '')``.
+        return bool(value)
+    return True
+
+
+def set_live_deployment_entries_halt(
+    deployment_id: str, detail: Mapping[str, Any] | None
+) -> bool:
+    """Set (``detail``) or clear (``None``) the entry-only halt flag.
+
+    Persisted in ``settings`` so the halt survives a daemon restart without a
+    schema change. Returns ``False`` when the deployment does not exist.
+    """
+    normalized = str(deployment_id or "").strip()
+    if not normalized:
+        return False
+    init_db()
+    with get_session() as session:
+        record = session.get(LiveDeploymentModel, normalized)
+        if record is None:
+            return False
+        settings = dict(record.settings_json or {})
+        if detail is None:
+            settings.pop(ENTRIES_HALT_SETTINGS_KEY, None)
+        else:
+            settings[ENTRIES_HALT_SETTINGS_KEY] = dict(detail)
+        record.settings_json = settings
+        record.updated_at = _utcnow_naive()
+        session.add(record)
+        session.commit()
+    return True
+
+
+def live_deployment_entries_halted(deployment_id: str) -> bool:
+    """Fresh read of the entry-halt flag; a read failure counts as halted.
+
+    Entries are the dangerous direction, so an unreadable deployment row must
+    fail closed here - the caller blocks the entry rather than trading on a
+    stale answer. A missing row reads as *not* halted: the ACTIVE-status gate
+    upstream already refuses dispatch for a deployment that is gone, and this
+    flag can only exist on a row that does.
+    """
+    try:
+        deployment = get_live_deployment(str(deployment_id or "").strip())
+    except Exception:
+        return True
+    if deployment is None:
+        return False
+    return entries_halt_marker_is_halted(
+        (deployment.settings or {}).get(ENTRIES_HALT_SETTINGS_KEY)
+    )
+
+
+def live_deployment_entries_halt_marker(deployment_id: str) -> Mapping[str, Any] | None:
+    """The persisted entries-halt marker dict, or ``None`` when absent/unreadable.
+
+    Unlike :func:`live_deployment_entries_halted` this distinguishes *who* set
+    the halt, which the reconciler needs to write and audit only on the
+    transition into a halt it owns.
+    """
+    try:
+        deployment = get_live_deployment(str(deployment_id or "").strip())
+    except Exception:
+        return None
+    if deployment is None:
+        return None
+    marker = (deployment.settings or {}).get(ENTRIES_HALT_SETTINGS_KEY)
+    return dict(marker) if isinstance(marker, dict) else None
+
+
+def resume_live_deployment_entries_halt(deployment_id: str) -> bool:
+    """Clear the halt only when the broker reconciler set it.
+
+    Returns ``True`` when a reconciler-owned halt was actually removed, so the
+    caller can audit the resume. An operator-set or unmarked value is left
+    alone.
+    """
+    normalized = str(deployment_id or "").strip()
+    if not normalized:
+        return False
+    init_db()
+    with get_session() as session:
+        record = session.get(LiveDeploymentModel, normalized)
+        if record is None:
+            return False
+        settings = dict(record.settings_json or {})
+        halt = settings.get(ENTRIES_HALT_SETTINGS_KEY)
+        if not isinstance(halt, dict) or halt.get("by") != ENTRIES_HALT_ACTOR:
+            return False
+        settings.pop(ENTRIES_HALT_SETTINGS_KEY, None)
+        record.settings_json = settings
+        record.updated_at = _utcnow_naive()
+        session.add(record)
+        session.commit()
+    return True
+
+
+def _apply_live_deployment_status_row(row: LiveDeploymentModel, status: str) -> None:
+    """Write a deployment's status (and the fields that go with it) on a loaded row.
+
+    One definition for every writer of `live_deployments.status`, in-session and
+    session-of-its-own alike, so the two rules that travel with a status change cannot
+    drift apart between them. Those rules are what makes a status readable afterwards:
+    an unchanged `updated_at` hides the write, and a `stopped_enforced_at` left on a
+    non-STOPPED row makes the next skip of the stop enforcement look proven (see the
+    STOPPED -> PAUSED -> STOPPED cycle below).
+    """
+    row.status = status
+    if status != "STOPPED":
+        # Clear the enforcement stamp in the *same* transaction as the status change.
+        # Without this a STOPPED -> PAUSED -> STOPPED cycle keeps the old stamp, and the
+        # second stop is skipped as "already enforced" while its positions are still
+        # open. Doing it in one commit matters: a crash between the two writes must not
+        # leave a non-STOPPED deployment carrying a stamp that disables the next
+        # enforcement.
+        row.stopped_enforced_at = None
+    row.updated_at = _utcnow_naive()
+
+
 def update_live_deployment_status(
-    deployment_id: str, status: str
+    deployment_id: str, status: str, *, release_entries_halt: bool = True
 ) -> LiveDeploymentConfig | None:
     next_status = str(status or "").upper()
     if next_status not in {"ACTIVE", "PAUSED", "STOPPED"}:
@@ -4797,17 +5541,20 @@ def update_live_deployment_status(
         record = session.get(LiveDeploymentModel, deployment_id)
         if record is None:
             return None
-        record.status = next_status
-        if next_status != "STOPPED":
-            # Clear the enforcement stamp in the *same* transaction as the
-            # status change. Without this a STOPPED -> PAUSED -> STOPPED cycle
-            # keeps the old stamp, and the second stop is skipped as "already
-            # enforced" while its positions are still open. Doing it in one
-            # commit matters: a crash between the two writes must not leave a
-            # non-STOPPED deployment carrying a stamp that disables the next
-            # enforcement.
-            record.stopped_enforced_at = None
-        record.updated_at = _utcnow_naive()
+        if next_status == "ACTIVE" and release_entries_halt:
+            # Resuming is the operator's explicit "trade again": it also
+            # releases a broker-reconciliation entry halt. A still-mismatched
+            # account is re-halted on the next pass, so this cannot hide a
+            # live divergence - it only ends the halt early by decision.
+            # ``release_entries_halt=False`` is for internal status writes
+            # that merely restore a previous state (the delete endpoint's
+            # rollback): they are not an operator resume and must not clear
+            # a halt the operator never lifted.
+            settings = dict(record.settings_json or {})
+            if ENTRIES_HALT_SETTINGS_KEY in settings:
+                settings.pop(ENTRIES_HALT_SETTINGS_KEY, None)
+                record.settings_json = settings
+        _apply_live_deployment_status_row(record, next_status)
         session.add(record)
         session.commit()
         session.refresh(record)
@@ -5145,15 +5892,28 @@ def claim_live_deployment_submission(
     token: str,
     *,
     ttl_seconds: float = LIVE_SUBMISSION_CLAIM_TTL_SECONDS,
+    allow_paused: bool = False,
+    refuse_entries_halt: bool = False,
 ) -> bool:
     """Take the single submission lease for one deployment, or refuse.
 
-    Two independent facts have to hold, and both are decided by the database
+    Three independent facts have to hold, and the first two are decided by the database
     rather than by a status snapshot taken earlier in the dispatch:
 
-    * the deployment is still ``ACTIVE`` (the ``INSERT ... SELECT`` reads the
-      live row, so a PAUSE that committed first wins the race);
+    * the deployment is in a dispatchable status (the ``INSERT ... SELECT`` reads
+      the live row, so a PAUSE that committed first wins the race) - ``ACTIVE``
+      always, and ``PAUSED`` only when ``allow_paused`` is set;
     * no other process holds a lease for it (``UNIQUE(deployment_id)``).
+
+    ``allow_paused`` is for exits only (the #126 decision): a PAUSED deployment closes
+    what it holds but opens nothing. The caller is the daemon's claim site, which knows
+    the signal kind; leaving it at the default keeps a plain status gate for entries.
+
+    ``refuse_entries_halt`` adds a third fact for *entry* submissions only:
+    the broker-reconciliation entries halt is checked inside the same
+    statement, so a halt committed while the dispatcher was sizing the order
+    still wins the race. Exits pass ``False`` - the halt is entry-only and
+    must never freeze them.
 
     An expired lease is deleted first, in its own committed transaction, so a
     claimer that died mid-submission cannot wedge the deployment forever. The
@@ -5168,6 +5928,21 @@ def claim_live_deployment_submission(
     init_db()
     now = _utcnow_naive()
     expires_at = now + timedelta(seconds=max(float(ttl_seconds), 0.01))
+    halt_predicate = ""
+    if refuse_entries_halt:
+        # json_extract mirrors live_deployment_entries_halted's truthiness for
+        # every JSON type: missing/null/false/0/"" read as not halted, anything
+        # else (the reconciler always stores a non-empty marker dict) blocks.
+        halt_predicate = (
+            "AND COALESCE(json_extract(settings, "
+            f"'$.{ENTRIES_HALT_SETTINGS_KEY}'), 0) IN (0, '')"
+        )
+    # Built from the shared status tuple, never from caller text, so the set cannot be
+    # widened by anything but this flag - and so the daemon's dispatch statuses and this
+    # filter cannot drift apart.
+    allowed = LIVE_DISPATCH_EXIT_STATUSES if allow_paused else LIVE_DISPATCH_ENTRY_STATUSES
+    status_list = ", ".join(f"'{status}'" for status in allowed)
+    status_filter = f"UPPER(status) IN ({status_list})"
     with get_session() as session:
         session.exec(
             delete(LiveDeploymentSubmissionClaimModel).where(
@@ -5183,7 +5958,8 @@ def claim_live_deployment_submission(
                     "INSERT INTO live_deployment_submission_claims "
                     "(token, deployment_id, claimed_at, expires_at) "
                     "SELECT :token, id, :claimed_at, :expires_at FROM live_deployments "
-                    "WHERE id = :deployment_id AND UPPER(status) = 'ACTIVE'"
+                    f"WHERE id = :deployment_id AND {status_filter} "
+                    f"{halt_predicate}"
                 ),
                 {
                     "token": normalized_token,
@@ -6871,6 +7647,10 @@ def _backtest_metadata_payload(backtest: BacktestRecord, trade_count: int) -> di
         "total_return": _stat_number_or_undefined(stats, "total_return", 0.0),
         "cagr": _stat_number_or_undefined(stats, "cagr", 0.0),
         "sharpe_ratio": _stat_number_or_undefined(stats, "sharpe_ratio", 0.0),
+        # #349: lets ranking tell pre-#229 rows (fixed sqrt(252) on the
+        # unfiltered calendar-filled series, field absent) from rows on the
+        # asset-class convention (252 equities/FX/CFDs, 365 crypto).
+        "equity_return_periods_per_year": stats.get("equity_return_periods_per_year"),
         "psr": _stat_number_or_undefined(stats, "psr", 0.0),
         "p_value": _stat_number_or_undefined(stats, "p_value", 1.0),
         "max_drawdown": _stat_number_or_undefined(stats, "max_drawdown_pct", 0.0),

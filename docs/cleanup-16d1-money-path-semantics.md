@@ -28,19 +28,32 @@ the price data.
 `self.equity = initial + realized + unrealized` — open positions' paper profit
 compounded into the next entry's quantity, and paper drawdown shrank it.
 
+**Regression found in #190 and re-fixed there:** the 16-D2 structural split
+(`runner/engine.py` → `runner/engine_pkg/`) dropped `_sizing_equity` and
+reverted every sizing call to `self.equity`. The two F21 tests stayed green only
+because creation sizing runs *before* the bar's `_update_equity`, so the
+mark-to-market figure they compared against lagged one bar and happened to be
+realized in that fixture. The fill-time re-size added in #190 removed the lag
+and exposed it. `_sizing_equity` is restored (initialised in `__init__`,
+refreshed in `_close_partial` and `_finalize_position`, and used by
+`_calculate_position_size` / `_current_risk_exposure`).
+
 **Decision:** sizing draws on `_sizing_equity = initial_capital + realized_pnl`
 (realized cash only). `self.equity` remains the mark-to-market *reporting*
 equity for the curve. Sizing is therefore indifferent to open-trade
 fluctuations: unrealized profit is not spendable, and unrealized loss does not
 shrink new positions. Every sizing input reads that one basis — the risk
-engine's `account_balance`, the notional/leverage caps
-(`_sizing_equity × position_notional_limit`, and the
-`max_position_exposure_pct` arm), the aggregate-exposure denominator
+engine's `account_balance`, the notional/exposure caps
+(`_sizing_equity × max_position_exposure_pct`), the aggregate-exposure
+denominator
 (`_current_risk_exposure`) and `equity_at_entry`, the recorded basis the
 multi-symbol shared-equity replay (`replay_shared_equity`) divides the
 quantity by — that replay accumulates realized PnL only, so a mark-to-market
 `equity_at_entry` would rescale a realized-cash quantity by a reporting
-denominator. Each order carries the basis its own quantity was computed from,
+denominator. The one exception is the #347 free-margin leverage check,
+which reads mark-to-market equity and used margin by design (MT5-style
+margin) — it is a clamp on the sized quantity, not a sizing basis. Each
+order carries the basis its own quantity was computed from,
 so the recorded figure is the fill-time basis for an order that is re-sized at
 fill and the creation-time basis for the fallback-sized MARKET order that
 keeps its creation quantity under the D4 exception.
@@ -118,6 +131,23 @@ protocol is **deliberately untouched** here — it is a deliberate MT5-alignment
 interface (see `docs/mt5-backtest-alignment-plan.md`), documented rather than
 removed; only the equity base it reads was wrong and is fixed.
 
+**Leverage/margin check moved to free margin (#347):** the maintainer
+decisions on #267/#240/#329 resolved the open question this branch left —
+the leverage cap is no longer denominated in realized cash. It is now
+MT5-style: an order's margin (notional / `max_leverage`, the broker maximum
+for the account/asset; unknown → 1x) must fit **free margin** =
+mark-to-market equity − margin already used by open positions, marked at
+the sizing price. An order that would need more leverage than the broker
+maximum is clamped down (floored to `lot_step` when the leverage cap binds)
+instead of refused. #329 (open) proposes live pre-submit caps judging
+against `broker_leverage × equity` without used margin; #359 tracks
+moving them to the same free-margin rule — backtest and live do NOT yet
+apply the identical rule. The
+mark-to-market equity here is the *margin-check* input only — the sizing
+target, the exposure cap and the aggregate-exposure denominator all stay on
+realized cash. Pinned by
+`tests/test_engine_behavior.py::TestFreeMarginLeverageCap`.
+
 **Pinned by:** `tests/test_engine_behavior.py::TestSizingEquityExcludesUnrealizedPnl`.
 The two original scenarios are basis-blind (the first entry fills at the next
 bar's open, so its paper PnL only reaches equity on the bar the second entry is
@@ -162,9 +192,22 @@ creation-price estimate forever.
 actually fill. MARKET re-sizes at the next-bar open (creation sizing is only
 the pending estimate); LIMIT/STOP/STOP_LIMIT re-size from their trigger price
 at fill. Quantities across order types are now computed from the same rule:
-quantity = sizing rule evaluated at the fill price. One documented exception:
-a MARKET order **without any stop** has no fill-time risk input, so its
-creation-time estimate (signal-bar close) stands.
+quantity = sizing rule evaluated at the fill price.
+
+**Superseded (#190):** the original record carried one exception — a MARKET
+order **without any stop** kept its creation-time (signal-bar close) estimate
+because it was said to have "no fill-time risk input". That premise is false:
+a stopless order has a documented fill-time risk input, the fallback stop
+(`allow_fallback_stop` / `RiskConfig.fallback_stop_pct`, see
+`docs/live-risk-consistency.md`), which the risk engine derives from the entry
+price it is handed — and `docs/cross-engine-backtest-contract.md` §4 documents
+that fallback as "2% of entry". Keeping the exception also breached the
+documented notional cap: the cap is `equity * leverage / fill`, but the quantity
+came from the signal close, so a gap between them sized a position beyond the
+cap (#189's `gap_up_at_fill` repro: 103.4k notional on a 100k equity / 1x cap;
+vectorbt and the differential reference both cap it). MARKET orders therefore
+re-size at the fill like every other order type, fallback stop included, and
+the fallback stop level recorded in `trade.meta` is anchored to the fill.
 
 **Scope note:** F23 also lists the O(n) intrabar replay
 (`engine.py` `iterrows()` window per bar instead of searchsorted). That is a
@@ -173,7 +216,8 @@ behavior only; the perf fix lands with the structural cleanup (16-D2) to keep
 the golden-master diffs reviewable.
 
 **Pinned by:** `tests/test_engine_behavior.py::TestOrderTypeSizingSemantics`
-(LIMIT, STOP and the stopless-MARKET exception).
+(LIMIT and STOP re-sized at the trigger price, and the stopless MARKET order
+sized at the fill price with the fallback stop anchored to it — no exception).
 
 ## D5 — Stats definitions are environment-independent (F17)
 
@@ -192,6 +236,12 @@ installed but the daily series unresolvable, metrics silently 0.0 — is closed
 by falling through to the manual 252-period path on raw period returns in that
 case instead of staying at 0.0. The dead `_infer_periods_per_year` /
 `_annualize_total_return` helpers of the old fallback path are removed.
+
+> Update (#229): Sharpe/Sortino annualisation later moved to the asset-class
+> convention — calendar-filled weekend/holiday rows dropped, then 252 for
+> equities/FX/CFDs or 365 for 24/7 crypto (maintainer decision 2026-11-22);
+> the sqrt(252) wording above records the D5 decision as made, not the
+> current contract.
 
 **Daily series includes the first trading day.** The daily equity build writes
 an inception point at the window start (00:00) and a close at
@@ -394,8 +444,17 @@ this code (older persisted artifacts keep their original numbers):
 - Portfolio-optimizer `sharpe`/`oos_sharpe` are annualized (F36); values
   produced before 16-D1 are per-observation and ~15.9x smaller on daily
   curves.
-- `sharpe_ratio`/`sortino_ratio` are annualized with `sqrt(252)` on daily
-  returns, on both code paths. When the equity curve's timestamps cannot be
+- `sharpe_ratio`/`sortino_ratio` are annualized with `sqrt(periods)` on
+  daily returns, on both code paths, where `periods` is the asset-class
+  convention (#229 maintainer decision 2026-11-22): calendar-filled
+  weekend/holiday rows — days the venue was closed, whose forward-filled
+  equity can only produce a zero return — are dropped before the ratio is
+  computed, then 252 applies for equities/FX/CFDs and 365 for an all-crypto
+  (24/7) book, published as `equity_return_periods_per_year`. Trading days
+  come from `shared.venue_calendar` resolved from the run's symbols,
+  source and asset-class metadata; an unresolvable venue falls back to the
+  Monday–Friday grid and is never treated as 24/7. When the equity curve's
+  timestamps cannot be
   parsed the observation spacing is unknown, so the annualisation factor is
   unknown: Sharpe, Sortino and PSR are listed in `undefined_metrics` (and
   published as `0.0`, the repo's convention for an undefined metric) and
