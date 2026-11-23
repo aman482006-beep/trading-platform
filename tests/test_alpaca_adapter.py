@@ -2088,6 +2088,94 @@ def test_get_max_leverage_unreadable_multiplier_fails_closed() -> None:
     assert asyncio.run(_adapter(client).get_max_leverage("AAPL")) is None
 
 
+# ── get_used_margin (#359) ────────────────────────────────────────────────────
+
+
+def test_get_used_margin_prefers_the_brokers_initial_margin() -> None:
+    # The broker's own figure already prices marginable vs non-marginable and
+    # crypto positions; it wins over any local approximation.
+    client = _FakeTradingClient()
+    client.account.initial_margin = "1234.56"
+    assert asyncio.run(_adapter(client).get_used_margin()) == pytest.approx(1234.56)
+
+
+def test_get_used_margin_falls_back_to_position_notionals_over_leverage() -> None:
+    # No initial_margin on the account: sum |market value| / effective
+    # leverage — min(multiplier, 2) for marginable stocks, 1x for crypto and
+    # non-marginable assets.
+    client = _FakeTradingClient()
+    client.positions = [
+        SimpleNamespace(
+            symbol="AAPL", market_value="100000", asset_class="us_equity",
+            asset_marginable=True,
+        ),
+        SimpleNamespace(
+            symbol="BTC/USD", market_value="-40000", asset_class="crypto",
+            asset_marginable=False,
+        ),
+        SimpleNamespace(
+            symbol="XYZ", market_value="30000", asset_class="us_equity",
+            asset_marginable=False,
+        ),
+    ]
+    # multiplier "2" -> overnight leverage 2 for the marginable stock only:
+    # 100000/2 + 40000/1 + 30000/1 = 120000.
+    assert asyncio.run(_adapter(client).get_used_margin()) == pytest.approx(120_000.0)
+
+
+def test_get_used_margin_fallback_without_positions_is_zero() -> None:
+    client = _FakeTradingClient()
+    assert asyncio.run(_adapter(client).get_used_margin()) == 0.0
+
+
+def test_get_used_margin_returns_none_when_positions_are_unreadable() -> None:
+    client = _FakeTradingClient()
+
+    def _boom():
+        raise RuntimeError("positions endpoint down")
+
+    client.get_all_positions = _boom
+    assert asyncio.run(_adapter(client).get_used_margin()) is None
+
+
+def test_get_used_margin_raises_on_an_unreadable_position_value() -> None:
+    # A partial sum would understate used margin and overstate free margin:
+    # ``parse_money`` raises ``MoneyParseError`` so the caps refuse.
+    from shared.money import MoneyParseError
+
+    client = _FakeTradingClient()
+    client.positions = [
+        SimpleNamespace(symbol="AAPL", market_value=None),
+    ]
+    with pytest.raises(MoneyParseError):
+        asyncio.run(_adapter(client).get_used_margin())
+
+
+def test_get_used_margin_raises_on_a_non_finite_position_value() -> None:
+    # market_value is Optional[str] on the broker model; "nan" parses but is
+    # not a usable notional, so the fallback must fail closed like any other
+    # unreadable figure.
+    from shared.money import MoneyParseError
+
+    client = _FakeTradingClient()
+    client.positions = [
+        SimpleNamespace(symbol="AAPL", market_value="nan"),
+    ]
+    with pytest.raises(MoneyParseError):
+        asyncio.run(_adapter(client).get_used_margin())
+
+
+def test_get_used_margin_raises_on_a_garbage_initial_margin() -> None:
+    # A present-but-unreadable ``initial_margin`` is not "absent": it raises
+    # so the caps refuse, instead of silently degrading to the approximation.
+    from shared.money import MoneyParseError
+
+    client = _FakeTradingClient()
+    client.account.initial_margin = "junk"
+    with pytest.raises(MoneyParseError):
+        asyncio.run(_adapter(client).get_used_margin())
+
+
 def test_get_max_leverage_garbage_multiplier_raises_money_parse_error() -> None:
     # A present-but-unreadable multiplier is not "absent": it raises so the
     # caps' ``_safe_max_leverage`` maps it to the 1x ceiling, never to a guess.

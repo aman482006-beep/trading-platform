@@ -2213,6 +2213,75 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             return None
         return min(multiplier, _ALPACA_OVERNIGHT_MAX_LEVERAGE)
 
+    async def get_used_margin(self) -> float | None:
+        """Margin held against open positions, in USD (#359).
+
+        Primary source is the broker's own ``account.initial_margin`` — it
+        already prices marginable vs non-marginable and crypto positions
+        correctly, which a notional/multiplier approximation would not. When
+        the account does not report it, falls back to Σ |market value| /
+        effective leverage per position — 1x for crypto and non-marginable
+        assets, ``min(multiplier, 2)`` otherwise (the same overnight Reg T
+        ceiling :meth:`get_max_leverage` applies; an unreadable multiplier
+        degrades to 1x, the conservative direction). ``None`` when neither
+        figure can be determined — the pre-submit caps fail closed on it.
+
+        ``asset_marginable is not True`` maps to 1x: only an explicit broker
+        ``True`` earns the overnight leverage, so a missing flag is treated
+        like non-marginable. Shorts' higher maintenance requirement is not
+        modelled — it only matters when ``initial_margin`` is absent, since
+        the broker's own figure already prices it correctly.
+        """
+        if not self._connected or self._trading_client is None:
+            await self.connect()
+        trading_client = self._trading_client
+        if trading_client is None:
+            raise RuntimeError(
+                "Alpaca adapter must be connected before requesting the account"
+            )
+        account = await asyncio.to_thread(trading_client.get_account)
+        # A present-but-unreadable ``initial_margin`` raises ``MoneyParseError``
+        # (the caps then refuse); only an absent field falls back to the
+        # notional/leverage approximation.
+        initial_margin = parse_optional(getattr(account, "initial_margin", None))
+        if initial_margin is not None:
+            return initial_margin
+
+        multiplier = parse_optional(getattr(account, "multiplier", None))
+        overnight_leverage = (
+            min(multiplier, _ALPACA_OVERNIGHT_MAX_LEVERAGE)
+            if multiplier is not None and multiplier > 0
+            else 1.0
+        )
+        try:
+            rows = await asyncio.to_thread(trading_client.get_all_positions)
+        except Exception as exc:  # except-kind: money-decision
+            logger.warning(
+                "Alpaca positions lookup for used margin failed",
+                extra={"data": {"error": repr(exc)}},
+            )
+            return None
+        total = 0.0
+        for row in rows:
+            # ``parse_money`` raises on a missing or garbage market value: a
+            # partial sum would understate used margin and overstate free
+            # margin, the unsafe direction.
+            notional = abs(parse_money(getattr(row, "market_value", None)))
+            if _is_flat(notional):
+                continue
+            symbol = str(getattr(row, "symbol", "") or "").strip().upper()
+            asset_class = str(getattr(row, "asset_class", "") or "").strip().lower()
+            marginable = getattr(row, "asset_marginable", None)
+            leverage = overnight_leverage
+            if (
+                asset_class == "crypto"
+                or classify_symbol(symbol) == "crypto"
+                or marginable is not True
+            ):
+                leverage = 1.0
+            total += notional / leverage
+        return total
+
     async def get_pip_value(self, symbol: str) -> LivePipValue:
         """One share (or coin) moves the USD account by 1.0 per 1.0 USD move (#146).
 

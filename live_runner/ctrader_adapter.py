@@ -991,6 +991,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._ProtoOAUnsubscribeSpotsReq: Any = None
         self._ProtoOAGetDynamicLeverageByIDReq: Any = None
         self._ProtoOAGetDynamicLeverageByIDRes: Any = None
+        self._ProtoOAGetPositionUnrealizedPnLReq: Any = None
+        self._ProtoOAGetPositionUnrealizedPnLRes: Any = None
 
         self._heartbeat_payload_type: int | None = None
         self._spot_payload_type: int | None = None
@@ -1019,6 +1021,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 ProtoOAExecutionEvent,
                 ProtoOAGetDynamicLeverageByIDReq,
                 ProtoOAGetDynamicLeverageByIDRes,
+                ProtoOAGetPositionUnrealizedPnLReq,
+                ProtoOAGetPositionUnrealizedPnLRes,
                 ProtoOANewOrderReq,
                 ProtoOAOrderDetailsReq,
                 ProtoOAOrderDetailsRes,
@@ -1078,6 +1082,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._ProtoOAOrderListRes = ProtoOAOrderListRes
         self._ProtoOAGetDynamicLeverageByIDReq = ProtoOAGetDynamicLeverageByIDReq
         self._ProtoOAGetDynamicLeverageByIDRes = ProtoOAGetDynamicLeverageByIDRes
+        self._ProtoOAGetPositionUnrealizedPnLReq = ProtoOAGetPositionUnrealizedPnLReq
+        self._ProtoOAGetPositionUnrealizedPnLRes = ProtoOAGetPositionUnrealizedPnLRes
         self._ProtoOAOrderListByPositionIdReq = ProtoOAOrderListByPositionIdReq
         self._ProtoOAOrderListByPositionIdRes = ProtoOAOrderListByPositionIdRes
         self._ProtoOADealListReq = ProtoOADealListReq
@@ -3310,8 +3316,14 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         scale = money_scale(digits)
         total = 0.0
         for position_pnl in response.positionUnrealizedPnL:
-            total += parse_money(getattr(position_pnl, "netUnrealizedPnL", None))
-        return total / scale
+            # Fail closed per entry (#302): an unreadable or non-finite
+            # netUnrealizedPnL read as 0.0 would understate a losing position
+            # and overstate equity - the unsafe direction for both the loss
+            # breaker and the pre-submit caps' free-margin ceiling.
+            # ``parse_money`` raises ``MoneyParseError`` on a missing or
+            # garbage field, so the whole equity read fails closed.
+            total += parse_money(getattr(position_pnl, "netUnrealizedPnL", None)) / scale
+        return total
 
     async def get_balance(self) -> tuple[float, float]:
         trader = await self._fetch_trader()
@@ -3325,13 +3337,54 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 equity = raw_equity / scale
         return balance, equity
 
+    async def get_used_margin(self) -> float | None:
+        """Margin held against open positions, summed in account currency (#359).
+
+        Sums the broker-reported ``ProtoOAPosition.usedMargin`` of every OPEN
+        position — cTrader has already applied each position's own leverage
+        (account leverage clamped by the symbol's volume tier), so no leverage
+        lookup is needed here. ``None`` when the reconcile or any open
+        position's margin figure is unreadable: a partial sum would understate
+        used margin and overstate the free margin the pre-submit caps judge
+        the order against.
+        """
+        try:
+            self._raise_if_terminal_auth_failed()
+            if not self._connected or not self._authenticated:
+                await self.connect()
+            reconcile_res = await self._reconcile_state()
+            total = 0.0
+            for position in getattr(reconcile_res, "position", []) or []:
+                status = int(getattr(position, "positionStatus", 0) or 0)
+                if status != self._ProtoOAPositionStatus.POSITION_STATUS_OPEN:
+                    continue
+                used = _optional_float(getattr(position, "usedMargin", None))
+                digits = getattr(position, "moneyDigits", None)
+                if used is None or used < 0 or digits is None:
+                    return None
+                try:
+                    digits_int = int(digits)
+                except (TypeError, ValueError, OverflowError):
+                    return None
+                if digits_int < 0:
+                    return None
+                total += used / money_scale(digits_int)
+            return total
+        except Exception as exc:  # except-kind: money-decision
+            logger.warning(
+                "cTrader used-margin lookup failed; treating it as unknown",
+                extra={"data": {"error": repr(exc)}},
+            )
+            return None
+
     async def get_equity(self) -> float:
         """Account equity including unrealized P&L, for the loss breaker (#301).
 
         Deliberately a separate path from :meth:`get_balance`: the #267
         maintainer decision keeps position sizing on realized balance, so
-        ``get_balance`` must not start carrying unrealized P&L. Only the
-        breaker reads this. ``ProtoOATrader`` has no equity field, so equity
+        ``get_balance`` must not start carrying unrealized P&L. The loss
+        breaker (#301) and the pre-submit caps' free-margin ceiling (#302,
+        #359) read this. ``ProtoOATrader`` has no equity field, so equity
         is balance plus the summed net unrealized P&L of open positions -
         reporting balance here would hide an open losing position until it
         closes. Any failure raises: unreadable equity is never "no loss".
