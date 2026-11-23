@@ -30,7 +30,10 @@ from live_runner.alpaca_fees import (
 )
 from live_runner.base_adapter import (
     EXIT_ONLY_RISK_SIZING_MODE,
+    ORDER_STATE_TERMINAL,
+    ORDER_STATE_WORKING,
     BaseLiveAdapter,
+    BrokerOrderView,
     ControlOutcome,
     LivePipValue,
     LiveQuote,
@@ -125,6 +128,65 @@ _EXTENDED_HOURS_BRACKET_MESSAGE = (
     "the broker rejects bracket orders with extended_hours enabled "
     "(signal_id={signal_id}, symbol={symbol})."
 )
+
+#: Order statuses that account for an expected order without proving it is
+#: still working (#303 reconciliation lookups). "Terminal" here means "not a
+#: missing-order mismatch", not necessarily final at the broker: done_for_day,
+#: stopped and suspended orders are accounted for but can reappear, while an
+#: unrecognised status stays "unknown" and fails closed.
+_ALPACA_ACCOUNTED_ORDER_STATUSES = frozenset(
+    {
+        "filled",
+        "canceled",
+        "expired",
+        "rejected",
+        "done_for_day",
+        "stopped",
+        "suspended",
+        "replaced",
+    }
+)
+_ALPACA_WORKING_ORDER_STATUSES = frozenset(
+    {
+        "new",
+        "partially_filled",
+        "pending_cancel",
+        "pending_replace",
+        "pending_new",
+        "pending_review",
+        "accepted",
+        "accepted_for_bidding",
+        "held",
+    }
+)
+
+#: Default per-request HTTP timeout for the alpaca-py REST session. alpaca-py
+#: exposes no timeout knob; without one a hung socket keeps its executor
+#: thread forever, which is how a reconciliation read used to leak workers.
+ALPACA_HTTP_TIMEOUT_SECONDS = 30.0
+
+
+def _install_http_timeout(client: Any, timeout_seconds: float) -> None:
+    """Give the alpaca-py REST session a default per-request timeout.
+
+    ``RESTClient`` has no timeout parameter and ``requests.Session`` has no
+    session-level default, so the session's ``request`` entry point is wrapped
+    once. A hung socket then fails the call instead of pinning an executor
+    thread forever.
+    """
+    session = getattr(client, "_session", None)
+    if session is None or getattr(session, "_tp_timeout_installed", False):
+        return
+    original_request = getattr(session, "request", None)
+    if not callable(original_request):
+        return
+
+    def _request_with_timeout(method: str, url: str, **kwargs: Any) -> Any:
+        kwargs.setdefault("timeout", timeout_seconds)
+        return original_request(method, url, **kwargs)
+
+    session.request = _request_with_timeout
+    session._tp_timeout_installed = True
 
 
 def _round_bracket_price_toward_entry(price: float, *, entry_price: float) -> float:
@@ -269,6 +331,28 @@ def _order_type(order: Any) -> str:
         raw = _order_attr(order, "type", "")
     text = str(getattr(raw, "value", raw) or "").strip().lower()
     return text.rsplit(".", 1)[-1]
+
+
+def _order_remaining_qty(order: Any) -> float | None:
+    """Remaining working quantity for a broker order, when both fields are readable.
+
+    ``None`` means "unknown" — an absent field or one that does not parse —
+    and is never read as zero. ``parse_optional`` raises ``MoneyParseError``
+    on a present-but-garbage field; it is caught here so one malformed order
+    reports an unknown qty instead of failing the whole working-orders read.
+    """
+    try:
+        qty = parse_optional(_order_attr(order, "qty", None))
+        filled = parse_optional(_order_attr(order, "filled_qty", None))
+    except MoneyParseError:
+        return None
+    if qty is None or filled is None:
+        return None
+    remaining = qty - filled
+    # The order is still on the broker's working list, so a non-positive
+    # remainder means "filled but not yet off the book": report 0 remaining,
+    # not the full qty — the field only feeds finding detail.
+    return remaining if remaining > 0 else 0.0
 
 
 def _usable_stop_price(order: Any) -> float | None:
@@ -1067,6 +1151,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 "alpaca-py is required for AlpacaLiveAdapter. Install package 'alpaca-py'."
             ) from exc
         self._trading_client = TradingClient(self.api_key, self.secret_key, paper=self.paper)
+        _install_http_timeout(self._trading_client, ALPACA_HTTP_TIMEOUT_SECONDS)
         self._trading_stream = TradingStream(self.api_key, self.secret_key, paper=self.paper)
         self._historical_data_client = StockHistoricalDataClient(
             self.api_key, self.secret_key
@@ -2705,6 +2790,84 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                         ids.add(order_id)
         return ids
 
+    async def list_reconciliation_orders(self) -> list[BrokerOrderView]:
+        """Working orders with client ids and position-protection marks (#303)."""
+        client = await self._require_trading_client()
+        orders = await self._list_open_orders(client, nested=True)
+        protection_sides = await self._protection_sides_by_symbol()
+        protected_ids = self._reconciliation_protection_ids(orders, protection_sides)
+        views: list[BrokerOrderView] = []
+        seen: set[str] = set()
+        for order in orders:
+            for item in (order, *_order_legs(order)):
+                order_id = _control_order_id(_order_attr(item, "id"))
+                client_order_id = _control_order_id(_order_attr(item, "client_order_id"))
+                if order_id is None and client_order_id is None:
+                    continue
+                key = order_id or client_order_id or ""
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                views.append(
+                    BrokerOrderView(
+                        order_id=key,
+                        client_order_id=str(client_order_id or ""),
+                        symbol=_order_symbol(item),
+                        side=_order_side(item),
+                        qty=_order_remaining_qty(item),
+                        order_type=_order_type(item),
+                        protection=key in protected_ids,
+                    )
+                )
+        return views
+
+    async def get_order_state(self, order_id: str, *, client_order_id: str = "") -> str | None:
+        """Working/terminal state of one order for reconciliation (#303).
+
+        Tries the broker order id first, then the client order id (the
+        persisted signal id). ``None`` - an error, a 404 or an unrecognised
+        status - always fails closed: the reconciler keeps its finding.
+        """
+        client = await self._require_trading_client()
+        candidates: list[str] = []
+        for value in (order_id, client_order_id):
+            text = str(value or "").strip()
+            if text and text not in candidates:
+                candidates.append(text)
+        states = [
+            await self._alpaca_order_state(client, candidate)
+            for candidate in candidates
+        ]
+        if ORDER_STATE_WORKING in states:
+            return ORDER_STATE_WORKING
+        if ORDER_STATE_TERMINAL in states:
+            return ORDER_STATE_TERMINAL
+        return None
+
+    async def _alpaca_order_state(self, client: Any, order_id: str) -> str | None:
+        order = None
+        get_by_id = getattr(client, "get_order_by_id", None)
+        if callable(get_by_id):
+            try:
+                order = await asyncio.to_thread(get_by_id, order_id)
+            except Exception:  # except-kind: money-decision
+                order = None
+        if order is None:
+            get_by_client = getattr(client, "get_order_by_client_id", None)
+            if callable(get_by_client):
+                try:
+                    order = await asyncio.to_thread(get_by_client, order_id)
+                except Exception:  # except-kind: money-decision
+                    order = None
+        if order is None:
+            return None
+        status = _order_status(order)
+        if status in _ALPACA_ACCOUNTED_ORDER_STATUSES:
+            return ORDER_STATE_TERMINAL
+        if status in _ALPACA_WORKING_ORDER_STATUSES:
+            return ORDER_STATE_WORKING
+        return None
+
     def exit_qty_step(self, symbol: str) -> float:
         """Alpaca's smallest quantity step (9 decimals): what an exit is floored to."""
         return 1e-9
@@ -2716,6 +2879,42 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         half a step absorbs float summation noise without hiding a real share.
         """
         return 0.5e-9
+
+    @staticmethod
+    def _reconciliation_protection_ids(
+        orders: list[Any], protection_side_by_symbol: dict[str, str]
+    ) -> set[str]:
+        """Ids of working orders that are position protection, not ledger orders.
+
+        Deliberately narrower than the cancel sweep's ``_protection_order_ids``:
+        the sweep spares *any* reduce-side order because a flatten follows it,
+        but reconciliation must still match the orders the ledger expects -
+        and this adapter's exits are market orders, so "reduces a position" alone
+        cannot mean protection here. Protection is a bracket leg nested under a
+        working parent, or a resting (non-market) reduce-side order such as an
+        orphaned take-profit/stop leg. A working market exit stays matchable.
+        """
+        protected: set[str] = set()
+        for order in orders:
+            for leg in _order_legs(order):
+                for attr in ("id", "client_order_id"):
+                    leg_id = _control_order_id(_order_attr(leg, attr))
+                    if leg_id is not None:
+                        protected.add(leg_id)
+            symbol = _order_symbol(order)
+            expected_side = protection_side_by_symbol.get(symbol)
+            raw_side = _order_attr(order, "side", "")
+            side = str(getattr(raw_side, "value", raw_side) or "").strip().lower()
+            if (
+                expected_side
+                and side == expected_side
+                and _order_type(order) != "market"
+            ):
+                for attr in ("id", "client_order_id"):
+                    order_id = _control_order_id(_order_attr(order, attr))
+                    if order_id is not None:
+                        protected.add(order_id)
+        return protected
 
     @staticmethod
     def _protection_order_ids(

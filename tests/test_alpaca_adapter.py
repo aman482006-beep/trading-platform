@@ -2049,6 +2049,156 @@ def test_alpaca_exit_qty_step_is_one_fractional_share_step() -> None:
     assert adapter.exit_qty_step("AAPL") == pytest.approx(1e-9)
 
 
+def test_reconciliation_orders_do_not_mark_market_exits_as_protection() -> None:
+    """#303: a working exit is a market order; "reduces a position" alone must
+    not mark it protection, or the reconciler reports it missing and halts
+    entries on a healthy account."""
+    client = _FakeTradingClient(
+        orders=[
+            _FakeOrder("exit-1", "AAPL", "sell", order_type="market"),
+            _FakeOrder("tp-1", "AAPL", "sell", order_type="limit"),
+            _FakeOrder("sl-1", "AAPL", "sell", order_type="stop", stop_price=90.0),
+            _FakeOrder("entry-1", "MSFT", "buy", order_type="limit"),
+        ],
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+
+    views = {
+        view.order_id: view
+        for view in asyncio.run(_adapter(client).list_reconciliation_orders())
+    }
+
+    assert views["exit-1"].protection is False
+    assert views["tp-1"].protection is True
+    assert views["sl-1"].protection is True
+    assert views["entry-1"].protection is False
+
+
+def test_reconciliation_orders_mark_bracket_legs_as_protection() -> None:
+    legs = [
+        _FakeOrder("leg-tp", "AAPL", "sell", order_type="limit"),
+        _FakeOrder("leg-sl", "AAPL", "sell", order_type="stop", stop_price=90.0),
+    ]
+    client = _FakeTradingClient(
+        orders=[_FakeOrder("parent-1", "AAPL", "buy", order_type="market", legs=legs)],
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+
+    views = {
+        view.order_id: view
+        for view in asyncio.run(_adapter(client).list_reconciliation_orders())
+    }
+
+    assert views["leg-tp"].protection is True
+    assert views["leg-sl"].protection is True
+
+
+def test_order_remaining_qty_reports_qty_minus_filled() -> None:
+    from live_runner.alpaca_adapter import _order_remaining_qty
+
+    assert _order_remaining_qty(_FakeOrder("o1", "AAPL", "buy", qty=10.0, filled_qty=4.0)) == pytest.approx(6.0)
+
+
+def test_order_remaining_qty_is_none_when_qty_is_unreadable() -> None:
+    from live_runner.alpaca_adapter import _order_remaining_qty
+
+    assert _order_remaining_qty(_FakeOrder("o1", "AAPL", "buy", qty="junk", filled_qty=0.0)) is None
+    assert _order_remaining_qty(_FakeOrder("o1", "AAPL", "buy", qty=None, filled_qty=0.0)) is None
+
+
+def test_order_remaining_qty_is_none_when_filled_qty_is_unreadable() -> None:
+    # An unreadable filled_qty is "unknown", never 0: guessing 0 would
+    # overstate the working quantity.
+    from live_runner.alpaca_adapter import _order_remaining_qty
+
+    assert _order_remaining_qty(_FakeOrder("o1", "AAPL", "buy", qty=10.0, filled_qty="junk")) is None
+    assert _order_remaining_qty(_FakeOrder("o1", "AAPL", "buy", qty=10.0, filled_qty=None)) is None
+
+
+def test_order_remaining_qty_reports_zero_when_filled_covers_qty() -> None:
+    # filled >= qty on an order still listed as working means "filled but not
+    # yet off the book": the remaining working qty is 0, not the full qty.
+    from live_runner.alpaca_adapter import _order_remaining_qty
+
+    assert _order_remaining_qty(_FakeOrder("o1", "AAPL", "buy", qty=10.0, filled_qty=10.0)) == 0.0
+    assert _order_remaining_qty(_FakeOrder("o1", "AAPL", "buy", qty=10.0, filled_qty=12.0)) == 0.0
+
+
+def test_get_order_state_maps_broker_statuses() -> None:
+    """Reconciliation lookups: accounted-for statuses drop the finding, the
+    rest fail closed (#303)."""
+    orders = {
+        "ord-expired": SimpleNamespace(status="expired"),
+        "ord-working": SimpleNamespace(status="new"),
+        "ord-weird": SimpleNamespace(status="some_future_status"),
+        "ord-done-for-day": SimpleNamespace(status="done_for_day"),
+        "ord-stopped": SimpleNamespace(status="stopped"),
+        "ord-suspended": SimpleNamespace(status="suspended"),
+        "ord-replaced": SimpleNamespace(status="replaced"),
+    }
+
+    def get_order_by_id(order_id):
+        order = orders.get(order_id)
+        if order is None:
+            raise RuntimeError("404 not found")
+        return order
+
+    client = SimpleNamespace(get_order_by_id=get_order_by_id)
+    adapter = _adapter(client)
+
+    assert asyncio.run(adapter.get_order_state("ord-expired")) == "terminal"
+    assert asyncio.run(adapter.get_order_state("ord-working")) == "working"
+    assert asyncio.run(adapter.get_order_state("ord-weird")) is None
+    assert asyncio.run(adapter.get_order_state("ord-missing")) is None
+    for order_id in (
+        "ord-done-for-day",
+        "ord-stopped",
+        "ord-suspended",
+        "ord-replaced",
+    ):
+        assert asyncio.run(adapter.get_order_state(order_id)) == "terminal"
+
+
+def test_get_order_state_falls_back_to_client_order_id() -> None:
+    def get_order_by_id(order_id):
+        raise RuntimeError("404 not found")
+
+    def get_order_by_client_id(client_order_id):
+        if client_order_id != "sig-1":
+            raise RuntimeError("404 not found")
+        return SimpleNamespace(status="canceled")
+
+    client = SimpleNamespace(
+        get_order_by_id=get_order_by_id,
+        get_order_by_client_id=get_order_by_client_id,
+    )
+    adapter = _adapter(client)
+
+    assert (
+        asyncio.run(adapter.get_order_state("broker-id", client_order_id="sig-1"))
+        == "terminal"
+    )
+
+
+def test_install_http_timeout_wraps_the_session_once() -> None:
+    from live_runner.alpaca_adapter import _install_http_timeout
+
+    calls: list[dict] = []
+
+    class _Session:
+        def request(self, method, url, **kwargs):
+            calls.append({"method": method, "kwargs": kwargs})
+            return "ok"
+
+    client = SimpleNamespace(_session=_Session())
+    _install_http_timeout(client, 12.5)
+    _install_http_timeout(client, 99.0)  # second call must not double-wrap
+
+    assert client._session.request("GET", "https://example.invalid") == "ok"
+    assert calls == [
+        {"method": "GET", "kwargs": {"timeout": 12.5}}
+    ]
+
 # ── get_max_leverage (#240/#302) ──────────────────────────────────────────────
 
 

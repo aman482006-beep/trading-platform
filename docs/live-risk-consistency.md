@@ -443,6 +443,19 @@ the entry** (`floor`), so the actual risk never exceeds the sized budget: a stop
 1.6 ticks goes out as 1 tick. A stop below one tick is refused (ValueError before
 sending); a take profit below one tick is sent as one tick (never 0).
 
+## Periodic Broker Reconciliation (#303)
+
+`live_runner/broker_reconciliation.py` periodically compares the local ledger truth
+(`live_executions` fills per deployment) with the broker state per account: net
+position per symbol, expected working orders and - where the adapter can list them -
+protective stops. An unreadable broker state counts as a mismatch (fail closed), but
+only stops the deployment's **entries** after
+`broker_reconciliation_consecutive_mismatches` consecutive failed passes (default 2)
+(the status stays ACTIVE; exits and trailing keep running); a clean pass resets the
+counter and lifts the halt. The report is read-only under
+`GET /api/live/reconciliation`. Details and open maintainer decisions:
+`docs/live-deploy-runbook.md`.
+
 ## Implicit Divergence
 
 The `enforce_stop_direction` difference means that:

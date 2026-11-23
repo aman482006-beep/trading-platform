@@ -361,6 +361,30 @@ def coerce_positive_live_qty(value: Any, *, field_name: str = "qty") -> float:
     return parsed
 
 
+#: Values :meth:`BaseLiveAdapter.get_order_state` may return. ``None`` means
+#: "unknown" and always fails closed in the reconciler.
+ORDER_STATE_WORKING = "working"
+ORDER_STATE_TERMINAL = "terminal"
+
+
+@dataclass(frozen=True)
+class BrokerOrderView:
+    """One working broker order, normalized for reconciliation (#303).
+
+    ``protection`` marks position-protection orders (bracket legs, attached
+    stop/target orders) so the reconciler does not mistake them for untracked
+    entry or exit orders.
+    """
+
+    order_id: str
+    client_order_id: str = ""
+    symbol: str = ""
+    side: str = ""
+    qty: float | None = None
+    order_type: str = ""
+    protection: bool = False
+
+
 @dataclass(frozen=True)
 class ProtectiveStop:
     """One working broker-side stop order that protects an open position.
@@ -499,6 +523,25 @@ class BaseLiveAdapter(ABC):
         from, including after a daemon restart.
         """
         raise NotImplementedError(f"{type(self).__name__} cannot list protective stops")
+
+    async def list_reconciliation_orders(self) -> list[BrokerOrderView]:
+        """Every working order on the account, normalized for reconciliation.
+
+        Unlike :meth:`working_order_ids`, this view keeps the client order id and
+        marks position-protection orders so the reconciler can tell an untracked
+        entry/exit from a bracket leg or attached stop/target (#303).
+        """
+        raise NotImplementedError(f"{type(self).__name__} cannot list reconciliation orders")
+
+    async def get_order_state(self, order_id: str, *, client_order_id: str = "") -> str | None:
+        """Classify one order the ledger expects, by broker or client order id.
+
+        Returns ``"working"`` when the broker still has it open, ``"terminal"``
+        when it reached a final state (filled, cancelled, expired, rejected),
+        and ``None`` when the state cannot be determined - an unknown answer
+        must never suppress a reconciliation finding (#303).
+        """
+        raise NotImplementedError(f"{type(self).__name__} cannot look up order state")
 
     def round_stop_price(self, stop: ProtectiveStop, price: float) -> float:
         """Round a computed stop to a price the broker accepts.

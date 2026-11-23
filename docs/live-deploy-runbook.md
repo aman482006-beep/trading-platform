@@ -330,6 +330,87 @@ clean-up.
   `held`, with the new `stop_price`; the parent's `legs` then show the new stop and the unchanged
   take-profit leg. Through the adapter the stop moved 11.35 -> 11.52 with the take profit intact.
 
+## Periodic Broker Reconciliation (#303)
+
+The daemon runs `live_runner/broker_reconciliation.py` on the deployment sync
+snapshot. For every account with an ACTIVE or PAUSED deployment it compares:
+
+- the signed ledger quantity per symbol (`live_executions` fills by deployment)
+  with the broker's net position for that symbol;
+- broker order ids/client order ids the ledger still expects to be working with
+  the adapter's normalized working-order view (bracket legs and attached
+  stop/target orders are marked as protection, not untracked entries/exits);
+- protective stops with open broker positions when the adapter can list them.
+
+Unreadable broker state is a mismatch (fail closed), but it must not flap: a
+deployment's entries are halted only after
+`broker_reconciliation_consecutive_mismatches` consecutive bad passes
+(default `2`), and a clean pass resets the streak *and* releases the halt.
+
+The halt is **entry-only**. It is a persisted flag on the deployment (the
+`broker_reconciliation_entries_halted` settings key), re-checked atomically
+inside the submission claim immediately before an entry order is submitted -
+the deployment stays
+`ACTIVE`, so exits, in-flight orders, trailing stops and STOPPED enforcement
+keep their normal semantics. A `PAUSED` status was rejected for this on
+purpose: it would also freeze exits and trailing, exactly when a broker/ledger
+divergence makes them most needed. The halt and its release are written to the
+live control audit trail as `broker_reconciliation_entries_halt` /
+`broker_reconciliation_entries_resume` (actor `broker_reconciliation`).
+
+To release a halt early, set the deployment `PAUSED` and back to `ACTIVE` (the
+resume transition clears the flag); a still-mismatched account is re-halted on
+the next pass, so this cannot hide a live divergence. To make the halt
+permanent, leave the flag - or `PAUSED`/`STOPPED` the deployment.
+
+Only signals younger than 7 days and belonging to ACTIVE/PAUSED deployments
+count as orders the ledger still expects to be working: both live order paths
+expire fast (Alpaca `DAY`, cTrader `IMMEDIATE_OR_CANCEL`), so an older
+unfilled row is a cancelled/expired/rejected historical order, not a working
+one. A younger order missing from the broker's working list is not trusted on
+the age bound alone: the reconciler asks the adapter for that order's state
+(`get_order_state`, bounded lookups per pass), and only a proven `terminal`
+state clears the finding - IOC remainders, cancelled orders and rejected
+submissions all classify terminal, while `working`, unknown, timed-out or
+unreadable states keep it. Accounts holding positions or orders placed
+*outside* the platform
+(manual trades, another tool) will always mismatch - the ledger cannot vouch
+for them; flatten or adopt them at the broker before relying on a clean
+report.
+
+Settings live in deployment `settings` (see `live_deployments.example.yaml`).
+Broker state is account-level, so the strictest values across an account's
+deployments win:
+
+- `broker_reconciliation_interval_seconds` (default `300`, bounds 30-86400)
+- `broker_reconciliation_qty_tolerance` (`null` = adapter precision, strict
+  default when unknown)
+- `broker_reconciliation_consecutive_mismatches` (default `2`, bounds 1-10)
+- `broker_reconciliation_enabled` (default `true`; the account reconciles unless
+  every deployment on it opts out)
+
+All four are validated at deployment creation: an unusable value is refused
+instead of being silently defaulted. At runtime an unrecognised boolean still
+fails closed to *enabled* (a typo like `"flase"` cannot disable
+reconciliation).
+
+The latest pass is written to
+`$DATA_DIR/live/broker_reconciliation_report.json` and served read-only at
+`GET /api/live/reconciliation`. Every mismatch logs the structured diff; the
+halt threshold logs at ERROR with `alert=broker_reconciliation_mismatch`.
+
+### Open decision
+
+Interval, tolerance and the consecutive-mismatch count are maintainer decisions.
+The shipped defaults are deliberately conservative (5-minute interval, adapter
+precision or the strict 1e-9 quantity tolerance, two consecutive mismatches)
+because a false halt is recoverable while a missed broker/ledger divergence is
+not. Whether account-level mismatches should halt entries on *all* ACTIVE
+deployments on the account (current conservative choice) or only the
+deployments whose ledger rows implicate the symbol is also open; the
+account-wide halt is kept because broker positions and working orders are
+netted per account and cannot be attributed to one deployment safely.
+
 ## Strategy Promotion Gate (#165)
 
 Only code a named human reviewer promoted to `production` may trade on a

@@ -54,6 +54,7 @@ from live_runner.base_adapter import (
     validate_live_quote_prices,
 )
 from live_runner.broker_order_conflicts import enforce_broker_order_conflict_halts
+from live_runner.broker_reconciliation import run_broker_reconciliation_loop
 from live_runner.credential_env import (
     accounts_env_mtime,
     discord_bot_env_canonical_name,
@@ -164,6 +165,7 @@ from shared.database import (
     list_live_deployments,
     list_services,
     list_stopped_enforced_deployment_ids,
+    live_deployment_entries_halted,
     live_db_path,
     mark_live_deployment_stopped_enforced,
     release_live_deployment_submission,
@@ -3132,6 +3134,24 @@ async def _submit_normalized_discord_signal(
             return
 
         is_exit = _signal_is_exit(live_signal.action, live_signal.metadata, deployment)
+        if not is_exit and await asyncio.to_thread(
+            live_deployment_entries_halted, str(deployment.id)
+        ):
+            # Entry-only halt (#303): broker reconciliation froze new entries on
+            # this deployment but exits must keep flowing, so the check sits
+            # after the exit classification and reads the flag fresh from the DB.
+            logger.warning(
+                "Skipping entry signal: deployment entries are halted by broker reconciliation",
+                extra={
+                    "data": {
+                        "account_id": account_id,
+                        "deployment_id": str(deployment.id),
+                        "symbol": live_signal.symbol,
+                    }
+                },
+            )
+            decision.refused("entries_halted")
+            return
         if is_exit:
             # Exits of every deployment on this account and symbol go one after the
             # other, from sizing to the persisted order (see ``_exit_lock``).
@@ -3336,8 +3356,9 @@ async def _prepare_claim_and_submit_signal(
 
     # Atomic submission claim. The status re-checks above ran against a
     # snapshot; between them and the broker call an operator can pause the
-    # deployment. The claim turns "still dispatchable" into a single atomic database
-    # fact taken immediately before submission, so a PAUSE either wins the race
+    # deployment, and the reconciler can halt entries. The claim turns "still
+    # dispatchable and not entries-halted" into a single atomic database fact
+    # taken immediately before submission, so either gate either wins the race
     # (the claim fails and nothing is sent) or is already in effect while this
     # dispatcher finishes the order it had already claimed. For an exit the claim
     # also passes a PAUSED row, because a pause does not forbid closing what is
@@ -3348,6 +3369,7 @@ async def _prepare_claim_and_submit_signal(
         str(deployment.id),
         claim_token,
         allow_paused=is_exit,
+        refuse_entries_halt=not is_exit,
     )
     if not claimed:
         logger.info(
@@ -6063,6 +6085,7 @@ async def sync_deployments_loop(
     accounts_env: Path | str | None = None,
     interval_seconds: int = DEPLOYMENT_POLL_INTERVAL_SECONDS,
     deployment_snapshot: list[LiveDeploymentConfig] | None = None,
+    first_sync_complete: asyncio.Event | None = None,
 ) -> None:
     accounts_env = _accounts_env_file(accounts_env)
     known_deployment_statuses: dict[str, str] = {}
@@ -6225,6 +6248,11 @@ async def sync_deployments_loop(
                 deployments_by_account,
                 accounts_env_values=accounts_env_values,
             )
+            if first_sync_complete is not None:
+                # The snapshot and adapters now reflect the DB: background
+                # loops gated on this event (broker reconciliation, #303) may
+                # take their first real pass.
+                first_sync_complete.set()
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # except-kind: loop-survival
@@ -6358,6 +6386,7 @@ async def _run_daemon_locked(
         await scheduler.start()
 
         deployment_snapshot: list[LiveDeploymentConfig] = []
+        first_sync_complete = asyncio.Event()
         sync_task = asyncio.create_task(
             sync_deployments_loop(
                 active_adapters,
@@ -6365,6 +6394,7 @@ async def _run_daemon_locked(
                 active_discord_tasks,
                 accounts_env=accounts_env,
                 deployment_snapshot=deployment_snapshot,
+                first_sync_complete=first_sync_complete,
             ),
             name="deployment-sync-loop",
         )
@@ -6391,6 +6421,14 @@ async def _run_daemon_locked(
         commission_task = asyncio.create_task(
             _backfill_commissions_loop(active_adapters), name="commission-backfill"
         )
+        reconciliation_task = asyncio.create_task(
+            run_broker_reconciliation_loop(
+                active_adapters,
+                current_deployments=lambda: list(deployment_snapshot),
+                deployments_ready=first_sync_complete,
+            ),
+            name="broker-reconciliation",
+        )
     except Exception:  # except-kind: money-decision
         # A startup failure (broken DB, bad config) propagates out of
         # asyncio.run as a traceback, not an ERROR record — log one here so
@@ -6399,7 +6437,12 @@ async def _run_daemon_locked(
         raise
     try:
         await asyncio.gather(
-            sync_task, service_sync_task, balance_task, trailing_task, commission_task
+            sync_task,
+            service_sync_task,
+            balance_task,
+            trailing_task,
+            commission_task,
+            reconciliation_task,
         )
     except asyncio.CancelledError:
         logger.info("Live daemon cancelled")
@@ -6423,6 +6466,7 @@ async def _run_daemon_locked(
             balance_task,
             trailing_task,
             commission_task,
+            reconciliation_task,
         ):
             if not task.done():
                 task.cancel()
@@ -6433,6 +6477,7 @@ async def _run_daemon_locked(
                 balance_task,
                 trailing_task,
                 commission_task,
+                reconciliation_task,
                 return_exceptions=True,
             )
         for task in list(active_listener_tasks.values()):

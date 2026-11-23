@@ -18,7 +18,10 @@ from uuid import UUID
 
 from live_runner.base_adapter import (
     EXIT_ONLY_RISK_SIZING_MODE,
+    ORDER_STATE_TERMINAL,
+    ORDER_STATE_WORKING,
     BaseLiveAdapter,
+    BrokerOrderView,
     ControlOutcome,
     LivePipValue,
     LiveQuote,
@@ -3627,6 +3630,180 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             if client_order_id:
                 ids.add(client_order_id)
         return ids
+
+    async def list_reconciliation_orders(self) -> list[BrokerOrderView]:
+        """Working orders with client ids and position-protection marks (#303)."""
+        reconcile_res = await self._reconcile_state()
+        trade_side_enum = getattr(self, "_ProtoOATradeSide", None)
+        if trade_side_enum is None:
+            raise ValueError("cTrader trade-side enum is unavailable")
+        try:
+            buy_side = int(trade_side_enum.BUY)
+            sell_side = int(trade_side_enum.SELL)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError("cTrader trade-side enum is unreadable") from exc
+
+        def _trade_int(value: Any, field: str, order_key: str) -> int:
+            if isinstance(value, bool):
+                raise ValueError(
+                    f"cTrader working order {order_key} has unreadable tradeData.{field}"
+                )
+            try:
+                number = int(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"cTrader working order {order_key} has unreadable tradeData.{field}"
+                ) from exc
+            if isinstance(value, float) and not value.is_integer():
+                raise ValueError(
+                    f"cTrader working order {order_key} has unreadable tradeData.{field}"
+                )
+            return number
+
+        views: list[BrokerOrderView] = []
+        for order in getattr(reconcile_res, "order", []) or []:
+            if not self._is_working_order(order):
+                continue
+            try:
+                order_type = int(getattr(order, "orderType", 0) or 0)
+            except (TypeError, ValueError):
+                order_type = 0
+            order_id = self._positive_int(getattr(order, "orderId", 0))
+            client_order_id = str(getattr(order, "clientOrderId", "") or "").strip()
+            key = str(order_id) if order_id is not None else client_order_id
+            if not key:
+                continue
+
+            # ProtoOAOrder carries symbol, volume and side under tradeData,
+            # not at the message root. A missing or malformed tradeData makes
+            # the whole broker read unreadable: emitting a blank/zero view
+            # would let reconciliation treat an unpriced order as accounted
+            # for instead of failing closed.
+            trade_data = getattr(order, "tradeData", None)
+            if trade_data is None:
+                raise ValueError(f"cTrader working order {key} has no tradeData")
+            symbol_id = _trade_int(
+                getattr(trade_data, "symbolId", 0), "symbolId", key
+            )
+            if symbol_id <= 0:
+                raise ValueError(
+                    f"cTrader working order {key} has no tradeData.symbolId"
+                )
+            symbol = self._symbol_name_for_id(symbol_id)
+
+            volume_raw = getattr(trade_data, "volume", 0)
+            if isinstance(volume_raw, bool):
+                raise ValueError(
+                    f"cTrader working order {key} has unreadable tradeData.volume"
+                )
+            try:
+                volume = float(volume_raw)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"cTrader working order {key} has unreadable tradeData.volume"
+                ) from exc
+            if not math.isfinite(volume) or volume <= 0:
+                raise ValueError(
+                    f"cTrader working order {key} has non-positive tradeData.volume"
+                )
+
+            trade_side = _trade_int(
+                getattr(trade_data, "tradeSide", 0), "tradeSide", key
+            )
+            if trade_side == buy_side:
+                side = "buy"
+            elif trade_side == sell_side:
+                side = "sell"
+            else:
+                raise ValueError(
+                    f"cTrader working order {key} has unknown tradeData.tradeSide"
+                )
+
+            scale = self._scale_for(symbol)
+            qty = _broker_volume_to_qty(volume, scale.volume_per_qty)
+            if not math.isfinite(qty) or qty <= 0:
+                raise ValueError(
+                    f"cTrader working order {key} has unreadable tradeData volume"
+                )
+
+            protection = order_type == int(self._ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT)
+            views.append(
+                BrokerOrderView(
+                    order_id=key,
+                    client_order_id=client_order_id,
+                    symbol=symbol,
+                    side=side,
+                    qty=qty,
+                    order_type=str(order_type),
+                    protection=protection,
+                )
+            )
+        return views
+
+    async def get_order_state(self, order_id: str, *, client_order_id: str = "") -> str | None:
+        """Working/terminal state of one order for reconciliation (#303).
+
+        ``ProtoOAOrderDetailsReq`` answers for a specific order id, including
+        orders no longer working. ``None`` - a transport error, an unknown
+        order, a missing status or a status this client cannot name - always
+        fails closed: the reconciler keeps its finding.
+        """
+        order_id_int = self._coerce_broker_order_id(order_id)
+        if order_id_int is None:
+            return None
+        self._raise_if_terminal_auth_failed()
+        if not self._connected or not self._authenticated:
+            await self.connect()
+        self._raise_if_terminal_auth_failed()
+        if (
+            self._ProtoOAOrderDetailsReq is None
+            or self._ProtoOAOrderDetailsRes is None
+            or self._ProtoOAOrderStatus is None
+        ):
+            return None
+        details_req = self._ProtoOAOrderDetailsReq()
+        details_req.ctidTraderAccountId = self.ctid_trader_account_id
+        details_req.orderId = order_id_int
+        try:
+            details_res = await self._send_request_with_refresh_retry(
+                details_req, timeout_seconds=15
+            )
+        except CTraderApiError:
+            return None
+        if not isinstance(details_res, self._ProtoOAOrderDetailsRes):
+            return None
+        order = getattr(details_res, "order", None)
+        if order is None:
+            return None
+        # ``orderStatus`` defaults to ACCEPTED on an unset order, so a broker
+        # response without a real order id must read as unknown, not working.
+        if not getattr(order, "orderId", 0):
+            return None
+        raw_status = getattr(order, "orderStatus", None)
+        if raw_status is None:
+            raw_status = getattr(order, "status", None)
+        if raw_status is None:
+            return None
+        try:
+            status = int(raw_status)
+        except (TypeError, ValueError):
+            return None
+        status_enum = self._ProtoOAOrderStatus
+        if status == int(status_enum.ORDER_STATUS_ACCEPTED):
+            return ORDER_STATE_WORKING
+        terminal = {
+            int(getattr(status_enum, name))
+            for name in (
+                "ORDER_STATUS_FILLED",
+                "ORDER_STATUS_REJECTED",
+                "ORDER_STATUS_EXPIRED",
+                "ORDER_STATUS_CANCELLED",
+            )
+            if getattr(status_enum, name, None) is not None
+        }
+        if status in terminal:
+            return ORDER_STATE_TERMINAL
+        return None
 
     def position_qty_tolerance(self, symbol: str) -> float:
         """Half of one broker volume unit, in qty units, for ``symbol``.
