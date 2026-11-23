@@ -88,8 +88,14 @@ class _FakeTradingClient:
         self.submitted: list[object] = []
         self.close_error = close_error
         self.submit_error = submit_error
+        self.account = SimpleNamespace(
+            cash=100_000.0, equity=100_000.0, currency="USD", multiplier="2"
+        )
         self.order_filters: list[object] = []
         self.history: dict[str, _FakeOrder] = {}
+
+    def get_account(self):
+        return self.account
 
     def get_orders(self, filter=None):  # noqa: A002 - mirrors alpaca-py
         # alpaca-py's server-side default page size is 50.
@@ -2041,6 +2047,56 @@ def test_alpaca_exit_qty_below_one_step_is_refused_as_below_step() -> None:
 def test_alpaca_exit_qty_step_is_one_fractional_share_step() -> None:
     adapter = _adapter(_FakeTradingClient())
     assert adapter.exit_qty_step("AAPL") == pytest.approx(1e-9)
+
+
+# ── get_max_leverage (#240/#302) ──────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("multiplier", "expected"),
+    [
+        # multiplier=4 is intraday buying power only; Reg T caps overnight
+        # marginable-stock positions at 2x, and no platform order is marked
+        # intraday-only, so the ceiling is the conservative min(multiplier, 2).
+        ("4", 2.0),
+        ("2", 2.0),
+        ("1", 1.0),
+    ],
+)
+def test_get_max_leverage_returns_the_overnight_reg_t_ceiling(
+    multiplier: str, expected: float
+) -> None:
+    client = _FakeTradingClient()
+    client.account.multiplier = multiplier
+    assert asyncio.run(_adapter(client).get_max_leverage("AAPL")) == pytest.approx(expected)
+
+
+def test_get_max_leverage_crypto_stays_at_the_1x_default() -> None:
+    # Alpaca offers no crypto margin: the multiplier does not apply, so the
+    # lookup reports unknown and the caps fail closed to 1x.
+    client = _FakeTradingClient()
+    client.account.multiplier = "4"
+    assert asyncio.run(_adapter(client).get_max_leverage("BTC/USD")) is None
+    assert asyncio.run(_adapter(client).get_max_leverage("BTCUSD")) is None
+
+
+def test_get_max_leverage_unreadable_multiplier_fails_closed() -> None:
+    client = _FakeTradingClient()
+    client.account = SimpleNamespace(cash=1.0, equity=1.0, currency="USD")
+    assert asyncio.run(_adapter(client).get_max_leverage("AAPL")) is None
+    client.account.multiplier = "0"
+    assert asyncio.run(_adapter(client).get_max_leverage("AAPL")) is None
+
+
+def test_get_max_leverage_garbage_multiplier_raises_money_parse_error() -> None:
+    # A present-but-unreadable multiplier is not "absent": it raises so the
+    # caps' ``_safe_max_leverage`` maps it to the 1x ceiling, never to a guess.
+    from shared.money import MoneyParseError
+
+    client = _FakeTradingClient()
+    client.account.multiplier = "junk"
+    with pytest.raises(MoneyParseError):
+        asyncio.run(_adapter(client).get_max_leverage("AAPL"))
 
 
 # ── Money fields fail closed (#280) ──────────────────────────────────────────

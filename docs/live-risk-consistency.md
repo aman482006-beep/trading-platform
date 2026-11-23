@@ -229,6 +229,95 @@ signals; refused ones are not persisted yet, only logged).
 On entries, payload values under these keys are overwritten; on exits (which run no gate)
 they are removed. A schema for quote snapshots (of refused signals too) is #134.
 
+## Pre-Submit Hard Caps (#302)
+
+`live_runner/pre_submit_caps.py::enforce_pre_submit_caps()` is the last check before
+the broker submit on the daemon paths — after sizing, after the submission claim,
+immediately before `adapter.submit_order()`. It is invoked at both submit chokepoints
+(`submit_order_with_risk()` and the Discord dispatch in
+`_prepare_claim_and_submit_signal()`). Inside `scripts/live_smoke.py` only the direct
+`adapter.submit_order` calls (:596 entry, :1481 close) bypass the caps; the calls
+through `submit_order_with_risk` (:702, :1130, :1570) are subject to them like every
+daemon path. `live_runner/test_signal_trigger.py:86` is another direct submit. All are
+operator tools for manual testing, not daemon paths; an error there has no cap
+backstop.
+**Independent of the sizing code** are the broker facts: quote, pip value, balance and
+the broker's maximum leverage for the account and asset (`get_max_leverage`; cTrader
+via `ProtoOASymbol.leverageId` + `GetDynamicLeverageByID` — the tier value is in cents
+like `leverageInCents`, 1:200 = 20000, and is divided by 100 before use — clamped to
+the account's own leverage `leverageInCents` from `ProtoOATrader`, as in Spotware's
+example with `min(trader, tier)`; `ProtoOATrader.maxLeverage` is deliberately not
+read — it is a uint32 without an "InCents" suffix, only the ceiling for *changes* to
+the leverage, against which `leverageInCents` is already validated; when a symbol has
+no `leverageId`, the account leverage alone is the ceiling; Alpaca via
+`min(account.multiplier, 2)` — the 4x multiplier is intraday buying power only,
+overnight Reg T applies at 2x, and no platform order is marked intraday-only; crypto
+stays at 1x; unknown → 1x). The tier leverage is an upper bound: on cTrader leverage
+shrinks with volume, so the first (smallest) tier is used — the leverage actually
+applied can be lower and is enforced further by the broker. Quantity and price levels,
+by contrast, come from the sized signal — nothing is re-invented from the payload.
+
+Refused (fail-closed, ERROR alert `pre_submit_cap_refusal` plus an audit entry via
+`record_live_control_audit`) when
+
+| Rule | Condition |
+|-------|-----------|
+| `qty_cap` | `qty > pre_submit_max_qty` (only when configured) |
+| `price_deviation` | `|entry - quote_side| / quote_side > pre_submit_max_price_deviation_fraction` (ask for buy, bid for sell, absolute in both directions) |
+| `notional_cap` | `qty * quote * pip_value > pre_submit_max_notional_equity_fraction * equity` (only when the fraction is explicitly configured) |
+| `stop_risk` | `qty * |entry - stop| * pip_value > pre_submit_max_risk_multiple * (max_risk_per_trade * equity)` |
+
+The caps add **no notional ceiling of their own below the broker maximum** — the only
+notional ceiling of this module is the broker's maximum leverage for the account and
+asset (#240, decision on #329): when a correctly sized order needs more leverage than
+the broker allows, the quantity is **clamped to the broker maximum** (floored to the
+lot step) instead of refused — the remaining caps run against the clamped size. An
+unknown broker leverage fails closed at 1x. The clamp is logged with a WARNING and
+audited as `pre_submit_leverage_clamp` (the `broker_max_leverage_is_upper_bound` field
+marks the upper-bound property; when a refusal by another cap follows the clamp, two
+audit rows are deliberately produced — clamp and refusal); when the broker maximum
+allows not even one lot step, the order is refused (`broker_leverage_cap`). The clamp
+is thus a backstop against a broken size, not a platform notional policy: sizing
+still caps order notional at `max_notional_per_trade` (default 0.20; `RiskConfig`
+refuses values > 1) — this ceiling remains until the #240 decision.
+
+Notional and stop risk are computed against account **equity** — and on the production
+path sizing and the caps also compute against the same basis: both read
+`get_balance()[1]`, which on Alpaca is the broker equity (`account.equity`) and on
+cTrader the realized balance (`ProtoOATrader` has no equity field); only an explicitly
+passed `account_balance` parameter deviates. The caps are therefore not a second
+sizing, but a hard backstop against broken sizes on the same basis.
+
+Additionally every **non-verifiability** refuses: missing stop, invalid cap settings,
+quote/pip-value/balance not fetchable or unusable, in particular a quote without a
+usable or stale broker time (`stale_quote`, same rule as the entry gate,
+`max_entry_quote_age_seconds`) (`broker_facts_unavailable` / `broker_facts_unusable` /
+`stale_quote` / `invalid_cap_config` / `invalid_entry_gate_config` / `missing_stop_loss`
+/ `unresolved_levels` / `invalid_qty`). Whether an order is an exit is decided by
+`is_exit_order` — the same classification sizing dispatches on — never a payload
+marker: an entry with `risk_sizing_mode="exit_only"` is capped normally, and the entry
+path removes `exit_only`/`risk_sizing_mode` before the adapter. Exit orders never run
+through the caps — they reduce exposure, and a cap must not block a flatten.
+
+Settings per deployment (deployment = account + symbols, i.e. the per-account /
+per-symbol scope), validated at creation (`validate_pre_submit_cap_settings` in
+`create_live_deployment`: type, finiteness, positivity and unique symbol keys) and
+again fail-closed at submit:
+
+| Setting | Default | Valid |
+|---------|---------|--------|
+| `pre_submit_max_qty` | **unlimited** | `> 0`, finite (no universal default: share, lot and 0.01-lot are different instruments) |
+| `pre_submit_max_notional_equity_fraction` | **broker leverage** (unknown → 1x) | `> 0` (order notional as a fraction of account equity; only explicitly set = hard reject cap) |
+| `pre_submit_max_price_deviation_fraction` | **0.02** | `> 0` |
+| `pre_submit_max_risk_multiple` | **2.0** | `> 0` (multiple of the configured `max_risk_per_trade` risk) |
+| `pre_submit_symbol_caps` | — | mapping `SYMBOL -> {same keys}`, overrides only for this symbol |
+
+The defaults are conservative backstops against sizing bugs (basis: #146 ~1000x, #184
+100x), not trading policy — risk multiple 2.0 and price deviation 2% are accepted per
+maintainer decision (2026-11-21), overridable per symbol. A 30 s timeout
+(`PRE_SUBMIT_CAPS_FETCH_TIMEOUT_SECONDS`) bounds the broker reads; on timeout the
+order is refused.
+
 ## Kill Switch (#300)
 
 Before every entry `prepare_order_with_risk()` refuses the order when the account is

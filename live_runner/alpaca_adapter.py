@@ -83,6 +83,11 @@ _ALPACA_ACC_RE = re.compile(r"^ALPACA_API_KEY_ACC(?P<index>\d+)$")
 
 _SL_METADATA_KEYS = ("stop_loss", "sl_price", "stop_price", "resolved_stop_loss")
 _TP_METADATA_KEYS = ("take_profit", "tp_price")
+#: Overnight Reg T ceiling for marginable stocks: Alpaca's ``multiplier`` = 4
+#: is intraday buying power only, so positions that may be held overnight are
+#: capped at 2x equity. No platform order is marked intraday-only.
+_ALPACA_OVERNIGHT_MAX_LEVERAGE = 2.0
+
 #: Newest orders requested per lookup of held bracket stop legs (Alpaca's maximum is 500).
 _ALPACA_HELD_LEG_LOOKUP_LIMIT = 500
 
@@ -2177,6 +2182,36 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         balance = parse_money(getattr(account, "cash", None))
         equity = parse_optional(getattr(account, "equity", None))
         return balance, balance if equity is None else equity
+
+    async def get_max_leverage(self, symbol: str) -> float | None:
+        """The account's overnight leverage ceiling — Alpaca's Reg T bound.
+
+        ``account.multiplier`` (1, 2 or 4) is the margin multiplier the broker
+        grants the account, but the 4x tier is intraday buying power: Reg T
+        caps overnight marginable-stock positions at 2x equity, and nothing
+        marks a platform order intraday-only, so the conservative ceiling the
+        pre-submit caps clamp against (#240) is ``min(multiplier, 2)``. Alpaca
+        offers no crypto margin, so crypto symbols stay at the 1x fail-closed
+        default (``None``). An unreadable or nonpositive multiplier is
+        ``None`` too — never a guess.
+        """
+        normalized_symbol = str(symbol or "").strip().upper()
+        if not normalized_symbol or classify_symbol(normalized_symbol) == "crypto":
+            return None
+        if not self._connected or self._trading_client is None:
+            await self.connect()
+        # Re-read after the await: `connect()` is what establishes the client, and
+        # mypy drops member narrowing across it (same pattern as get_balance).
+        trading_client = self._trading_client
+        if trading_client is None:
+            raise RuntimeError(
+                "Alpaca adapter must be connected before requesting the account"
+            )
+        account = await asyncio.to_thread(trading_client.get_account)
+        multiplier = parse_optional(getattr(account, "multiplier", None))
+        if multiplier is None or multiplier <= 0:
+            return None
+        return min(multiplier, _ALPACA_OVERNIGHT_MAX_LEVERAGE)
 
     async def get_pip_value(self, symbol: str) -> LivePipValue:
         """One share (or coin) moves the USD account by 1.0 per 1.0 USD move (#146).
