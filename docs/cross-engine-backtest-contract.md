@@ -50,7 +50,9 @@ parent Cleanup 16 record.
   triggers when `high >= take_profit`; mirrored for SHORT. Native records this
   as `stop_trigger_side = "bar_low_high"` and
   `take_profit_trigger_side = "bar_high_low"`.
-- Fill price: the protective **level itself**, not the bar close — with one
+- Fill price: the protective **level itself ± the resolved slippage
+  model**, not the bar close (since #130 stop/TP fills slip like every
+  other fill; with `slippage="none"` the level is exact) — with one
   owner-decided exception (2026-11-13, realism / MT5 + live-broker parity): a
   bar that **opens beyond** the level gapped through it and fills at the
   bar's **open**, the price actually available; an open exactly at the level
@@ -69,6 +71,44 @@ parent Cleanup 16 record.
   the entry bar and enforced through the intrabar walk (§3). Without intrabar
   data, exits happen on the scheduled signal exit and the levels are recorded
   in `trade.meta` (`sl_price`, `tp_price`).
+
+### Slippage (fill-price cost model, #130)
+
+Slippage is applied to the **fill price** in the adverse direction —
+never as a separate cost line, so `pnl`, `net_pnl`, the equity curve and
+sizing equity all carry the same cost. For the fixed-bps models that
+means buys fill higher and sells fill lower; the bar-spread model
+charges the quoted spread **once per round trip, on the buy side only**
+(canonical OHLC is the bid series: buys lift to the ask, sells stay on
+the bid) — an implementer porting this must not subtract the spread on
+sells as well or the spread is charged twice.
+Scope per the maintainer decision: the **native** engine and **signal
+replay** only (the engines #318 keeps; LEAN stays import-only; vectorbt
+and pynecore do not model slippage and record that fact in
+`meta.data["slippage"]` when run through the CLI).
+
+- `runner.slippage.resolve_slippage_model` resolves one model per run (per
+  symbol where asset classes differ) from engine params:
+  `slippage="none"|"zero"` is the explicit parity opt-out that reproduces
+  pre-#130 gross fills; `"spread"` uses the bar's bid/ask columns
+  (MT5-tester-like) with a fixed-bps fallback; `"bps"`/`slippage_bps` is a
+  fixed-bps model; absent config picks the per-asset-class default
+  (FX/CFD-like classes → bar spread, equities → 5 bps, crypto → 10 bps,
+  all overridable via `slippage_defaults`/`slippage_default_bps`).
+- Instruments are classified from the `ohlcv/{source}/{asset_class}/…`
+  parquet path; runs that cannot be classified — or whose class maps to
+  no slippage model — REFUSE under the default `auto` resolution
+  (fail closed like fees, #84): pass `slippage="none"` for a deliberate
+  gross run or an explicit cost (`"bps"`/`"spread"`/`slippage_bps`).
+- Every run records the resolved model per symbol in
+  `meta.data["slippage"]["models"]` (plus the data's `price_basis`), so a
+  reader never has to guess which cost model produced the numbers.
+- When a strategy already prices the spread through `spread_price_col`,
+  the auto model degrades to fixed bps so the quoted spread is not
+  charged twice. `ask_ohlc` does not degrade the model — it only moves
+  SHORT stop/TP *triggers* onto the ask side, and those ask-triggered
+  exits pass `fill_side="ask"` so the bar spread is not charged twice on
+  them either.
 
 ## 2. End-date boundary
 
