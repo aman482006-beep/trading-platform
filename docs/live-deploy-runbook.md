@@ -519,6 +519,8 @@ The viewer answers HTTP 409 with the reason. Exit-only orders are never blocked:
 closing a position must not depend on a promotion. The daemon check runs on
 every entry, so a deployment edited after activation is caught at order time.
 
+
+
 ### The cTrader top-N deploy never arms a non-demo account (#261)
 
 That endpoint creates its rows in one shot, with no per-deployment
